@@ -1,6 +1,6 @@
 {
   "name": "tower-do",
-  "version": "0.1.2",
+  "version": "0.2.0",
   "description": "Shared multi-agent WIP board for Pi coding agent — Kimi Tower style orchestration (todo-flavored)",
   "license": "MIT",
   "author": "温习江湖 <wweir@foxmail.com>",
