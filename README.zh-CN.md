@@ -45,7 +45,7 @@ pi 启动时自动发现扩展；已开会话用 `/reload` 加载。运行依赖
 
 ## 发布
 
-在 `main` 上打 `vX.Y.Z` 标签即触发 CI 运行编译 + 测试门禁并自动发布到 npm（见 `.github/workflows/release.yml` 与 [docs/OPERATIONS.md](docs/OPERATIONS.md)）。标签须与 `package.json` 的 `version` 一致。
+在 `main` 上打 `vX.Y.Z` 标签即触发 CI 运行编译 + 测试门禁，自动发布到 npm 并创建 GitHub Release（见 `.github/workflows/release.yml` 与 [docs/OPERATIONS.md](docs/OPERATIONS.md)）。标签须与 `package.json` 的 `version` 一致。
 
 ## 快速上手
 

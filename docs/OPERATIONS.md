@@ -41,9 +41,9 @@ addressing in multi-agent sessions.
 ## Release (npm publish on tag)
 
 Tagging `vX.Y.Z` on `main` triggers `.github/workflows/release.yml`, which
-runs the compile + test gate and then `npm publish` when the tag matches
-`package.json` `version`. This is the **only** release path — no manual
-`npm publish`.
+runs the compile + test gate, `npm publish`, and then creates a GitHub
+Release for the tag — all automatically. This is the **only** release path —
+no manual `npm publish` or `gh release create`.
 
 ```bash
 # bump version in package.json, commit, then:
@@ -57,6 +57,8 @@ git tag v0.3.0 && git push origin main --tags
 - Publish uses npm provenance (`--provenance`) with the `id-token` permission;
   auth comes from the `NPM_TOKEN` repository secret. Requires a GitHub-hosted
   runner (provenance is unavailable on self-hosted runners).
+- The GitHub Release notes are generated from conventional commits since the
+  previous `v*` tag; the job needs `contents: write` for `gh release create`.
 
 ## Runtime layout
 

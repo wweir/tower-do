@@ -51,10 +51,10 @@ Pi auto-discovers the extension at startup; existing sessions pick it up with `/
 
 ## Release
 
-Tagging `vX.Y.Z` on `main` runs the compile + test gate in CI and publishes
-to npm automatically (see `.github/workflows/release.yml` and
-[docs/OPERATIONS.md](docs/OPERATIONS.md)). The tag must match `package.json`
-version.
+Tagging `vX.Y.Z` on `main` runs the compile + test gate in CI, publishes
+to npm automatically, and creates a GitHub Release (see
+`.github/workflows/release.yml` and [docs/OPERATIONS.md](docs/OPERATIONS.md)).
+The tag must match `package.json` version.
 
 ## Quick tour
 
