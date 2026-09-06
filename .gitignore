@@ -1,0 +1,7 @@
+node_modules/
+bun.lock
+dist/
+coverage/
+*.log
+*.tgz
+.DS_Store
