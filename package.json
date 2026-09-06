@@ -21,6 +21,7 @@
     "state.ts",
     "board.ts",
     "test/",
+    "docs/",
     "tsconfig.json",
     "README.md",
     "README.zh-CN.md",
