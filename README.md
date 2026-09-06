@@ -60,6 +60,54 @@ a message, the peer reads it via `inbox`.
 Identity resolution: `as` param > project config `identity` > session name >
 session id. Recording work for a subagent: pass its id (e.g. `as: "coder-1"`).
 
+## Configuration
+
+One optional key — `<project>/.pi/tower-do/config.json`. No environment
+variables.
+
+```json
+{ "identity": "team-orchestrator" }
+```
+
+| key | default | meaning |
+| --- | --- | --- |
+| `identity` | session name/id | pin this session's board identity (project-level); must not be the reserved orchestrator identity `tower` |
+
+That is the whole surface. Absent file = defaults; unknown keys are ignored
+(forward compatibility); a malformed file or invalid `identity` fails loudly at
+session start — never silently defaulted, because a silently-reset identity
+would corrupt owner matching in multi-agent sessions. The file holds no
+secrets and is safe to commit for shared team settings; gitignore only
+`board.jsonl`. Details: [docs/OPERATIONS.md](docs/OPERATIONS.md).
+
+## Architecture
+
+Three layers, strict dependency direction (top depends on bottom, never
+reverse):
+
+```text
+Pi sessions / subagents (multiple, same project)
+   │  tower_do · tower_do_talk · tower_do_status  (+ widget, reminders)
+   ▼
+index.ts   extension layer — tool params & prompt contract, TUI widget,
+           board-reconciliation reminders, session lifecycle
+   ▼
+state.ts   pure core — schema + validation (every-field owner guard,
+           baseRevision stale gate), event fold, read derivations (presence,
+           blocked, scope conflicts, message retention); no I/O
+   ▼
+board.ts   disk layer — append-only JSONL event log; every read re-folds
+           from disk, writers append single-line events
+   ▼
+<project>/.pi/tower-do/board.jsonl   single source of truth (file-as-state,
+                                     shared by all sessions; gitignore it)
+```
+
+Write path: tool params → validate + revision gate → append event(s) → fold →
+view. Read path: re-fold events into a view, derive everything else — there
+are no mutable state files besides the log. Full data flow and derivations:
+[docs/ARCHITECTURE.md](docs/ARCHITECTURE.md).
+
 ## Documentation
 
 | Doc | Content |
@@ -73,11 +121,11 @@ session id. Recording work for a subagent: pass its id (e.g. `as: "coder-1"`).
 
 ## Files
 
-```
+```text
 ├── index.ts     # extension entry: 3 tools + widget + reminder + lifecycle
 ├── state.ts     # pure schema/validation/fold/read-derivations (no I/O)
 ├── board.ts     # disk layer: append-only JSONL (file-as-state) + config
-├── test/        # smoke + owner-guard + presence-retention + changed-files + scope-conflicts
+├── test/        # smoke + owner-guard + presence-retention + changed-files + scope-conflicts + config
 ├── docs/        # PRODUCT / ARCHITECTURE / CONTRACTS / DECISIONS / OPERATIONS
 └── README.md
 ```
@@ -88,6 +136,7 @@ session id. Recording work for a subagent: pass its id (e.g. `as: "coder-1"`).
 bun install               # devDeps — typecheck/tests only
 bunx tsc --noEmit -p tsconfig.json   # strict + noUnused, zero errors
 bun run test/smoke.ts               # end-to-end: 3 tools, persistence, scoping, changedFiles disk round-trip
+bun run test/config.ts              # config fail-loud + reserved identity (11 cases)
 bun run test/owner-guard.ts         # every-field owner guard (10 cases)
 bun run test/presence-retention.ts  # read receipts / retirement / presence (34)
 bun run test/changed-files.ts       # P0 delivery-receipt invariants (10 cases)

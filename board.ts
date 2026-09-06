@@ -21,10 +21,13 @@ import { dirname } from "node:path";
 
 import {
   createEmptyBoard,
+  normalizeIdentity,
   readPersistedFinding,
   readPersistedMessage,
   readPersistedTask,
   TOWER_DO_SCHEMA_VERSION,
+  TOWER_IDENTITY,
+  TowerDoValidationError,
   type TowerBoardView,
   type TowerDoFinding,
   type TowerDoMessage,
@@ -218,87 +221,35 @@ export class TowerBoard {
 }
 
 export interface TowerDoConfig {
-  /** Optional fixed identity; otherwise resolved from the session. */
-  identity?: string;
-  /** Inject a board-reconciliation reminder every N LLM calls (0 = off). */
-  reminderInterval: number;
-  /** Widget collapsed task limit (completed hidden unless expanded). */
-  collapsedTaskLimit: number;
-  /** How many recent activity-log lines the status tool shows. */
-  activityTail: number;
   /**
-   * Max folded messages kept after fully-read ones are retired. Unread or
-   * partially-read messages always survive; this bounds how many *done*
-   * (every addressee has read them) messages the view retains so history
-   * exits instead of accumulating forever. 0 = keep all (legacy).
+   * Optional fixed identity; otherwise resolved from the session. The ONLY
+   * user-configurable key — every other tuning constant lives in index.ts
+   * (internal, never user-facing; see DECISIONS.md).
    */
-  messageRetention: number;
+  identity?: string;
 }
 
-export const DEFAULT_TOWER_DO_CONFIG: TowerDoConfig = {
-  reminderInterval: 3,
-  collapsedTaskLimit: 3,
-  activityTail: 8,
-  messageRetention: 50,
-};
-
+/**
+ * Validate config.json. Fail loud: a silently-reset config would drop a
+ * pinned identity and corrupt owner matching / message addressing. Unknown
+ * keys are ignored (forward compatibility after retired knobs).
+ */
 export function normalizeBoardConfig(value: unknown): TowerDoConfig {
-  if (!value || typeof value !== "object")
-    return { ...DEFAULT_TOWER_DO_CONFIG };
-  const input = value as {
-    identity?: unknown;
-    reminderInterval?: unknown;
-    collapsedTaskLimit?: unknown;
-    activityTail?: unknown;
-    messageRetention?: unknown;
-  };
-  const reminderInterval =
-    typeof input.reminderInterval === "number" &&
-    Number.isInteger(input.reminderInterval) &&
-    input.reminderInterval >= 0 &&
-    input.reminderInterval <= 20
-      ? input.reminderInterval
-      : DEFAULT_TOWER_DO_CONFIG.reminderInterval;
-  const collapsedTaskLimit =
-    typeof input.collapsedTaskLimit === "number" &&
-    Number.isInteger(input.collapsedTaskLimit) &&
-    input.collapsedTaskLimit >= 1 &&
-    input.collapsedTaskLimit <= 10
-      ? input.collapsedTaskLimit
-      : DEFAULT_TOWER_DO_CONFIG.collapsedTaskLimit;
-  const activityTail =
-    typeof input.activityTail === "number" &&
-    Number.isInteger(input.activityTail) &&
-    input.activityTail >= 1 &&
-    input.activityTail <= 50
-      ? input.activityTail
-      : DEFAULT_TOWER_DO_CONFIG.activityTail;
-  const messageRetention =
-    typeof input.messageRetention === "number" &&
-    Number.isInteger(input.messageRetention) &&
-    input.messageRetention >= 0 &&
-    input.messageRetention <= 10_000
-      ? input.messageRetention
-      : DEFAULT_TOWER_DO_CONFIG.messageRetention;
-  // identity is used in exact comparisons (owner / message recipient); keep it
-  // a single line and bounded so a misconfigured value cannot garble matching.
-  const rawIdentity =
-    typeof input.identity === "string" ? input.identity.trim() : "";
-  const identity =
-    rawIdentity &&
-    rawIdentity.length <= 64 &&
-    !/[\r\n\u2028\u2029]/.test(rawIdentity)
-      ? rawIdentity
-      : undefined;
-  return {
-    ...(identity === undefined ? {} : { identity }),
-    reminderInterval,
-    collapsedTaskLimit,
-    activityTail,
-    messageRetention,
-  };
-}
-
-export function readBoardConfig(value: unknown): TowerDoConfig {
-  return normalizeBoardConfig(value);
+  if (typeof value !== "object" || value === null || Array.isArray(value)) {
+    throw new TowerDoValidationError(
+      "tower-do config.json must contain a JSON object",
+    );
+  }
+  const rawIdentity = (value as Record<string, unknown>).identity;
+  if (rawIdentity === undefined) return {};
+  if (typeof rawIdentity !== "string") {
+    throw new TowerDoValidationError('config key "identity" must be a string');
+  }
+  const identity = normalizeIdentity(rawIdentity, 'config key "identity"');
+  if (identity === TOWER_IDENTITY) {
+    throw new TowerDoValidationError(
+      `config key "identity" must not be the reserved orchestrator identity "${TOWER_IDENTITY}"`,
+    );
+  }
+  return { identity };
 }

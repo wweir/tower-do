@@ -46,7 +46,17 @@ backend and the orchestrator consumes the board.
   full replacement, an unguarded content field would let a stale replay roll
   back a peer's concurrent update.
 - **`tower` reserved identity** as the orchestrator escape hatch (owner of
-  everything).
+  everything). It is not claimable via config, so no session can *drift into*
+  the orchestrator role by default; an explicit `as: "tower"` call remains the
+  documented (unauthenticated, cooperative-trust) way for the orchestrator to
+  act. Same class of collision: the broadcast keyword `"all"` is rejected as
+  any identity (config / `as` / owner).
+- **Config surface is `identity` only** (config.json, optional, safe to
+  commit). Reminder cadence, widget rows, activity tail, and message retention
+  are internal constants — no user evidence ever justified tuning them, and
+  every knob is permanent schema+docs+test surface. A malformed config fails
+  loudly instead of silently defaulting: a silently-reset identity corrupts
+  owner matching in multi-agent sessions.
 - **Message read receipts (`readBy`) + audience snapshots** so broadcast
   retirement is bounded and late joiners don't pin history forever.
 - **Advisory scope today.** `scope` is a declared mission boundary with owner

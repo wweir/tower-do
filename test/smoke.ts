@@ -400,9 +400,13 @@ async function layer2(): Promise<void> {
     const text = result.content.map((item) => item.text).join("\n");
     return { text, details: result.details };
   };
-  const runThrow = async (name: string, params: never): Promise<string> => {
+  const runThrow = async (
+    name: string,
+    params: never,
+    cwd?: string,
+  ): Promise<string> => {
     try {
-      await run(name, params);
+      await run(name, params, cwd);
       return "NO ERROR";
     } catch (error) {
       return error instanceof Error ? error.message : String(error);
@@ -685,6 +689,18 @@ async function layer2(): Promise<void> {
     /single line/.test(newlineAs),
     newlineAs.slice(0, 80),
   );
+  // "all" is the broadcast keyword — it must not be claimable as an acting
+  // identity, or `as: "all"` would receive every broadcast and collide with
+  // message addressing.
+  const allAs = await runThrow("tower_do", {
+    tasks: [],
+    as: "all",
+  } as never);
+  check(
+    'identity "all" is rejected',
+    /reserved broadcast recipient "all"/.test(allAs),
+    allAs.slice(0, 80),
+  );
 
   // Invalid status filter is a loud error, not a silent empty board.
   const badFilter = await runThrow("tower_do_status", {
@@ -869,6 +885,33 @@ async function layer2(): Promise<void> {
     "worktree does not leak to the parent dir",
     !outerSeesWt.text.includes("wt-only"),
     "worktree isolation",
+  );
+
+  // Broken config.json fails loudly instead of silently resetting identity —
+  // a silent default would corrupt owner matching in multi-agent sessions.
+  const brokenDir = mkdtempSync(join(tmpdir(), "tower-do-badcfg-"));
+  mkdirSync(join(brokenDir, ".pi", "tower-do"), { recursive: true });
+  writeFileSync(
+    join(brokenDir, ".pi", "tower-do", "config.json"),
+    '{ "identity": "broken',
+  );
+  const brokenMsg = await runThrow("tower_do_status", {}, brokenDir);
+  check(
+    "broken config.json is a loud error",
+    /tower-do config .*config\.json/.test(brokenMsg),
+    brokenMsg.slice(0, 80),
+  );
+  const reservedDir = mkdtempSync(join(tmpdir(), "tower-do-reserved-"));
+  mkdirSync(join(reservedDir, ".pi", "tower-do"), { recursive: true });
+  writeFileSync(
+    join(reservedDir, ".pi", "tower-do", "config.json"),
+    '{ "identity": "tower" }',
+  );
+  const reservedMsg = await runThrow("tower_do_status", {}, reservedDir);
+  check(
+    "config identity tower is a loud error",
+    /reserved orchestrator identity "tower"/.test(reservedMsg),
+    reservedMsg.slice(0, 80),
   );
 }
 

@@ -18,19 +18,25 @@ typescript) is for typecheck/tests.
 
 ## Configuration
 
-`<project>/.pi/tower-do/config.json` (optional; absent = defaults):
+`<project>/.pi/tower-do/config.json` is the only configuration surface — no
+environment variables. The file is optional (absent = defaults) and safe to
+commit for shared team settings: it holds no secrets. Only `board.jsonl`
+belongs in `.gitignore`.
 
 ```json
-{ "identity": "team-orchestrator", "reminderInterval": 3, "collapsedTaskLimit": 3, "activityTail": 8, "messageRetention": 50 }
+{ "identity": "team-orchestrator" }
 ```
 
 | key | default | meaning |
 | --- | --- | --- |
-| `identity` | session name/id | pin this session's board identity (project-level) |
-| `reminderInterval` | 3 | inject a board-reconciliation reminder every N LLM calls (0 = off) |
-| `collapsedTaskLimit` | 3 | widget rows for unfinished tasks (rest fold to `… +N more`) |
-| `activityTail` | 8 | activity lines shown by `tower_do_status` |
-| `messageRetention` | 50 | fully-read old messages kept before oldest retire (0 = keep all) |
+| `identity` | session name/id | pin this session's board identity (project-level); must not be the reserved orchestrator identity `tower` |
+
+That is the whole surface. Reminder cadence, widget rows, activity tail, and
+message retention are internal tuning constants, not configuration. Unknown
+keys are ignored (forward compatibility). A malformed file or invalid
+`identity` fails loudly at session start — it is never silently defaulted,
+because a silently-reset identity would corrupt owner matching and message
+addressing in multi-agent sessions.
 
 ## Runtime layout
 

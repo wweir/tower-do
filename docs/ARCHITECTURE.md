@@ -74,7 +74,7 @@ activity tail — they never mutate the file, and callers cannot "write" them:
   self-reported; authoritative conflict resolution needs git-diff reads, out of
   scope for TowerDo).
 - **Message retention**: `retainMessages` retires *fully-read* history past the
-  `messageRetention` budget; unread / partially-read messages never exit, and
+  internal message-retention budget; unread / partially-read messages never exit, and
   orphaned broadcasts (audience all gone) retire so finished rounds don't pin
   the budget forever.
 

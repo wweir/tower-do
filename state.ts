@@ -241,7 +241,7 @@ function assertSingleLine(value: string, location: string): string {
   return value;
 }
 
-function normalizeIdentity(
+export function normalizeIdentity(
   value: string | undefined,
   location: string,
 ): string {
@@ -252,6 +252,11 @@ function normalizeIdentity(
     throw new TowerDoValidationError(
       `${location} must be at most 64 characters`,
     );
+  if (identity === "all") {
+    throw new TowerDoValidationError(
+      `${location} must not be the reserved broadcast recipient "all"`,
+    );
+  }
   return identity;
 }
 
@@ -405,26 +410,10 @@ export function writeBoardSnapshot(
       continue;
     }
     // Tower: only the owner or the orchestrator may change an owned task's
-    // fields (see the removal guard below for task deletion); any agent may
-    // add new tasks or touch unowned ones. The guard compares EVERY field
-    // (subject/description/status/owner/dependsOn/scope/changedFiles/blockedBy), not just
-    // status/owner/scope — otherwise a worker replaying the full task list
-    // (full-replacement semantics) could silently rewrite another owner's
-    // content (e.g. its subject or dependencies) or roll back its concurrent
-    // update with a stale snapshot while leaving status untouched.
-    const ownerChanged =
-      existing.owner !== candidate.owner ||
-      existing.status !== candidate.status ||
-      existing.scope?.join("\u0000") !== candidate.scope?.join("\u0000") ||
-      existing.changedFiles?.join("\u0000") !==
-        candidate.changedFiles?.join("\u0000") ||
-      existing.subject !== candidate.subject ||
-      existing.description !== candidate.description ||
-      existing.dependsOn.join("\u0000") !==
-        candidate.dependsOn.join("\u0000") ||
-      existing.blockedBy.join("\u0000") !== candidate.blockedBy.join("\u0000");
+    // fields (removal is guarded separately above). We only reach this point
+    // when taskEquals found a real field change, so a plain ownership check
+    // suffices — the every-field comparison already happened.
     if (
-      ownerChanged &&
       existing.owner !== undefined &&
       caller !== existing.owner &&
       caller !== TOWER_IDENTITY
@@ -555,6 +544,21 @@ function normalizeTask(
       `tasks[${index}].dependsOn supports at most ${MAX_TASK_DEPENDENCIES} keys`,
     );
   }
+  if ((input.scope?.length ?? 0) > MAX_SCOPE_GLOBS) {
+    throw new TowerDoValidationError(
+      `tasks[${index}].scope supports at most ${MAX_SCOPE_GLOBS} globs`,
+    );
+  }
+  if ((input.changedFiles?.length ?? 0) > MAX_CHANGED_FILES) {
+    throw new TowerDoValidationError(
+      `tasks[${index}].changedFiles supports at most ${MAX_CHANGED_FILES} paths`,
+    );
+  }
+  if ((input.blockedBy?.length ?? 0) > MAX_TASK_DEPENDENCIES) {
+    throw new TowerDoValidationError(
+      `tasks[${index}].blockedBy supports at most ${MAX_TASK_DEPENDENCIES} entries`,
+    );
+  }
   const dependsOn = [
     ...new Set(
       (input.dependsOn ?? [])
@@ -575,7 +579,6 @@ function normalizeTask(
   }
 
   const scope = (input.scope ?? [])
-    .slice(0, MAX_SCOPE_GLOBS)
     .map((glob) => assertSingleLine(glob.trim(), `tasks[${index}].scope entry`))
     .filter(Boolean);
   for (const glob of scope) {
@@ -588,7 +591,6 @@ function normalizeTask(
   const changedFiles = [
     ...new Set(
       (input.changedFiles ?? [])
-        .slice(0, MAX_CHANGED_FILES)
         .map((file) =>
           assertSingleLine(file.trim(), `tasks[${index}].changedFiles entry`),
         )
@@ -615,7 +617,7 @@ function normalizeTask(
         )
         .filter(Boolean),
     ),
-  ].slice(0, MAX_TASK_DEPENDENCIES);
+  ];
 
   const owner = normalizeOptionalText(input.owner);
   if (owner !== undefined) normalizeIdentity(owner, `tasks[${index}].owner`);
@@ -1076,11 +1078,6 @@ export function readBoardSnapshot(value: unknown): TowerBoardView | undefined {
     messages,
     findings,
   };
-}
-
-/** Serialize a board snapshot for session checkpoints. */
-export function writeBoardCheckpoint(view: TowerBoardView): TowerBoardView {
-  return cloneBoard(view);
 }
 
 export const REMINDER_TASK_LINE_CAP = 12;

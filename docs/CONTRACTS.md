@@ -84,6 +84,7 @@ event count, tool-read from the file (never self-reported).
 bun install            # devDeps (bun-types + typescript) — typecheck/tests only
 bunx tsc --noEmit -p tsconfig.json      # strict + noUnused, zero errors
 bun run test/smoke.ts               # end-to-end: 3 tools, persistence, scoping, changedFiles disk round-trip
+bun run test/config.ts              # config fail-loud + reserved identity (11 cases)
 bun run test/owner-guard.ts         # every-field owner guard (10 cases)
 bun run test/presence-retention.ts  # read receipts / retirement / presence (34)
 bun run test/changed-files.ts       # P0 receipt invariants (10 cases)

@@ -51,8 +51,7 @@ import { dirname, join } from "node:path";
 import { Type } from "typebox";
 
 import {
-  DEFAULT_TOWER_DO_CONFIG,
-  readBoardConfig,
+  normalizeBoardConfig,
   TowerBoard,
   type TowerDoConfig,
 } from "./board.ts";
@@ -92,7 +91,6 @@ import {
   TOWER_IDENTITY,
   TowerDoValidationError,
   unreadMessagesToMe,
-  writeBoardCheckpoint,
   writeBoardSnapshot,
   type ActivityEntry,
   type FindingKind,
@@ -106,6 +104,14 @@ import {
 } from "./state.ts";
 
 const WIDGET_KEY = "pi-tower-do-widget";
+
+// Internal tuning constants — deliberately NOT user config (DECISIONS.md:
+// no user evidence ever justified tuning them, and every knob is permanent
+// schema+docs+test surface).
+const REMINDER_INTERVAL = 3; // inject a board reminder every N LLM calls
+const WIDGET_TASK_LIMIT = 3; // unfinished tasks shown in the above-editor line
+const STATUS_ACTIVITY_TAIL = 8; // activity feed lines in tower_do_status
+const MESSAGE_RETENTION = 50; // max fully-read messages kept in the view
 
 // ---------------------------------------------------------------------------
 // Config (project-scoped, best-effort JSON)
@@ -171,13 +177,18 @@ function boardFileFor(cwd: string): string {
 }
 
 function loadConfig(dir: string): TowerDoConfig {
+  const path = join(dir, "config.json");
+  if (!existsSync(path)) return {};
+  // Fail loud, never silently default: a broken config would drop a pinned
+  // identity and corrupt owner matching / message addressing in multi-agent
+  // sessions. Annotate every failure with the path — JSON.parse and
+  // normalizeBoardConfig errors alone do not carry it.
   try {
-    const path = join(dir, "config.json");
-    if (!existsSync(path)) return { ...DEFAULT_TOWER_DO_CONFIG };
-    const raw = JSON.parse(readFileSync(path, "utf8")) as unknown;
-    return readBoardConfig(raw);
-  } catch {
-    return { ...DEFAULT_TOWER_DO_CONFIG };
+    return normalizeBoardConfig(JSON.parse(readFileSync(path, "utf8")));
+  } catch (error) {
+    throw new Error(
+      `tower-do config ${path}: ${error instanceof Error ? error.message : String(error)}`,
+    );
   }
 }
 
@@ -238,6 +249,11 @@ function resolveCaller(
   }
   if (caller.length > 64) {
     throw new TowerDoValidationError("as must be at most 64 characters");
+  }
+  if (caller === "all") {
+    throw new TowerDoValidationError(
+      'as must not be the reserved broadcast recipient "all"',
+    );
   }
   return caller;
 }
@@ -323,7 +339,7 @@ const TowerDoParamsSchema = Type.Object({
   baseRevision: Type.Optional(
     Type.Integer({
       description:
-        "Board revision you last observed (from tower_do_status). Rejects stale writes when a peer changed the board since.",
+        "Board revision you last observed (from tower_do_status). Rejects stale writes when a peer changed the board since; omitting it disables the stale-write check.",
       minimum: 0,
     }),
   ),
@@ -353,35 +369,49 @@ const TalkParamsSchema = Type.Object({
   ),
   body: Type.Optional(
     Type.String({
-      description: "send or finding: the message body or finding summary",
+      description: `send or finding: the message body or finding summary (send: max ${Math.round(MAX_MESSAGE_BYTES / 1024)} KiB — split oversized content into multiple messages)`,
     }),
   ),
   taskKey: Type.Optional(TaskKeySchema),
-  kind: Type.Optional(StringEnum(["bug", "improve", "vuln", "idea"] as const)),
-  severity: Type.Optional(StringEnum(["low", "medium", "high"] as const)),
+  kind: Type.Optional(
+    StringEnum(["bug", "improve", "vuln", "idea"] as const, {
+      description: "finding: kind (required when filing a new finding)",
+    }),
+  ),
+  severity: Type.Optional(
+    StringEnum(["low", "medium", "high"] as const, {
+      description: "finding: severity (default: medium)",
+    }),
+  ),
   title: Type.Optional(
     Type.String({
-      description: "finding: title",
+      description: "finding: title (required when filing a new finding)",
       maxLength: MAX_FINDING_TITLE_CHARS,
     }),
   ),
   summary: Type.Optional(
     Type.String({
-      description: "finding: summary",
+      description: "finding: summary (required when filing a new finding)",
       maxLength: MAX_FINDING_SUMMARY_CHARS,
     }),
   ),
   location: Type.Optional(
-    Type.String({ description: "finding: file/line location" }),
+    Type.String({
+      description: "finding: file/line location",
+      maxLength: 256,
+    }),
   ),
   suggestedFix: Type.Optional(
-    Type.String({ description: "finding: suggested fix" }),
+    Type.String({ description: "finding: suggested fix", maxLength: 2_000 }),
   ),
   findingId: Type.Optional(
     Type.String({ description: "finding: id to update (with status)" }),
   ),
   status: Type.Optional(
-    StringEnum(["open", "accepted", "rejected", "done"] as const),
+    StringEnum(["open", "accepted", "rejected", "done"] as const, {
+      description:
+        "finding update: new status; requires findingId; ignored for send/inbox",
+    }),
   ),
   limit: Type.Optional(
     Type.Integer({
@@ -392,7 +422,8 @@ const TalkParamsSchema = Type.Object({
   ),
   as: Type.Optional(
     Type.String({
-      description: "Identity to act as (default: session identity)",
+      description:
+        "Identity to act as (default: your session identity). Pass a subagent id when recording work on its behalf.",
       maxLength: 64,
     }),
   ),
@@ -401,18 +432,21 @@ const TalkParamsSchema = Type.Object({
 const StatusParamsSchema = Type.Object({
   owner: Type.Optional(
     Type.String({
-      description: "Filter tasks by owner identity",
+      description: "Filter tasks by owner identity (combined AND with status)",
       maxLength: 64,
     }),
   ),
   status: Type.Optional(
-    Type.String({
+    StringEnum(["pending", "in_progress", "completed", "blocked"] as const, {
       description: "Filter tasks by a single status",
-      maxLength: 16,
     }),
   ),
   limit: Type.Optional(
-    Type.Integer({ description: "Max task lines", minimum: 1, maximum: 200 }),
+    Type.Integer({
+      description: "Max task lines (default 200)",
+      minimum: 1,
+      maximum: 200,
+    }),
   ),
 });
 
@@ -426,6 +460,16 @@ const STATUS_GLYPH: Record<TowerDoStatus, string> = {
   pending: "○",
   blocked: "✗",
 };
+
+/** Theme color for a task status glyph. Shared by the widget and renderCall. */
+function statusColor(
+  status: TowerDoStatus,
+): "warning" | "error" | "success" | "muted" {
+  if (status === "in_progress") return "warning";
+  if (status === "blocked") return "error";
+  if (status === "completed") return "success";
+  return "muted";
+}
 
 function taskLine(task: TowerDoTask, showOwner: boolean): string {
   const owner = showOwner && task.owner !== undefined ? ` @${task.owner}` : "";
@@ -572,21 +616,14 @@ export default function towerDoExtension(pi: ExtensionAPI): void {
                   ? theme.fg("warning", ` ${inboxForMe} msg`)
                   : "");
               const lines = [header];
-              // collapsedTaskLimit caps how many unfinished tasks the
+              // WIDGET_TASK_LIMIT caps how many unfinished tasks the
               // above-editor line shows; the rest fold into an overflow note.
               const cap =
-                activeCwd === undefined
-                  ? unfinished.length
-                  : boards.entryFor(activeCwd).config.collapsedTaskLimit;
+                activeCwd === undefined ? unfinished.length : WIDGET_TASK_LIMIT;
               const shown = unfinished.slice(0, cap);
               for (const task of shown) {
                 const glyph = STATUS_GLYPH[task.status];
-                const color =
-                  task.status === "in_progress"
-                    ? "warning"
-                    : task.status === "blocked"
-                      ? "error"
-                      : "muted";
+                const color = statusColor(task.status);
                 const owner =
                   task.owner === undefined
                     ? ""
@@ -630,11 +667,7 @@ export default function towerDoExtension(pi: ExtensionAPI): void {
     const folded = await entry.board.fold();
     return cloneBoard({
       ...folded,
-      messages: retainMessages(
-        folded.messages,
-        folded,
-        entry.config.messageRetention,
-      ),
+      messages: retainMessages(folded.messages, folded, MESSAGE_RETENTION),
     });
   };
 
@@ -659,7 +692,12 @@ export default function towerDoExtension(pi: ExtensionAPI): void {
   pi.registerTool({
     name: TOWER_DO_TOOL_NAME,
     label: "TowerDo",
-    description: `Maintain the shared multi-agent WIP board with one atomic update. Every call replaces the task list: include each key to keep, omit a key to remove it. Existing tasks may omit unchanged fields; new tasks require subject and status. Up to ${MAX_TOWER_DO_TASKS} tasks. Tasks may carry an owner (only they or "tower" may change an owned task's fields — and removing (omitting) another owner's task or changing its scope is rejected), dependsOn (must be on the board or in this call), scope (file globs the task may touch), and blockedBy notes. Pass baseRevision from tower_do_status to avoid clobbering a peer's change.`,
+    description: `Maintain the shared multi-agent WIP board with one atomic update.
+- Full replacement: include every key to keep; omitting a key removes it.
+- Omitted optional fields on existing keys are preserved; new keys require subject and status.
+- Owner guard: a task with an owner can only be changed (any field) or removed by its owner or the "tower" identity.
+- Always pass baseRevision from tower_do_status; omitting it disables the stale-write check.
+- Up to ${MAX_TOWER_DO_TASKS} tasks. Optional per-task fields: dependsOn (must exist on the board or in this call), scope (file globs the task may touch), blockedBy (non-empty renders the task as blocked).`,
     promptSnippet:
       "Maintain the shared multi-agent WIP board with one atomic update",
     promptGuidelines: [
@@ -667,7 +705,7 @@ export default function towerDoExtension(pi: ExtensionAPI): void {
       "When a task needs a plan of 3+ steps, define it yourself and call tower_do with subject + status before beginning substantive work.",
       "Include baseRevision (from tower_do_status) in every tower_do call; a stale revision is rejected so you never silently overwrite a peer's update.",
       "Mark a task completed only after implementation and verification succeed. Use status blocked with a blockedBy note instead of leaving it hanging.",
-      "Claim shared tasks by setting owner and in_progress together. Only the owner or the orchestrator identity tower may later change that task's status, scope, or presence on the board — to remove or reassign another agent's task, message the owner via tower_do_talk instead of editing it directly.",
+      "Claim shared tasks by setting owner and in_progress together. Only the owner or the orchestrator identity tower may change an owned task's fields or remove it — to remove or reassign another agent's task, message the owner via tower_do_talk instead of editing it directly.",
       "Reconcile actual progress with the shared board before your final response, and do not issue a no-op tower_do call only to acknowledge a reminder.",
     ],
     parameters: TowerDoParamsSchema,
@@ -755,14 +793,7 @@ export default function towerDoExtension(pi: ExtensionAPI): void {
           continue;
         const status = isTowerDoStatus(task.status) ? task.status : "pending";
         const glyph = STATUS_GLYPH[status];
-        const color =
-          status === "in_progress"
-            ? "warning"
-            : status === "blocked"
-              ? "error"
-              : status === "completed"
-                ? "success"
-                : "muted";
+        const color = statusColor(status);
         const owner2 =
           typeof task.owner === "string" && task.owner
             ? theme.fg("dim", ` @${task.owner}`)
@@ -816,11 +847,11 @@ export default function towerDoExtension(pi: ExtensionAPI): void {
     name: TOWER_DO_TALK_TOOL_NAME,
     label: "TowerDo Talk",
     description:
-      'Cross-agent communication on the shared tower-do board. action=send delivers an inbox message to a task owner or "all" (self-send rejected; recipient must be a known owner). action=inbox lists messages addressed to you or "all", newest first. action=finding files a structured out-of-scope finding (bug|improve|vuln|idea) with severity/location/suggestedFix, or updates a finding\'s status via findingId + status. Use findings instead of silently editing other-owned tasks.',
+      'Cross-agent communication on the shared tower-do board. action=send delivers an inbox message to "all", the orchestrator identity "tower", or a task owner (self-send rejected). action=inbox lists messages addressed to you or "all", newest first. action=finding files a structured out-of-scope finding (bug|improve|vuln|idea) with severity/location/suggestedFix, or updates a finding\'s status via findingId + status. Use findings instead of silently editing other-owned tasks.',
     promptSnippet:
       "Send addressed messages or file findings on the shared multi-agent board",
     promptGuidelines: [
-      'Use tower_do_talk to communicate with task owners on the shared board instead of editing owned tasks directly; the recipient must be a known owner or "all".',
+      'Use tower_do_talk to communicate with task owners on the shared board instead of editing owned tasks directly; the recipient must be "all", "tower", or a known task owner.',
       "Use action=finding (not direct edits) when you discover an out-of-scope problem — file it with kind/severity/summary/suggestedFix so the owning agent and reviewers can route it.",
       "Keep message bodies brief and reference files by path; the board persists everything, so pointer-style notes keep context lean.",
     ],
@@ -1069,10 +1100,20 @@ export default function towerDoExtension(pi: ExtensionAPI): void {
           "finding location must be a single line",
         );
       }
+      if (location && location.length > 256) {
+        throw new TowerDoValidationError(
+          "finding location must be at most 256 characters",
+        );
+      }
       const suggestedFix = params.suggestedFix?.trim();
       if (suggestedFix && /[\r\n\u2028\u2029]/.test(suggestedFix)) {
         throw new TowerDoValidationError(
           "finding suggestedFix must be a single line",
+        );
+      }
+      if (suggestedFix && suggestedFix.length > 2_000) {
+        throw new TowerDoValidationError(
+          "finding suggestedFix must be at most 2000 characters",
         );
       }
       const finding: TowerDoFinding = {
@@ -1199,10 +1240,10 @@ export default function towerDoExtension(pi: ExtensionAPI): void {
         tasks.filter((task) => task.status === status);
       // Fetch a wider tail than the rendered window: presence (who is around,
       // who went idle) needs enough history to judge inactivity, while the
-      // rendered activity feed only shows the configured activityTail lines.
+      // rendered activity feed only shows the configured activity tail.
       // The tail is also the source for the header's "last updated" line, so
       // it is parsed once and shared by all three consumers.
-      const tailCount = boards.entryFor(ctx.cwd).config.activityTail;
+      const tailCount = STATUS_ACTIVITY_TAIL;
       const presenceCount = Math.max(tailCount, 200);
       const now = Date.now();
       const rawTail = (await board.rawTail(presenceCount)).reverse();
@@ -1304,12 +1345,12 @@ export default function towerDoExtension(pi: ExtensionAPI): void {
             : "";
           const blocked = taskIsBlocked(task, view) ? " [blocked]" : "";
           const unresolved = findAllUnresolvedDeps(task, view);
-          const reason =
-            task.status === "blocked" || task.blockedBy.length > 0
-              ? ` — waiting${task.blockedBy.length ? ` (blockedBy: ${task.blockedBy.join(", ")})` : ""}`
-              : unresolved.length > 0
-                ? ` — waiting for deps: ${unresolved.join(", ")}`
-                : "";
+          let reason = "";
+          if (task.status === "blocked" || task.blockedBy.length > 0) {
+            reason = ` — waiting${task.blockedBy.length ? ` (blockedBy: ${task.blockedBy.join(", ")})` : ""}`;
+          } else if (unresolved.length > 0) {
+            reason = ` — waiting for deps: ${unresolved.join(", ")}`;
+          }
           lines.push(
             `- ${STATUS_GLYPH[task.status]} ${task.key}: ${task.subject}${owner}${deps}${scope}${changedFilesSuffix(task)}${blocked}${reason}`,
           );
@@ -1374,7 +1415,7 @@ export default function towerDoExtension(pi: ExtensionAPI): void {
       }
       if (recentEntries.length === 0) lines.push("(no recent activity)");
 
-      const truncated = truncateTail(lines.join("\n") + "\n", {
+      const truncated = truncateTail(`${lines.join("\n")}\n`, {
         maxBytes: DEFAULT_MAX_BYTES,
       });
       const text = truncated.content;
@@ -1498,20 +1539,18 @@ export default function towerDoExtension(pi: ExtensionAPI): void {
         ? undefined
         : { messages };
     }
-    const entry = boards.entryFor(activeCwd);
-    const interval = entry.config.reminderInterval;
     const identity = sessionIdentity(activeCwd, pi);
     const tasks = getAllTasks(currentView);
     const hasUnfinished = tasks.some((task) => task.status !== "completed");
     const hasInbox = unreadMessagesToMe(currentView, identity).length > 0;
-    if (interval === 0 || (!hasUnfinished && !hasInbox)) {
+    if (!hasUnfinished && !hasInbox) {
       llmCallsSinceReminder = 0;
       return messages.length === event.messages.length
         ? undefined
         : { messages };
     }
     llmCallsSinceReminder += 1;
-    if (llmCallsSinceReminder < interval) {
+    if (llmCallsSinceReminder < REMINDER_INTERVAL) {
       return messages.length === event.messages.length
         ? undefined
         : { messages };
@@ -1532,7 +1571,7 @@ export default function towerDoExtension(pi: ExtensionAPI): void {
   });
 
   pi.on("session_compact", async (event, ctx) => {
-    pi.appendEntry(TOWER_DO_BOARD_TYPE, writeBoardCheckpoint(currentView));
+    pi.appendEntry(TOWER_DO_BOARD_TYPE, cloneBoard(currentView));
     if (event.willRetry || ctx.hasPendingMessages()) {
       contextCheckpointNeeded = false;
       llmCallsSinceReminder = 0;
@@ -1544,7 +1583,7 @@ export default function towerDoExtension(pi: ExtensionAPI): void {
             sessionIdentity(ctx.cwd, pi),
           ),
           display: false,
-          details: writeBoardCheckpoint(currentView),
+          details: cloneBoard(currentView),
         },
         { deliverAs: "steer" },
       );
@@ -1565,7 +1604,7 @@ export default function towerDoExtension(pi: ExtensionAPI): void {
           sessionIdentity(activeCwd, pi),
         ),
         display: false,
-        details: writeBoardCheckpoint(currentView),
+        details: cloneBoard(currentView),
       },
     };
   });

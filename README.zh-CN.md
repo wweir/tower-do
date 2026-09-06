@@ -49,6 +49,40 @@ pi 启动时自动发现扩展；已开会话用 `/reload` 加载。运行依赖
 
 身份解析：`as` 参数 > 项目配置 `identity` > 会话名 > 会话 id。代子代理记录工作时传它的 id（如 `as: "coder-1"`）。
 
+## 配置
+
+仅一个可选键 —— `<project>/.pi/tower-do/config.json`。无环境变量。
+
+```json
+{ "identity": "team-orchestrator" }
+```
+
+| 键 | 默认值 | 含义 |
+| --- | --- | --- |
+| `identity` | 会话名/会话 id | 钉住本会话的看板身份（项目级）；不得使用保留的编排者身份 `tower` |
+
+配置面就这些。文件缺失 = 默认值；未知键忽略（向前兼容）；文件损坏或 `identity` 非法在会话启动时大声报错——绝不静默回退，静默重置身份会破坏多 agent 场景下的 owner 匹配。该文件无 secret，可提交共享团队设置；只需 gitignore `board.jsonl`。详见 [docs/OPERATIONS.md](docs/OPERATIONS.md)。
+
+## 架构
+
+三层，依赖方向严格单向（上层依赖下层，从不反向）：
+
+```text
+Pi 会话 / 子代理（多个，同一项目）
+   │  tower_do · tower_do_talk · tower_do_status（+ widget、提醒）
+   ▼
+index.ts   扩展层 —— 工具参数与提示词契约、TUI widget、看板对账提醒、会话生命周期
+   ▼
+state.ts   纯逻辑核心 —— schema + 校验（全字段 owner 门禁、baseRevision 防覆盖门禁）、
+           事件折叠、只读派生（在场 / 阻塞 / scope 冲突 / 消息保留）；无 I/O
+   ▼
+board.ts   磁盘层 —— 追加式 JSONL 事件日志；每次读取都从磁盘重新折叠，写入方追加单行事件
+   ▼
+<project>/.pi/tower-do/board.jsonl   唯一事实源（file-as-state，所有会话共享；需 gitignore）
+```
+
+写路径：工具参数 → 校验 + revision 门禁 → 追加事件 → 折叠 → 视图。读路径：重新折叠事件得到视图，其余全部只读派生——除日志外没有可变状态文件。完整数据流与派生规则见 [docs/ARCHITECTURE.md](docs/ARCHITECTURE.md)。
+
 ## 文档
 
 | 文档 | 内容 |
@@ -62,11 +96,11 @@ pi 启动时自动发现扩展；已开会话用 `/reload` 加载。运行依赖
 
 ## 文件结构
 
-```
+```text
 ├── index.ts     # 扩展入口：3 工具 + widget + 提醒 + 生命周期
 ├── state.ts     # 纯 schema/校验/折叠/只读派生（无 I/O）
 ├── board.ts     # 磁盘层：追加式 JSONL（file-as-state）+ 配置
-├── test/        # smoke + owner-guard + presence-retention + changed-files + scope-conflicts
+├── test/        # smoke + owner-guard + presence-retention + changed-files + scope-conflicts + config
 ├── docs/        # PRODUCT / ARCHITECTURE / CONTRACTS / DECISIONS / OPERATIONS
 └── README.md
 ```
@@ -77,6 +111,7 @@ pi 启动时自动发现扩展；已开会话用 `/reload` 加载。运行依赖
 bun install                          # devDeps —— 仅类型检查/测试用
 bunx tsc --noEmit -p tsconfig.json   # strict + noUnused，零错误
 bun run test/smoke.ts               # 端到端：3 工具、持久化、项目边界、changedFiles 磁盘往返
+bun run test/config.ts              # 配置 fail-loud + 保留身份（11 用例）
 bun run test/owner-guard.ts         # 全字段 owner 门禁（10 用例）
 bun run test/presence-retention.ts  # 读回执 / 消息保留 / 在场派生（34 用例）
 bun run test/changed-files.ts       # P0 交付回执不变量（10 用例）
