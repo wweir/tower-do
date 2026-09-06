@@ -29,6 +29,7 @@ export const TOWER_DO_STATUS_TOOL_NAME = "tower_do_status";
 export const MAX_TOWER_DO_TASKS = 50;
 export const MAX_TASK_DEPENDENCIES = 20;
 export const MAX_SCOPE_GLOBS = 20;
+export const MAX_CHANGED_FILES = 100;
 export const DEFAULT_IDENTITY = "main";
 /** Reserved orchestrator identity that may act on any owned task (Tower). */
 export const TOWER_IDENTITY = "tower";
@@ -78,6 +79,8 @@ export interface TowerDoTaskInput {
   owner?: string;
   dependsOn?: string[];
   scope?: string[];
+  /** Delivery receipt: files the owner actually changed (completed only). */
+  changedFiles?: string[];
   blockedBy?: string[];
 }
 
@@ -89,6 +92,7 @@ interface ResolvedTowerDoTaskInput {
   owner?: string;
   dependsOn: string[];
   scope?: string[];
+  changedFiles?: string[];
   blockedBy: string[];
 }
 
@@ -179,6 +183,9 @@ function cloneTask(task: TowerDoTask): TowerDoTask {
     ...(task.owner === undefined ? {} : { owner: task.owner }),
     dependsOn: [...task.dependsOn],
     ...(task.scope === undefined ? {} : { scope: [...task.scope] }),
+    ...(task.changedFiles === undefined
+      ? {}
+      : { changedFiles: [...task.changedFiles] }),
     blockedBy: [...task.blockedBy],
   };
 }
@@ -324,6 +331,10 @@ export function writeBoardSnapshot(
           ...(patch.scope !== undefined || existing?.scope !== undefined
             ? { scope: patch.scope ?? existing!.scope }
             : {}),
+          ...(patch.changedFiles !== undefined ||
+          existing?.changedFiles !== undefined
+            ? { changedFiles: patch.changedFiles ?? existing!.changedFiles }
+            : {}),
           blockedBy:
             patch.blockedBy === undefined
               ? existing
@@ -396,7 +407,7 @@ export function writeBoardSnapshot(
     // Tower: only the owner or the orchestrator may change an owned task's
     // fields (see the removal guard below for task deletion); any agent may
     // add new tasks or touch unowned ones. The guard compares EVERY field
-    // (subject/description/status/owner/dependsOn/scope/blockedBy), not just
+    // (subject/description/status/owner/dependsOn/scope/changedFiles/blockedBy), not just
     // status/owner/scope — otherwise a worker replaying the full task list
     // (full-replacement semantics) could silently rewrite another owner's
     // content (e.g. its subject or dependencies) or roll back its concurrent
@@ -405,6 +416,8 @@ export function writeBoardSnapshot(
       existing.owner !== candidate.owner ||
       existing.status !== candidate.status ||
       existing.scope?.join("\u0000") !== candidate.scope?.join("\u0000") ||
+      existing.changedFiles?.join("\u0000") !==
+        candidate.changedFiles?.join("\u0000") ||
       existing.subject !== candidate.subject ||
       existing.description !== candidate.description ||
       existing.dependsOn.join("\u0000") !==
@@ -477,6 +490,9 @@ function cloneNormalizedTask(
     ...(task.owner === undefined ? {} : { owner: task.owner }),
     dependsOn: [...task.dependsOn],
     ...(task.scope === undefined ? {} : { scope: [...task.scope] }),
+    ...(task.changedFiles === undefined
+      ? {}
+      : { changedFiles: [...task.changedFiles] }),
     blockedBy: [...task.blockedBy],
   };
 }
@@ -489,6 +505,8 @@ function taskEquals(left: TowerDoTask, right: TowerDoTask): boolean {
     left.owner === right.owner &&
     left.dependsOn.join("\u0000") === right.dependsOn.join("\u0000") &&
     (left.scope ?? []).join("\u0000") === (right.scope ?? []).join("\u0000") &&
+    (left.changedFiles ?? []).join("\u0000") ===
+      (right.changedFiles ?? []).join("\u0000") &&
     left.blockedBy.join("\u0000") === right.blockedBy.join("\u0000")
   );
 }
@@ -502,6 +520,7 @@ function normalizeTask(
     owner?: string;
     dependsOn: string[];
     scope?: string[];
+    changedFiles?: string[];
     blockedBy: string[];
   },
   index: number,
@@ -566,6 +585,28 @@ function normalizeTask(
       );
     }
   }
+  const changedFiles = [
+    ...new Set(
+      (input.changedFiles ?? [])
+        .slice(0, MAX_CHANGED_FILES)
+        .map((file) =>
+          assertSingleLine(file.trim(), `tasks[${index}].changedFiles entry`),
+        )
+        .filter(Boolean),
+    ),
+  ];
+  for (const file of changedFiles) {
+    if (file.length === 0 || file.length > 256) {
+      throw new TowerDoValidationError(
+        `tasks[${index}].changedFiles entry must be 1-256 characters`,
+      );
+    }
+  }
+  if (changedFiles.length > 0 && input.status !== "completed") {
+    throw new TowerDoValidationError(
+      `tasks[${index}].changedFiles is a delivery receipt — it requires status "completed" (got "${input.status}")`,
+    );
+  }
   const blockedBy = [
     ...new Set(
       (input.blockedBy ?? [])
@@ -587,6 +628,7 @@ function normalizeTask(
     ...(owner === undefined ? {} : { owner }),
     dependsOn,
     ...(scope.length ? { scope } : {}),
+    ...(changedFiles.length ? { changedFiles } : {}),
     blockedBy,
   };
 }
@@ -677,6 +719,163 @@ export function findAllUnresolvedDeps(
 }
 
 // ---------------------------------------------------------------------------
+// Scope × changedFiles overlap detection (derived, read-only).
+//
+// P1: turn the (previously decorative) `scope` declaration into a *useful*
+// boundary signal. Because changedFiles is a delivery receipt (completed
+// only; a worker may set it once, owner/tower may amend) and scope is the
+// owner's declared file boundary, we can derive two advisory warnings without
+// any git access:
+//   1. boundary overlap — a task still in progress/pending has a scope glob
+//      that a COMPLETED task's receipt already touched → "files you plan to
+//      change were just changed by X";
+//   2. scope-vs-scope collision — two in_progress tasks declared overlapping
+//      globs → a planning mistake worth surfacing before both start writing.
+// Both are pure read derivations (like taskIsBlocked): nobody writes them to
+// the board; tower_do_status renders them as row suffixes. Advisory only —
+// never a gate, because scope is a self-declared glob and changedFiles is a
+// self-reported receipt (authoritative conflict resolution needs git diff
+// reads, which is out of TowerDo's scope).
+// ---------------------------------------------------------------------------
+
+export interface ScopeConflict {
+  /** Task key that has the overlapping declaration (in progress / pending). */
+  taskKey: string;
+  kind: "overlap" | "collision";
+  /** The completed task whose receipt collides (overlap), or the peer task. */
+  peerKey: string;
+  /** Human-readable summary of what collides. */
+  detail: string;
+}
+
+/**
+ * Minimal file-glob matcher (path segments joined by "/"). Supports:
+ *   `*`   — any run of chars within one segment (no "/")
+ *   `**`  — any number of segments (may span "/")
+ *   `?`   — exactly one char (no "/")
+ * No character classes / braces / negation — keep it dependency-free and
+ * predictable for the board's advisory use. A glob with no wildcard is
+ * treated as an exact path match.
+ */
+export function globMatchesPath(glob: string, path: string): boolean {
+  const g = glob.replaceAll("\\", "/");
+  const p = path.replaceAll("\\", "/");
+  // Fast path: no wildcards → exact match (both normalized, no trailing
+  // slash semantics — a directory glob like "src/" is not special here).
+  if (!g.includes("*") && !g.includes("?")) return g === p;
+
+  const gSeg = g.split("/");
+  const pSeg = p.split("/");
+
+  const matchFrom = (gi: number, pi: number): boolean => {
+    for (;;) {
+      if (gi === gSeg.length) return pi === pSeg.length;
+      const seg = gSeg[gi];
+      if (seg === "**") {
+        // `**` eats zero or more path segments: try every split point.
+        for (let skip = pi; skip <= pSeg.length; skip += 1) {
+          if (matchFrom(gi + 1, skip)) return true;
+        }
+        return false;
+      }
+      if (pi >= pSeg.length) return false;
+      if (!segmentMatches(seg, pSeg[pi])) return false;
+      gi += 1;
+      pi += 1;
+    }
+  };
+  return matchFrom(0, 0);
+}
+
+function segmentMatches(glob: string, value: string): boolean {
+  if (!glob.includes("*") && !glob.includes("?")) return glob === value;
+  // Build a regex char by char: escape regex metacharacters first, then map
+  // `*` → any non-slash run and `?` → exactly one non-slash char. (Escaping
+  // AFTER substituting `?` would escape the generated `.` and turn `?` into
+  // a literal dot — a classic order bug.)
+  let pattern = "";
+  for (const ch of glob) {
+    if (ch === "*") pattern += "[^/]*";
+    else if (ch === "?") pattern += "[^/]";
+    else pattern += ch.replace(/[.+^${}()|[\]\\]/g, "\\$&");
+  }
+  return new RegExp(`^${pattern}$`).test(value);
+}
+
+function scopeGlobIntersects(a: string, b: string): boolean {
+  // Two globs intersect if any path in one matches the other. For our
+  // advisory signal an exact conservative test is enough: either glob
+  // literally contains the other's head, or they share a concrete prefix
+  // segment. True glob-intersection is undecidable in general; we only need
+  // to flag the OBVIOUS collisions a planner would make.
+  if (globMatchesPath(a, b)) return true;
+  if (globMatchesPath(b, a)) return true;
+  const aDir = a.endsWith("/**") ? a.slice(0, -3) : a;
+  const bDir = b.endsWith("/**") ? b.slice(0, -3) : b;
+  return (
+    aDir === bDir || aDir.startsWith(`${bDir}/`) || bDir.startsWith(`${aDir}/`)
+  );
+}
+
+/**
+ * Derive advisory scope conflicts for a board view. Returns one entry per
+ * in-progress/pending task that collides with a completed task's receipt
+ * (kind "overlap") or with another in-progress task's scope (kind
+ * "collision"). Read-only; never throws; renders nothing itself.
+ */
+export function findScopeConflicts(board: TowerBoardView): ScopeConflict[] {
+  const conflicts: ScopeConflict[] = [];
+  const completed = board.tasks.filter((t) => t.status === "completed");
+  const active = board.tasks.filter(
+    (t) => t.status === "in_progress" || t.status === "pending",
+  );
+  for (const task of active) {
+    if (task.scope === undefined || task.scope.length === 0) continue;
+    // 1. overlap: a completed task's receipt file sits inside my scope glob.
+    for (const done of completed) {
+      if (done.key === task.key) continue;
+      const files = done.changedFiles ?? [];
+      if (files.length === 0) continue;
+      const hit = files.find((file) =>
+        task.scope!.some((glob) => globMatchesPath(glob, file)),
+      );
+      if (hit !== undefined) {
+        conflicts.push({
+          taskKey: task.key,
+          kind: "overlap",
+          peerKey: done.key,
+          detail: `${hit} (touched by ${done.key} ${done.owner ? `@${done.owner}` : ""})`,
+        });
+      }
+    }
+  }
+  // 2. collision: two in-progress tasks declared intersecting scope globs.
+  const inProgress = board.tasks.filter((t) => t.status === "in_progress");
+  for (let i = 0; i < inProgress.length; i += 1) {
+    for (let j = i + 1; j < inProgress.length; j += 1) {
+      const a = inProgress[i];
+      const b = inProgress[j];
+      if (a.key === b.key) continue;
+      const aScope = a.scope ?? [];
+      const bScope = b.scope ?? [];
+      if (aScope.length === 0 || bScope.length === 0) continue;
+      const collides = aScope.some((ga) =>
+        bScope.some((gb) => scopeGlobIntersects(ga, gb)),
+      );
+      if (collides) {
+        conflicts.push({
+          taskKey: a.key,
+          kind: "collision",
+          peerKey: b.key,
+          detail: `scope ${aScope.join(", ")} × ${bScope.join(", ")}`,
+        });
+      }
+    }
+  }
+  return conflicts;
+}
+
+// ---------------------------------------------------------------------------
 // Persisted-state reading (board file entries) + session checkpoint replay.
 // The disk board is authoritative; the session checkpoint is a fallback.
 // ---------------------------------------------------------------------------
@@ -711,6 +910,11 @@ export function readPersistedTask(
   const scope = Array.isArray(candidate.scope)
     ? candidate.scope.filter((item): item is string => typeof item === "string")
     : undefined;
+  const changedFiles = Array.isArray(candidate.changedFiles)
+    ? candidate.changedFiles.filter(
+        (item): item is string => typeof item === "string",
+      )
+    : undefined;
   const blockedBy = Array.isArray(candidate.blockedBy)
     ? candidate.blockedBy.filter(
         (item): item is string => typeof item === "string",
@@ -726,6 +930,9 @@ export function readPersistedTask(
         ...(owner ? { owner } : {}),
         dependsOn,
         ...(scope !== undefined && scope.length ? { scope } : {}),
+        ...(changedFiles !== undefined && changedFiles.length
+          ? { changedFiles }
+          : {}),
         blockedBy,
       },
       index,

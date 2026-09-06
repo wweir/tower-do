@@ -67,6 +67,7 @@ import {
   FINDING_STATUSES,
   formatActivityFeed,
   formatBoardReminder,
+  findScopeConflicts,
   formatPresenceLine,
   getAllTasks,
   isTowerDoStatus,
@@ -279,7 +280,7 @@ const TowerDoTaskSchema = Type.Object({
   owner: Type.Optional(
     Type.String({
       description:
-        'Agent/session identity that owns this task. Only the owner or the orchestrator identity "tower" may change its fields (subject/description/status/owner/dependsOn/scope/blockedBy).',
+        'Agent/session identity that owns this task. Only the owner or the orchestrator identity "tower" may change its fields (status/owner/scope/changedFiles/subject/description/dependsOn/blockedBy).',
       maxLength: 64,
     }),
   ),
@@ -295,6 +296,13 @@ const TowerDoTaskSchema = Type.Object({
       description:
         "Optional file-glob list describing what paths this task may touch (Tower mission scope). Only owner/tower may change it.",
       maxItems: 20,
+    }),
+  ),
+  changedFiles: Type.Optional(
+    Type.Array(Type.String(), {
+      description:
+        'Delivery receipt: files the owner actually changed. Only settable when status is "completed" (set it in the same call that completes the task). A worker may set it once; its owner or "tower" may amend later (the owner guard rejects other workers). Paths are repo-relative.',
+      maxItems: 100,
     }),
   ),
   blockedBy: Type.Optional(
@@ -424,6 +432,17 @@ function taskLine(task: TowerDoTask, showOwner: boolean): string {
   const deps = task.dependsOn.length ? ` ← ${task.dependsOn.join(",")}` : "";
   const scope = task.scope?.length ? ` [scope: ${task.scope.join(", ")}]` : "";
   return `${task.key}: ${task.subject}${owner}${deps}${scope}`;
+}
+
+/** Receipt rendering: ` [files: a.ts, b.ts]` — only ever present on completed tasks. */
+function changedFilesSuffix(task: TowerDoTask): string {
+  const files = task.changedFiles;
+  if (files === undefined || files.length === 0) return "";
+  const joined =
+    files.length <= 4
+      ? files.join(", ")
+      : `${files.slice(0, 4).join(", ")}, …+${files.length - 4}`;
+  return ` [files: ${joined}]`;
 }
 
 function formatChange(
@@ -1205,6 +1224,10 @@ export default function towerDoExtension(pi: ExtensionAPI): void {
         )
         .sort((a, b) => b.at - a.at)
         .slice(0, 20);
+      // P1: derived scope × changedFiles advisory. Pure read, rendered as a
+      // dedicated section (not per-row suffix) so long scope lists don't
+      // explode every task line.
+      const scopeConflicts = findScopeConflicts(view);
 
       if (params.status !== undefined && !isTowerDoStatus(params.status)) {
         throw new TowerDoValidationError(
@@ -1288,7 +1311,7 @@ export default function towerDoExtension(pi: ExtensionAPI): void {
                 ? ` — waiting for deps: ${unresolved.join(", ")}`
                 : "";
           lines.push(
-            `- ${STATUS_GLYPH[task.status]} ${task.key}: ${task.subject}${owner}${deps}${scope}${blocked}${reason}`,
+            `- ${STATUS_GLYPH[task.status]} ${task.key}: ${task.subject}${owner}${deps}${scope}${changedFilesSuffix(task)}${blocked}${reason}`,
           );
         }
         lines.push("");
@@ -1299,6 +1322,22 @@ export default function towerDoExtension(pi: ExtensionAPI): void {
       renderGroup("completed", "Completed");
 
       if (shown.length === 0) lines.push("(no tasks match the filter)");
+
+      if (scopeConflicts.length > 0) {
+        lines.push(`## Scope conflicts (${scopeConflicts.length}) — advisory`);
+        for (const conflict of scopeConflicts) {
+          const glyph = conflict.kind === "collision" ? "⚠" : "⛔";
+          const label =
+            conflict.kind === "collision"
+              ? `collision: ${conflict.taskKey} × ${conflict.peerKey}`
+              : `overlap: ${conflict.taskKey} plans to touch what ${conflict.peerKey} already changed`;
+          lines.push(`- ${glyph} ${label} — ${conflict.detail}`);
+        }
+        lines.push(
+          "  (advisory: scope is self-declared, changedFiles is self-reported — resolve by messaging the owner or re-scoping, not by gate)",
+        );
+        lines.push("");
+      }
 
       lines.push(
         `## Messages for ${caller} (${myMessages.length}; ${myUnread} unread)`,

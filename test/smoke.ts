@@ -1,8 +1,9 @@
 /**
  * tower-do smoke test — two layers:
- *  1. pure state + board layer (multi-agent semantics)
+ *  1. pure state + board layer (multi-agent semantics incl. the changedFiles
+ *     delivery-receipt disk round-trip via append/fold across instances)
  *  2. the real extension via a mock ExtensionAPI (tools execute end-to-end)
- * Run with: bun run /tmp/tower-do-smoke.ts
+ * Run with: bun run test/smoke.ts
  */
 import { mkdirSync, mkdtempSync, writeFileSync } from "node:fs";
 import { tmpdir } from "node:os";
@@ -262,6 +263,59 @@ async function layer1(): Promise<void> {
     view.tasks.every((t) => t.key !== "gemm") &&
       view.tasks.find((t) => t.key === "test")?.dependsOn.length === 0,
     `tasks=${view.tasks.map((t) => t.key).join(",")}`,
+  );
+
+  // changedFiles receipt survives the DISK round-trip (board.append → fold):
+  // a completed task carrying the receipt must re-fold it from the JSONL
+  // event log, including via a second TowerBoard instance on the same file
+  // (the path a peer session actually reads).
+  const doneWrite = writeBoardSnapshot(
+    view,
+    {
+      tasks: [
+        {
+          key: "readme",
+          subject: "write vulkan API survey into README",
+          status: "completed",
+          owner: "bob",
+          changedFiles: ["README.md", "src/api/types.ts"],
+        },
+        {
+          key: "test",
+          subject: "run sqznet test",
+          status: "pending",
+          owner: "carol",
+          dependsOn: [],
+        },
+      ],
+      baseRevision: view.revision,
+    },
+    "bob",
+  );
+  view = doneWrite.view;
+  await board.append(doneWrite.taskEvents);
+  const receipt = doneWrite.view.tasks.find((t) => t.key === "readme");
+  check(
+    "completing with changedFiles persists the receipt",
+    receipt?.status === "completed" &&
+      JSON.stringify(receipt.changedFiles) ===
+        JSON.stringify(["README.md", "src/api/types.ts"]),
+    `changedFiles=${JSON.stringify(receipt?.changedFiles)}`,
+  );
+  const freshBoard = new TowerBoard(file);
+  const reFolded = await freshBoard.fold();
+  const reRead = reFolded.tasks.find((t) => t.key === "readme");
+  check(
+    "changedFiles receipt survives disk fold across instances",
+    reRead?.status === "completed" &&
+      JSON.stringify(reRead.changedFiles) ===
+        JSON.stringify(["README.md", "src/api/types.ts"]),
+    `reFolded changedFiles=${JSON.stringify(reRead?.changedFiles)}`,
+  );
+  check(
+    "revision still equals a refold after the receipt write",
+    reFolded.revision === doneWrite.view.revision,
+    `refold=${reFolded.revision} write=${doneWrite.view.revision}`,
   );
 }
 
