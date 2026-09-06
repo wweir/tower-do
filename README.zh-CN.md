@@ -2,6 +2,11 @@
 
 > 一个 todo 风格的 pi 扩展，融入了 **Kimi Tower 多 worker 编排**的协调设计，让多个 agent（会话/子代理）共享"正在进行的事"以及与任务绑定的沟通状态。
 
+[![npm version](https://img.shields.io/npm/v/tower-do.svg)](https://www.npmjs.com/package/tower-do)
+[![Pi gallery](https://img.shields.io/badge/Pi-gallery-7c3aed)](https://pi.dev/packages/tower-do)
+[![GitHub](https://img.shields.io/badge/GitHub-wweir%2Ftower--do-181717?logo=github)](https://github.com/wweir/tower-do)
+[![License: MIT](https://img.shields.io/badge/license-MIT-yellow.svg)](LICENSE)
+
 [English README](./README.md)
 
 ## 安装
