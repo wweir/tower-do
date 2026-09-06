@@ -11,7 +11,7 @@ jobs:
   test-and-publish:
     runs-on: ubuntu-latest
     permissions:
-      contents: read
+      contents: write # create the GitHub Release
       id-token: write # for npm provenance (public registry)
     steps:
       - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
@@ -60,3 +60,21 @@ jobs:
         run: npm publish --provenance --access public
         env:
           NODE_AUTH_TOKEN: ${{ secrets.NPM_TOKEN }}
+
+      # Create the GitHub Release from the version tag (npm publish done).
+      # Notes cover commits since the previous v* tag — no third-party action.
+      - name: Create GitHub Release
+        run: |
+          prev="$(git tag --sort=-v:refname | grep -E '^v[0-9]+' | sed -n 2p || true)"
+          if [ -n "$prev" ]; then
+            range="$prev..HEAD"
+          else
+            range="HEAD"
+          fi
+          notes="$(git log "$range" --oneline --no-merges 2>/dev/null | sed 's/^[0-9a-f]\{7,\}//' | grep -E '^(feat|fix|chore|docs|ci|refactor|perf|test|revert)(\(|:)' | sed 's/^/ - /' || true)"
+          if [ -z "$notes" ]; then
+            notes="Release ${GITHUB_REF_NAME}"
+          fi
+          gh release create "$GITHUB_REF_NAME" --title "$GITHUB_REF_NAME" --notes "$notes"
+        env:
+          GH_TOKEN: ${{ github.token }}
