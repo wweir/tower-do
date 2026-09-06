@@ -1,119 +1,122 @@
-# tower-do — 共享多 Agent WIP 看板（pi 扩展）
+# tower-do — Shared Multi-Agent WIP Board (Pi extension)
 
-> 一个 todo 风格的 pi 扩展，融入了 **Kimi Tower 多 worker 编排**的协调设计，让多个 agent（会话/子代理）共享"正在进行的事"以及与任务绑定的沟通状态。
+> A todo-flavored Pi extension inspired by **Kimi Tower's multi-worker orchestration** design. Multiple agents (sessions / subagents) share a live view of "what's in progress" plus task-bound communication state.
 
-## 安装
+[中文版说明 / Chinese README](./README.zh-CN.md)
 
-**方式一：从 npm 安装（推荐）**
+## Install
+
+**Option 1 — from npm (recommended)**
 
 ```bash
 pi install npm:tower-do
 ```
 
-**方式二：从 git 安装**
+**Option 2 — from git**
 
 ```bash
 pi install git:https://github.com/wweir/tower-do.git@main
 ```
 
-**方式三：手动放到全局扩展目录**
+**Option 3 — manual copy to the global extensions dir**
 
 ```bash
 mkdir -p ~/.pi/agent/extensions && cp -r tower-do ~/.pi/agent/extensions/
 ```
 
-pi 启动即自动发现；已有会话用 `/reload` 热加载。运行时依赖 `typebox` 与 `@earendil-works/*` 由 pi 环境提供（peerDependencies，无需手动安装）。
+Pi auto-discovers the extension at startup; existing sessions pick it up with `/reload`. Runtime dependencies (`typebox`, `@earendil-works/*`) are provided by the Pi environment (declared as peerDependencies — no manual install needed).
 
-## 工具
+## Tools
 
-| 工具 | 作用 |
+| Tool | Purpose |
 | --- | --- |
-| `tower_do` | 共享看板的一键原子更新：plan / 认领（owner+in_progress）/ 完成 / 阻塞（blocked+blockedBy）。支持 `baseRevision` 防踩踏 |
-| `tower_do_talk` | 跨 agent 沟通：`send`（给已知 owner 或 `all` 发消息，禁自发）、`inbox`、`finding`（结构化越界上报/状态更新） |
-| `tower_do_status` | 共享仪表盘：所有人的 WIP（owner/依赖/scope/阻塞原因）、给我的消息、未决 finding、活动尾 |
+| `tower_do` | One-shot atomic board update: plan / claim (`owner` + `in_progress`) / complete / block (`blocked` + `blockedBy`). Supports `baseRevision` for clobber protection |
+| `tower_do_talk` | Cross-agent messaging: `send` (to a known owner or `all`; self-send rejected), `inbox`, `finding` (structured out-of-scope report / status update) |
+| `tower_do_status` | Shared dashboard: everyone's WIP (owner / deps / scope / block reasons), messages for you, open findings, activity tail |
 
-身份解析：`as` 参数 > 项目配置 `identity` > 会话名 > 会话 id。为子代理代记时传子代理 id（如 `as: "coder-1"`）。
+Identity resolution: `as` param > project config `identity` > session name > session id. When recording work on behalf of a subagent, pass its id (e.g. `as: "coder-1"`).
 
-## 与 Kimi Tower 的对应（设计映射）
+## Mapping to Kimi Tower (design correspondence)
 
-| Kimi Tower 机制 | tower-do 落地 |
+| Kimi Tower mechanism | tower-do implementation |
 | --- | --- |
-| 共享黑板（file-as-state） | `<project>/.pi/tower-do/board.jsonl`，append-only JSONL，折叠成当前视图；任何能读文件的会话/子代理都能看到同一份 WIP |
-| 角色分工（worker 只动自己的 mission） | 任务可带 `owner`；只有 owner 或保留身份 `tower` 能改它的 status/scope（越权直接报错） |
-| mission scope | 任务可带 `scope`（文件 glob），全可见，仅 owner/tower 可扩 |
-| 协商（站内信/finding） | `tower_do_talk`：收件人必须是已知 owner 或 `all`、禁自发；越界发现走 finding 而不是偷偷改 |
-| 确定性门禁（revision 工具读数） | 看板 `revision` 由文件事件数推导（写入结果 = 重折叠结果），`baseRevision` 陈旧即拒——绝不静默覆盖同伴的更新 |
+| Shared blackboard (file-as-state) | `<project>/.pi/tower-do/board.jsonl`, append-only JSONL folded into the current view; any session/subagent that can read the file sees the same WIP |
+| Role separation (workers touch only their own mission) | Tasks carry `owner`; only the owner or the reserved identity `tower` can change its status/scope (out-of-scope writes error out) |
+| Mission scope | Tasks carry `scope` (file globs), visible to all, extendable only by owner/tower |
+| Negotiation (interoffice mail / findings) | `tower_do_talk`: recipient must be a known owner or `all`, self-send forbidden; out-of-scope discoveries go through `finding` instead of silent edits |
+| Deterministic gate (revision-based read) | Board `revision` is derived from the event count (write result = re-fold result); stale `baseRevision` is rejected — never silently overwrite a peer's update |
 
-## 多 agent 用法
+## Multi-agent usage
 
-**同一 pi 会话 + 子代理（典型）**：父代理 `tower_do` 拆任务、`owner` 认领；把 `tower_do_status` 输出的看板路径给子代理读（file-as-state），子代理回传结果，父代理 `tower_do` 收口（或传 `as` 代记）。依赖关系用 `dependsOn`（未完成的依赖会显示为阻塞原因）。
+**One Pi session + subagents (typical)**: the parent `tower_do`s out tasks and claims `owner`s; hand the board path printed by `tower_do_status` to subagents (file-as-state), they report results back, the parent closes out with `tower_do` (or records on their behalf with `as`). Model dependencies with `dependsOn` (unfinished deps surface as block reasons).
 
-**多个 pi 会话共享同一项目**：两边自动读写同一个 `<project>/.pi/tower-do/board.jsonl`；一个会话发消息，另一个 `inbox` 可读——这就是跨 agent 消息的落地形态。
+**Multiple Pi sessions sharing one project**: both sides read/write the same `<project>/.pi/tower-do/board.jsonl` automatically; one session sends a message, the other reads it via `inbox` — that is cross-agent messaging made concrete.
 
-## 作用域：什么算一个「项目」
+## Scope: what counts as a "project"
 
-看板按**项目**共享，不是按字面工作目录。每个会话的 `cwd` 会先向上解析到**最近的 git 根**（含 `.git` 目录的仓库，或含 `gitdir:` 文件的 worktree/submodule）；**若一直找不到 git 边界，则该目录本身就是项目边界**。
+The board is shared per **project**, not per literal working directory. Each session's `cwd` is first resolved upward to the **nearest git root** (a repo containing `.git`, or a worktree/submodule whose `.git` is a file with `gitdir:`); **if no git boundary is found, the directory itself is the project boundary**.
 
-| 场景 | 效果 |
+| Scenario | Effect |
 | --- | --- |
-| `cd /repo` 与 `cd /repo/src` 两个会话 | 共享同一块板（同 git 根） |
-| 同 repo 根会话 + 任意深子目录会话 | 共享（都锚定到 repo 根） |
-| 两个互不相干的非 git 目录 | 各自独立（目录即边界） |
-| 嵌套 git repo（子目录自带 `.git`） | 各自按自己的根，互不越界 |
-| git worktree（`.git` 是文件） | 该 worktree 根即边界 |
+| Sessions in `/repo` and `/repo/src` | Same board (same git root) |
+| Repo-root session + any nested dir session | Shared (both anchor to repo root) |
+| Two unrelated non-git dirs | Independent (dir is the boundary) |
+| Nested git repos (child has own `.git`) | Each anchors to its own root, no crossing |
+| Git worktree (`.git` is a file) | Worktree root is the boundary |
 
-配置 `config.json` 同样锚定到项目根：`identity` 是**项目级**的，同一项目不同会话共享同一身份配置。
+`config.json` anchors to the same project root: `identity` is **project-level** — different sessions in the same project share one identity config.
 
-## 配置（可选）
+## Configuration (optional)
 
-`<project>/.pi/tower-do/config.json`：
+`<project>/.pi/tower-do/config.json`:
 
 ```json
 { "identity": "team-orchestrator", "reminderInterval": 3, "collapsedTaskLimit": 3, "activityTail": 8, "messageRetention": 50 }
 ```
 
-- `reminderInterval`: 每 N 次 LLM 调用注入一次看板对账提醒（0=关）
-- `identity`: 固定本会话身份（否则取会话名/会话 id）
-- `collapsedTaskLimit`: widget 未完成任务最多显示行数（超出折叠为 `… +N more`）
-- `activityTail`: `tower_do_status` 活动尾显示的事件行数
-- `messageRetention`: 消息保留预算——**全员已读**的旧消息超过该预算即从所有读视图退出（默认 50，`0` = 全保留，旧行为）；未读/部分已读的消息永不退出
+- `reminderInterval`: inject a board-reconciliation reminder every N LLM calls (0 = off)
+- `identity`: pin this session's identity (otherwise session name / session id)
+- `collapsedTaskLimit`: max unfinished-task rows shown in the widget (overflow folds to `… +N more`)
+- `activityTail`: number of activity lines shown by `tower_do_status`
+- `messageRetention`: message retention budget — **fully-read** old messages past this budget leave all read views (default 50, `0` = keep all, legacy behavior); unread / partially-read messages never leave
 
-## 设计要点与约定
+## Design notes & conventions
 
-- **写路径全部在 `withFileMutationQueue` 内 re-fold**：baseRevision 校验与 diff 都基于锁内最新视图，杜绝"先读后写"竞态（与 Kimi Tower store 的可验证性同一哲学）。
-- 每个变更都是追加事件（`{kind,task|message|finding,...}`）；revision = 累计任务事件数，**write 返回的 revision 与重折叠完全一致**。无任何字段变化的 `tower_do` 调用（no-op）回执明确提示 `board unchanged`、不追加事件、且**保留原 `updatedAt` 不漂移**。
-- **删除有守卫 + 全量替换**：`tower_do` 是整板替换——每个省略的 key 都被删除。删除只允许删自己的或无人认领的任务；删别人的 owned 任务会被 owner 守卫拒绝。依赖校验基于**写后图**：幸存任务不能依赖本写中被删的任务（可同写先 `dependsOn: []` 清依赖再删目标），也不能依赖板上不存在或本写未提供的任务。owned 任务的 status/owner/scope 只有 owner/tower 能改（subject/description 非保护字段，整板 LWW 重写时允许携带）。
-- 消息 body ≤ 32KB；多行报告用指针式引用，保持上下文精简。
-- **消息带已读回执**：`readBy` 记录谁读过；`tower_do_talk inbox` 阅读即自动 ack（追加同 id 事件，LWW 折叠不重复）。广播的**发送者不算读者**（自发消息不进自己 inbox），因此其余 owner 都读过后广播即可退役。广播发送时会**快照当时的 owner 列表为 `audience`**：之后新加入的 owner 不是广播受众，不会让旧广播永不退役。**历史日志的 backward-compat**：无 audience 字段的旧广播在 fold 时从重放点的 owner 表**回填 audience**（取发送时刻在场 owner，sender 除外；owner 转移不泄漏旧 owner；后续 ack 重放不会拓宽已回填的 audience）。
-- **无法投递的消息自动退役**：指名消息若收件人已离开板（板重建/清空后无人能读）视为已读可退役；**广播的 audience 成员若已全部离场**（整轮测试/协调结束，板在全新 owner 下重建）同样视为可退役——已结束的广播轮次不会因无人读而永久卡住保留预算。孤儿消息不会无限占用折叠视图。
-- **历史消息退出机制**：只读视图（status/inbox/reminder/widget）统一套 `retainMessages`——**未读永不退出**，仅当全员已读的消息数超出 `messageRetention` 预算时，最旧的已读历史退出视图。磁盘 append-only 事件日志保留（审计），fold 输出不再膨胀。
-- **在场（presence）零写入派生**：`tower_do_status` 的 `Who is around` 段从活动日志按 `by` 聚合最近时间得出（纯读，绝不把读操作者标成活跃），只列出**拥有未完成任务的人**或**1 小时内活动过的人**，其余历史身份折叠为计数。状态区分三种：**活跃**（刚动过）、**`⚠ idle`**（曾活动但超过 10 分钟无动作——协调者可消息或回收）、**(not started)**（新分配、从未在板上活动——不是停滞，不误报 idle）。tower_do 写回执也会尾注真实 idle owners。`Recent activity` 段渲染为紧凑人类行（`who · time · glyph detail`），消息 ack 显示为 `👁 read` 而非重发。相邻事件间隔超过 30 分钟时渲染 `── session break ──` 分隔线，区分"同一次会话连续操作"与"隔了多次会话"；头部另加一行 `last updated N ago by X`（从活动尾纯读派生），revision 本身单调但不带活跃度——一眼判断板是否停滞。
-- 完成标准：任务 completed 只应在实现+验证成功之后；等依赖/同伴用 `blocked` + `blockedBy`，不要挂着不动。
-- 内存态只作 widget/提醒缓存，磁盘文件是唯一权威；工作区被清理后从最近会话检查点（custom entry）恢复兜底。
+- **Every write path re-folds inside `withFileMutationQueue`**: baseRevision validation and diffing both run against the latest lock-held view, eliminating read-then-write races (same verifiability philosophy as the Kimi Tower store).
+- Every change is an appended event (`{kind, task|message|finding, ...}`); revision = cumulative task-event count, and **the revision a write returns exactly equals a re-fold**. A `tower_do` call with no field changes (no-op) replies `board unchanged`, appends no event, and **keeps the original `updatedAt` without drift**.
+- **Delete is guarded + full-board replacement**: `tower_do` replaces the whole board — every omitted key is deleted. Deletion is only allowed for your own or unclaimed tasks; deleting another's owned task is rejected by the owner guard. Dependency validation runs on the **post-write graph**: surviving tasks may not depend on tasks deleted in the same write (clear deps with `dependsOn: []` first, then delete), nor on tasks absent from the board or not provided by this write. A task's status/owner/scope may only be changed by owner/tower (subject/description are unprotected; they may ride along in a full-board LWW rewrite).
+- Message bodies ≤ 32 KB; use pointer-style references for long reports to keep context lean.
+- **Messages carry read receipts**: `readBy` records who read; reading via `tower_do_talk inbox` auto-acks (appends a same-id event; LWW fold dedupes). A broadcast's **sender does not count as a reader** (self-sent messages never enter your own inbox), so a broadcast can retire once every other owner has read it. On send, the current owner list is **snapshotted as `audience`**: owners joining later are not part of the audience and cannot pin an old broadcast forever. **Backward compat for historical logs**: old broadcasts without an `audience` field are **back-filled at fold time** from the owner table at the replay point (owners present at send time, sender excluded; owner transfers don't leak old owners; later ack replays never widen an already back-filled audience).
+- **Undeliverable messages auto-retire**: a named message whose recipient has left the board (rebuilt/cleared, nobody can read it) counts as read and can retire; a **broadcast whose whole audience has left** (round of testing/coordination over, board rebuilt under fresh owners) can retire too — finished broadcast rounds don't squat the retention budget forever because nobody reads them. Orphan messages never grow the folded view without bound.
+- **Historical-message exit**: all read views (status / inbox / reminder / widget) go through `retainMessages` — **unread never exits**; only when fully-read messages exceed the `messageRetention` budget do the oldest read ones leave the view. The append-only event log on disk is preserved (audit); the fold output no longer bloats.
+- **Presence derived with zero writes**: the `Who is around` section of `tower_do_status` aggregates recent timestamps from the activity log by `by` (pure read — never marks the reader as active), listing only **people with unfinished tasks** or **people active within the last hour**; other historical identities fold into a count. Three states: **active** (touched recently), **`⚠ idle`** (was active but no action for 10+ minutes — coordinator may message or reclaim), **(not started)** (newly assigned, never active on the board — not stalled, not a false idle). `tower_do` write receipts also footnote real idle owners. The `Recent activity` section renders compact human lines (`who · time · glyph detail`); message acks show as `👁 read` instead of re-sends. When adjacent events are > 30 min apart, a `── session break ──` divider separates "same continuous session" from "multiple sessions apart"; a header line `last updated N ago by X` (derived purely from the activity tail) makes it obvious at a glance whether the board is stalled — `revision` is monotonic but carries no liveness.
+- Done criteria: mark a task `completed` only after implementation + verification succeed; when waiting on a dependency or peer use `blocked` + `blockedBy`, don't leave it hanging.
+- In-memory state is only a widget/reminder cache; the disk file is the single source of truth; if the workspace is cleaned up, recover from the most recent session checkpoint (custom entry).
 
-## 验证
+## Verification
 
 ```bash
-cd <repo>/extensions/tower-do   # 或已 clone 的仓库根
-tsc --noEmit -p tsconfig.json   # 权威类型检查（含 strict + noUnused）
-bun run test/smoke.ts                # 冒烟：ownership/删除越权、悬空依赖、stale revision、消息/finding、跨实例持久化、三工具端到端
-bun run test/owner-guard.ts          # full-field 属主守卫回归（10 项）
-bun run test/presence-retention.ts   # 已读回执 + 历史退出 + 在场派生 + feed 渲染/会话分隔 + 孤儿/audience 退役回归（34 项）
+cd <repo>                # repo root
+bun install              # install devDeps (bun-types + typescript); only needed for typecheck/tests
+bunx tsc --noEmit -p tsconfig.json   # authoritative typecheck (strict + noUnused)
+bun run test/smoke.ts                # smoke: ownership/delete overreach, dangling deps, stale revision, messages/findings, cross-instance persistence, all three tools end-to-end
+bun run test/owner-guard.ts          # full-field owner guard regression (10 cases)
+bun run test/presence-retention.ts   # read receipts + historical exit + presence derivation + feed rendering/session breaks + orphan/audience retirement regression (34 cases)
 ```
 
-冒烟覆盖：规划持久化、依赖阻塞/解锁、`tower` 绕过与任意删除、owner-only 变更/删除强制、悬空依赖拦截、同写删依赖目标拒绝/清依赖后放行、stale baseRevision 拒绝、站内信投递与收件箱、tower 合法收件人、禁自发、字段单行约束、非法 status 过滤报错、finding 上报与仪表盘可见、跨子目录/嵌套 repo/worktree 项目作用域、第二会话读到同一看板。
+Smoke covers: planning persistence, dependency blocking/unblocking, `tower` bypass & arbitrary delete, owner-only change/delete enforcement, dangling-dependency interception, same-write delete-with-dependent rejection / clear-then-delete allowance, stale `baseRevision` rejection, interoffice mail delivery & inbox, `tower` as a legal recipient, self-send ban, single-line field constraint, invalid status filter error, finding reporting & dashboard visibility, cross-subdir/nested-repo/worktree project scoping, second session reading the same board.
 
-## 文件
+## Files
 
 ```
-├── index.ts     # 扩展入口：3 工具 + widget + 提醒 + 生命周期
-├── state.ts     # 纯 schema/校验/折叠/快照/已读保留/在场派生（参考 todo 扩展的 state.ts 风格）
-├── board.ts     # 磁盘层：append-only JSONL（file-as-state）+ 配置
+├── index.ts     # extension entry: 3 tools + widget + reminder + lifecycle
+├── state.ts     # pure schema/validation/fold/snapshot/read-retention/presence derivation
+├── board.ts     # disk layer: append-only JSONL (file-as-state) + config
 ├── test/smoke.ts
 ├── test/owner-guard.ts
 ├── test/presence-retention.ts
-├── tsconfig.json  # 仅供 typecheck
+├── tsconfig.json  # typecheck only
 └── README.md
 ```
 
-参考资料：Kimi Tower 多 worker 协调设计（Tower 官方博客/文档）与扩展参考实现 <https://github.com/99percentpeople/pi-extensions/blob/master/extensions/todo/index.ts>。
+References: Kimi Tower's multi-worker orchestration design (official Tower blog/docs) and the reference extension implementation <https://github.com/99percentpeople/pi-extensions/blob/master/extensions/todo/index.ts>.

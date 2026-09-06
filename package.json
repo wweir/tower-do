@@ -22,10 +22,15 @@
     "test/",
     "tsconfig.json",
     "README.md",
+    "README.zh-CN.md",
     "LICENSE"
   ],
   "pi": {
     "extensions": ["./index.ts"]
+  },
+  "devDependencies": {
+    "bun-types": "^1.3.14",
+    "typescript": "^5.0.0"
   },
   "peerDependencies": {
     "@earendil-works/pi-ai": "*",
