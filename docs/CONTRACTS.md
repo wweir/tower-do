@@ -94,3 +94,6 @@ bun run test/scope-conflicts.ts     # P1 glob + conflict derivation (17 cases)
 Coverage intent: **pure, dependency-free logic** (state.ts) carries regression
 suites; I/O-touching layers (board.ts / index.ts) are covered by the smoke test
 exercising all three tools end-to-end against a temp board.
+
+The same gate runs in CI on every `v*` tag push before the npm publish step
+(`.github/workflows/release.yml`) — a tag that fails the gate never ships.

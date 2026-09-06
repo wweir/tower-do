@@ -43,6 +43,10 @@ mkdir -p ~/.pi/agent/extensions && cp -r tower-do ~/.pi/agent/extensions/
 
 pi 启动时自动发现扩展；已开会话用 `/reload` 加载。运行依赖（`typebox`、`@earendil-works/*`）由 pi 环境提供（peerDependencies，无需手动安装）。
 
+## 发布
+
+在 `main` 上打 `vX.Y.Z` 标签即触发 CI 运行编译 + 测试门禁并自动发布到 npm（见 `.github/workflows/release.yml` 与 [docs/OPERATIONS.md](docs/OPERATIONS.md)）。标签须与 `package.json` 的 `version` 一致。
+
 ## 快速上手
 
 **单个 pi 会话 + 子代理（典型用法）**：父会话在板上规划并认领 owner；把 `tower_do_status` 打印的看板路径交给子代理（file-as-state）；子代理回报结果；父会话收口。**多个 pi 会话共享同一项目**：两边自动读写同一个 `<project>/.pi/tower-do/board.jsonl` —— 发消息、对方 `inbox` 读取，即跨 agent 通讯。

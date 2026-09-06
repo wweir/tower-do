@@ -1,0 +1,62 @@
+name: release
+
+# Publish to npm on version tags. Tag must match package.json version
+# (enforced below) so a misplaced tag never ships a wrong package.
+on:
+  push:
+    tags:
+      - "v*"
+
+jobs:
+  test-and-publish:
+    runs-on: ubuntu-latest
+    permissions:
+      contents: read
+      id-token: write # for npm provenance (public registry)
+    steps:
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+
+      # bun install is fast on this repo; no cache to avoid the
+      # cache-poisoning surface.
+      - uses: oven-sh/setup-bun@0c5077e51419868618aeaa5fe8019c62421857d6 # v2.2.0
+        with:
+          bun-version: latest
+
+      - name: Install dependencies
+        run: bun install --frozen-lockfile
+
+      # The repo publishes TypeScript sources directly (main: ./index.ts, no
+      # build step) — tsc is the compile gate and the rest is the test gate.
+      - name: Compile check
+        run: bunx tsc --noEmit -p tsconfig.json
+
+      - name: Test gate
+        run: |
+          bun run test/smoke.ts
+          bun run test/config.ts
+          bun run test/owner-guard.ts
+          bun run test/presence-retention.ts
+          bun run test/changed-files.ts
+          bun run test/scope-conflicts.ts
+
+      - name: Verify tag matches package version
+        run: |
+          tag="${GITHUB_REF_NAME#v}"
+          pkg="$(node -p 'require("./package.json").version')"
+          if [ "$tag" != "$pkg" ]; then
+            echo "::error::tag '${GITHUB_REF_NAME}' (${tag}) does not match package.json version ${pkg}"
+            exit 1
+          fi
+          echo "tag ${GITHUB_REF_NAME} matches package version ${pkg}"
+
+      # npm does not read NODE_AUTH_TOKEN without a .npmrc registry mapping;
+      # setup-node writes it (and publishes against the public registry).
+      - uses: actions/setup-node@820762786026740c76f36085b0efc47a31fe5020 # v7.0.0
+        with:
+          node-version: 22
+          registry-url: https://registry.npmjs.org
+
+      - name: Publish to npm
+        run: npm publish --provenance --access public
+        env:
+          NODE_AUTH_TOKEN: ${{ secrets.NPM_TOKEN }}

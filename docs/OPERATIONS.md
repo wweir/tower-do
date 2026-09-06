@@ -38,6 +38,26 @@ keys are ignored (forward compatibility). A malformed file or invalid
 because a silently-reset identity would corrupt owner matching and message
 addressing in multi-agent sessions.
 
+## Release (npm publish on tag)
+
+Tagging `vX.Y.Z` on `main` triggers `.github/workflows/release.yml`, which
+runs the compile + test gate and then `npm publish` when the tag matches
+`package.json` `version`. This is the **only** release path — no manual
+`npm publish`.
+
+```bash
+# bump version in package.json, commit, then:
+git tag v0.3.0 && git push origin main --tags
+```
+
+- The repo ships TypeScript sources directly (`main: ./index.ts`, no build
+  step), so the "compile" gate is `bunx tsc --noEmit -p tsconfig.json`.
+- Tag must equal `package.json` version (`v` stripped); a mismatched tag
+  fails the job before publish.
+- Publish uses npm provenance (`--provenance`) with the `id-token` permission;
+  auth comes from the `NPM_TOKEN` repository secret. Requires a GitHub-hosted
+  runner (provenance is unavailable on self-hosted runners).
+
 ## Runtime layout
 
 - Board: `<project>/.pi/tower-do/board.jsonl` (append-only event log — the

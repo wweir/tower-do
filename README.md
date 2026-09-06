@@ -49,6 +49,13 @@ mkdir -p ~/.pi/agent/extensions && cp -r tower-do ~/.pi/agent/extensions/
 
 Pi auto-discovers the extension at startup; existing sessions pick it up with `/reload`. Runtime dependencies (`typebox`, `@earendil-works/*`) are provided by the Pi environment (peerDependencies — no manual install needed).
 
+## Release
+
+Tagging `vX.Y.Z` on `main` runs the compile + test gate in CI and publishes
+to npm automatically (see `.github/workflows/release.yml` and
+[docs/OPERATIONS.md](docs/OPERATIONS.md)). The tag must match `package.json`
+version.
+
 ## Quick tour
 
 **One session + subagents (typical).** Parent plans tasks on the board and
