@@ -447,7 +447,7 @@ async function layer2(): Promise<void> {
   );
   const s1 = await run("tower_do_status", {});
   check(
-    "two agents' WIP visible on one board",
+    "two agents' tasks visible on one board",
     s1.text.includes("alice") && s1.text.includes("bob"),
     "owners shown",
   );

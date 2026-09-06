@@ -1,9 +1,9 @@
 /**
- * tower-do — shared multi-agent WIP board (disk layer).
+ * tower-do — shared multi-agent task board (disk layer).
  *
  * Load-bearing Tower design choice: the board is a plain append-only JSONL
  * file (`<project>/.pi/tower-do/board.jsonl`), i.e. file-as-state. Any agent
- * session or subagent that can read the file can see everyone's WIP, and any
+ * session or subagent that can read the file can see everyone's tasks, and any
  * writer appends events. Folding events yields the current view; the
  * monotonic `revision` is derived from the file (tool-read, never
  * self-reported) and backs the stale-write guard.

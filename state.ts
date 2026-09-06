@@ -1,5 +1,5 @@
 /**
- * tower-do — shared multi-agent WIP board (state layer).
+ * tower-do — shared multi-agent task board (state layer).
  *
  * Pure schema/validation/folding, mirroring the reference todo extension's
  * state.ts style. The board is a shared, append-only file (file-as-state, in

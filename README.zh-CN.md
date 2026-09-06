@@ -1,4 +1,4 @@
-# tower-do — 共享多 Agent WIP 看板（pi 扩展）
+# tower-do — 共享多 Agent 任务看板（pi 扩展）
 
 > 一个 todo 风格的 pi 扩展，融入了 **Kimi Tower 多 worker 编排**的协调设计，让多个 agent（会话/子代理）共享"正在进行的事"以及与任务绑定的沟通状态。
 
@@ -11,7 +11,7 @@
 
 ## 功能
 
-面向并行 pi agent 的共享 WIP 看板：计划 / 认领 / 完成 / 阻塞任务（带 owner 与依赖）、跨 agent 消息与 finding、全局状态仪表盘。**冲突感知**：完成任务时带 `changedFiles`（你实际改过的文件的交付回执）+ 声明 `scope`（文件 glob 边界）后，`tower_do_status` 会派生两类**建议性告警**——**overlap**（某个进行中/待办任务的 scope 命中了刚完成任务的回执文件，"你打算动的文件别人刚改过"）与 **collision**（两个进行中任务的 scope 相交）。告警只提示不拦截，通过消息协调或调整 scope 解决。
+面向并行 pi agent 的共享任务看板：计划 / 认领 / 完成 / 阻塞任务（带 owner 与依赖）、跨 agent 消息与 finding、全局状态仪表盘。**冲突感知**：完成任务时带 `changedFiles`（你实际改过的文件的交付回执）+ 声明 `scope`（文件 glob 边界）后，`tower_do_status` 会派生两类**建议性告警**——**overlap**（某个进行中/待办任务的 scope 命中了刚完成任务的回执文件，"你打算动的文件别人刚改过"）与 **collision**（两个进行中任务的 scope 相交）。告警只提示不拦截，通过消息协调或调整 scope 解决。
 
 三个工具：
 
@@ -19,7 +19,7 @@
 | --- | --- |
 | `tower_do` | 一次性原子更新看板：计划 / 认领（`owner` + `in_progress`）/ 完成（带 `changedFiles` 回执）/ 阻塞（`blocked` + `blockedBy`）。`baseRevision` 防覆盖 |
 | `tower_do_talk` | 跨 agent 消息：`send`（已知 owner 或 `all`；禁止自发）/ `inbox` / `finding`（结构化越界上报） |
-| `tower_do_status` | 共享仪表盘：所有人的 WIP（owner / deps / scope / changedFiles / 阻塞原因）、**scope 冲突**、消息、open findings、活动与在场状态 |
+| `tower_do_status` | 共享仪表盘：所有人的进行中工作（owner / deps / scope / changedFiles / 阻塞原因）、**scope 冲突**、消息、open findings、活动与在场状态 |
 
 ## 安装
 

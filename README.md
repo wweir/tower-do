@@ -1,4 +1,4 @@
-# tower-do — Shared Multi-Agent WIP Board (Pi extension)
+# tower-do — Shared Multi-Agent Task Board (Pi extension)
 
 > A todo-flavored Pi extension inspired by **Kimi Tower's multi-worker orchestration** design. Multiple agents (sessions / subagents) share a live view of "what's in progress" plus task-bound communication state.
 
@@ -11,7 +11,7 @@
 
 ## What it does
 
-Shared WIP board for parallel Pi agents: plan / claim / complete / block tasks
+Shared task board for parallel Pi agents: plan / claim / complete / block tasks
 with owners + dependencies, cross-agent messaging + findings, and a global
 status dashboard. **Conflict awareness**: completing a task with `changedFiles`
 (a delivery receipt of files you actually changed) plus declared `scope` file
@@ -25,7 +25,7 @@ Three tools:
 | --- | --- |
 | `tower_do` | One-shot atomic board update: plan / claim (`owner` + `in_progress`) / complete (`changedFiles` receipt) / block (`blocked` + `blockedBy`). `baseRevision` protects against clobbering |
 | `tower_do_talk` | Cross-agent messaging: `send` (known owner or `all`; self-send rejected), `inbox`, `finding` (structured out-of-scope report / status update) |
-| `tower_do_status` | Shared dashboard: everyone's WIP (owner / deps / scope / changedFiles / block reasons), **scope conflicts**, messages, open findings, activity + presence |
+| `tower_do_status` | Shared dashboard: everyone's in-progress work (owner / deps / scope / changedFiles / block reasons), **scope conflicts**, messages, open findings, activity + presence |
 
 ## Install
 

@@ -15,7 +15,7 @@ project:
 ```
 
 - **No daemon, no DB, no lock server.** Any Pi session or subagent that can read
-  the file sees the same WIP. This is *file-as-state* (Kimi Tower blackboard
+  the file sees the same tasks. This is *file-as-state* (Kimi Tower blackboard
   lineage): state = storage, communication = storage.
 - The **disk file is the single source of truth.** In-memory state (widget /
   reminders / `currentView`) is a display cache only. If the workspace is

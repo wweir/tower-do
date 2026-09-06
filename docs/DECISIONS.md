@@ -38,7 +38,7 @@ backend and the orchestrator consumes the board.
 ## Prior decisions (condensed from the initial port)
 
 - **File-as-state over locks/daemon.** Board = append-only JSONL; any reader
-  sees the same WIP. Communication and state are the same storage primitive.
+  sees the same tasks. Communication and state are the same storage primitive.
   (Kimi Tower blackboard lineage; see research/kimi-tower-*.)
 - **Revision counts task events only** so messages/findings never stale a peer's
   baseRevision.

@@ -1,12 +1,12 @@
 /**
- * tower-do — a shared multi-agent WIP board for pi.
+ * tower-do — a shared multi-agent task board for pi.
  *
  * Fuses the coordination design of Kimi Tower's multi-worker orchestration
  * into a todo-style extension:
  *
  *  - file-as-state: the board lives in `<project>/.pi/tower-do/board.jsonl`
  *    (append-only JSONL; folding events yields the current view). Every agent
- *    session — or a subagent pointed at the board path — sees the same WIP.
+ *    session — or a subagent pointed at the board path — sees the same tasks.
  *  - ownership: tasks may carry an `owner`; only the owner or the reserved
  *    orchestrator identity "tower" may change an owned task's fields
  *    (workers touch only their own missions).
@@ -23,7 +23,7 @@
  *   tower_do           — plan / claim / update / complete / block shared tasks
  *   tower_do_talk      — send an inbox message to a task owner / read your
  *                        inbox / file a structured finding
- *   tower_do_status    — shared dashboard: everyone's WIP, blocks, messages,
+ *   tower_do_status    — shared dashboard: everyone's tasks, blocks, messages,
  *                        open findings, and the activity tail
  *
  * Identities: default to the session identity (config `identity` >
@@ -686,20 +686,20 @@ export default function towerDoExtension(pi: ExtensionAPI): void {
   };
 
   // -------------------------------------------------------------------------
-  // tower_do — plan / claim / update / complete / block shared WIP
+  // tower_do — plan / claim / update / complete / block shared tasks
   // -------------------------------------------------------------------------
 
   pi.registerTool({
     name: TOWER_DO_TOOL_NAME,
     label: "TowerDo",
-    description: `Maintain the shared multi-agent WIP board with one atomic update.
+    description: `Maintain the shared multi-agent task board with one atomic update.
 - Full replacement: include every key to keep; omitting a key removes it.
 - Omitted optional fields on existing keys are preserved; new keys require subject and status.
 - Owner guard: a task with an owner can only be changed (any field) or removed by its owner or the "tower" identity.
 - Always pass baseRevision from tower_do_status; omitting it disables the stale-write check.
 - Up to ${MAX_TOWER_DO_TASKS} tasks. Optional per-task fields: dependsOn (must exist on the board or in this call), scope (file globs the task may touch), blockedBy (non-empty renders the task as blocked).`,
     promptSnippet:
-      "Maintain the shared multi-agent WIP board with one atomic update",
+      "Maintain the shared multi-agent task board with one atomic update",
     promptGuidelines: [
       "Use tower_do for the task plan instead of direct file edits when multiple agents or sessions share the work; it is the shared board, not a private todo list.",
       "When a task needs a plan of 3+ steps, define it yourself and call tower_do with subject + status before beginning substantive work.",
@@ -1210,7 +1210,7 @@ export default function towerDoExtension(pi: ExtensionAPI): void {
   });
 
   // -------------------------------------------------------------------------
-  // tower_do_status — shared dashboard (everyone's WIP)
+  // tower_do_status — shared dashboard (everyone's tasks)
   // -------------------------------------------------------------------------
 
   pi.registerTool({
@@ -1219,7 +1219,7 @@ export default function towerDoExtension(pi: ExtensionAPI): void {
     description:
       "Read the shared tower-do board: everyone's tasks (owner, status, deps, scope, blocks), messages addressed to you, open findings, and the recent activity tail. Also prints the board file path so subagents can read state directly (file-as-state). Output is truncated to 50KB.",
     promptSnippet:
-      "Show the shared multi-agent WIP board: tasks, messages, findings, activity",
+      "Show the shared multi-agent task board: tasks, messages, findings, activity",
     promptGuidelines: [
       "Use tower_do_status before starting work to see who owns what on the shared board, and before finishing work to reconcile your own tasks.",
       "When a tower_do write is rejected as stale, call tower_do_status first to re-read the current revision, then merge your changes and retry with the new baseRevision.",

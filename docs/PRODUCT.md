@@ -5,7 +5,7 @@
 
 ## What it is
 
-A **shared multi-agent WIP board** for the Pi coding agent — a todo-flavored
+A **shared multi-agent task board** for the Pi coding agent — a todo-flavored
 Pi extension inspired by Kimi Tower's multi-worker orchestration. Multiple
 agents (Pi sessions, or one session + subagents) share a live view of *what's
 in progress* plus task-bound communication state, without any central server.
