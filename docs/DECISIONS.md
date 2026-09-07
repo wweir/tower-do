@@ -32,9 +32,9 @@ roster into `sess`: a window containing a merge commit or more than 20
 commits re-anchors the window at the new HEAD. A fast-forward pull of few
 commits is the accepted blind spot.
 
-Cost bound: refresh hashes at most 2000 dirty paths per settle; past the cap
-the session viewpoint pauses (keeps its last count) while dirty stays
-correct.
+Cost bound: refresh hashes at most 2000 dirty paths per settle; past the
+cap (or on a hashing failure) the session viewpoint pauses — dirty stays
+correct while the baseline re-seeds on a later refresh.
 
 Display: always-labeled `sess M · git N` (session first), joined to the board
 progress line with a dim `│`. Widget numbers are emphasized by viewpoint

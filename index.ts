@@ -581,13 +581,21 @@ export default function towerDoExtension(pi: ExtensionAPI): void {
   type LiveGitCounts = {
     disabled: false;
     root: string; // git toplevel; porcelain paths are relative to this
-    startHashes: Map<string, string>; // content baseline captured on the first successful hash
-    lastHead: string; // attribution window start; the empty tree when unborn
+    startHashes: Map<string, string> | undefined; // undefined = baseline hashing failed/paused; dirty-only display
+    lastHead: string | undefined; // attribution window start; the empty tree when unborn; undefined only while paused
     lastDirty: Set<string>;
     touched: Set<string>;
     dirty: number;
     session: number;
   };
+  /** A live state with a usable content baseline and attribution window. */
+  const isSeeded = (
+    counts: LiveGitCounts | undefined,
+  ): counts is LiveGitCounts &
+    { startHashes: Map<string, string>; lastHead: string } =>
+    counts !== undefined &&
+    counts.startHashes !== undefined &&
+    counts.lastHead !== undefined;
   let gitCounts: { disabled: true } | LiveGitCounts | undefined;
   // Captured by the widget factory so async refreshes can force a repaint —
   // render() is only invoked on TUI-driven redraws otherwise.
@@ -750,17 +758,35 @@ export default function towerDoExtension(pi: ExtensionAPI): void {
     return Number.parseInt(count.trim(), 10) > EXTERNAL_MOVE_MAX_COMMITS;
   };
 
-  /** First successful observation: hash the dirty worktree, freeze the
-   * attribution window at the current HEAD (unborn → the empty tree). A
-   * hash failure leaves gitCounts unset; the next refresh re-seeds. */
+  /** First observation (or re-seed after a paused state): hash the dirty
+   * worktree, freeze the attribution window at the current HEAD (unborn →
+   * the empty tree). On hash failure/cap keep the dirty count visible and
+   * retry the baseline on a later refresh. */
   const seedGitCounts = async (
     root: string,
     seq: number,
     dirtyPaths: string[],
+    existing?: LiveGitCounts,
   ): Promise<void> => {
     const currentHashes = await hashPaths(root, dirtyPaths);
     if (seq !== gitRefreshSeq) return;
-    if (currentHashes === undefined) return;
+    if (currentHashes === undefined) {
+      if (existing !== undefined) {
+        gitCounts = { ...existing, dirty: dirtyPaths.length };
+      } else {
+        gitCounts = {
+          disabled: false,
+          root,
+          startHashes: undefined,
+          lastHead: undefined,
+          lastDirty: new Set(dirtyPaths),
+          touched: new Set(),
+          dirty: dirtyPaths.length,
+          session: 0,
+        };
+      }
+      return;
+    }
     const lastHead =
       (await git(root, ["rev-parse", "--verify", "HEAD"]))?.trim() ??
       EMPTY_TREE_HASH;
@@ -806,8 +832,8 @@ export default function towerDoExtension(pi: ExtensionAPI): void {
     }
     const { changed, untracked } = parsePorcelain(porcelain);
     const dirtyPaths = [...changed, ...untracked];
-    if (existing === undefined) {
-      await seedGitCounts(root, seq, dirtyPaths);
+    if (!isSeeded(existing)) {
+      await seedGitCounts(root, seq, dirtyPaths, existing);
       return;
     }
     await attributeGitCounts(root, seq, existing, dirtyPaths);
@@ -818,7 +844,10 @@ export default function towerDoExtension(pi: ExtensionAPI): void {
   const attributeGitCounts = async (
     root: string,
     seq: number,
-    existing: LiveGitCounts,
+    existing: LiveGitCounts & {
+      startHashes: Map<string, string>;
+      lastHead: string;
+    },
     dirtyPaths: string[],
   ): Promise<void> => {
     const currentSet = new Set(dirtyPaths);
