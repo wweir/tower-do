@@ -4,6 +4,62 @@
 > / reviews live in docs/plans + docs/reviews and get folded here when they
 > become durable rules.
 
+## 2026-09 — widget git segment: dirty vs session, same unit
+
+**Context.** The above-editor widget should show how dirty the worktree is and
+how much of that this session caused, without a second unit (lines, commits).
+
+**Decision.** Two file counts, one unit:
+
+- **dirty** = `git status --porcelain -z -uall` entries (NUL-separated, no
+  C-quoting; untracked directories expanded to file granularity; a rename/copy
+  is one entry — the destination). Status runs from the toplevel so paths are
+  root-relative regardless of `status.relativePaths`.
+- **session** = files whose content this session actually changed. First
+  observation freezes the attribution window at the current HEAD
+  (`rev-parse --verify HEAD`; unborn → the empty tree) and hashes every
+  dirty path (`git hash-object`; missing, non-file, or newline-named paths
+  use an `absent` sentinel). Each refresh folds the *incremental* window
+  `lastHead..HEAD` into the persistent set: a path counts if its worktree
+  hash differs from the baseline, it is new, it left the dirty set with a
+  blob different from the baseline, or it appears in the window with a blob
+  different from the baseline — the last one catches edits that were made
+  *and* committed between two refreshes. Pre-dirty files this session never
+  edits do not count. A later commit can still show `sess N · git 0`.
+
+External HEAD movement (pull / rebase / branch switch) never folds its
+roster into `sess`: a window containing a merge commit or more than 20
+commits re-anchors the window at the new HEAD. A fast-forward pull of few
+commits is the accepted blind spot.
+
+Cost bound: refresh hashes at most 2000 dirty paths per settle; past the cap
+the session viewpoint pauses (keeps its last count) while dirty stays
+correct.
+
+Display: always-labeled `sess M · git N` (session first), joined to the board
+progress line with a dim `│`. Widget numbers are emphasized by viewpoint
+(`sess` = accent, `git` = warning); labels stay dim.
+Hidden only when both counts are 0, or in a non-git directory. Empty board
+still shows a non-empty git segment. Folding equal counts into a single `ΔN`
+was rejected — it hid which viewpoint the number belonged to.
+
+**Rejected.** Counting both rename endpoints as dirty (breaks the same-unit
+fold against porcelain entries); a rename may still count source+dest in
+`sess` — path-level content change. Disabling the segment on any git failure
+(an `index.lock` would hide it for the rest of the session). Gating
+`agent_settled` refresh on widget registration (empty board then never
+initializes the segment). Subtracting the first-observation *path* set (`sess`
+stayed 0 while editing already-dirty files). Using the *worktree* `git diff
+<startHead>` as `sess` (a dirty worktree then makes `sess` ≈ `git`). Sampling
+only `lastDirty` vs current dirty (edits committed between two refreshes were
+invisible). Folding `startHead..HEAD` monotonically (one `git pull` polluted
+`touched` with foreign files for the rest of the session — hence the
+incremental window + re-anchor). C-style quoting on porcelain output (`"`,
+`\`, tabs still get
+quoted even with `quotePath=false`; `-z` removes quoting entirely). Leaving
+`?? dir/` collapsed (one `absent` sentinel absorbed every later change inside
+an untracked directory).
+
 ## 2025-09 — share "changed files" as boundary facts, not diffs (P0 + P1)
 
 **Context.** Research asked whether multiple agents editing one repo should

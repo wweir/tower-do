@@ -41,6 +41,14 @@ TowerDo is its state/communication substrate.
   whose scope overlaps a just-finished task's files, or two in-progress tasks
   with intersecting scopes, are flagged in `tower_do_status` — resolve by
   messaging, not by gate.
+- **Above-editor widget.** Board progress plus a git segment (`sess M · git N`):
+  worktree dirty file count vs files whose content this session actually
+  changed (pre-dirty files count only if edited again; edits committed
+  between refreshes are counted too, while a mid-session pull re-anchors
+  attribution instead of counting pulled files; later commits can leave
+  `sess N · git 0`).
+  Same unit, two labeled viewpoints; hidden when both counts are 0 or the
+  directory is not git; the git segment alone still shows on an empty board.
 
 ## Identity
 

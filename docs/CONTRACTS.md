@@ -89,11 +89,13 @@ bun run test/owner-guard.ts         # every-field owner guard (10 cases)
 bun run test/presence-retention.ts  # read receipts / retirement / presence (34)
 bun run test/changed-files.ts       # P0 receipt invariants (10 cases)
 bun run test/scope-conflicts.ts     # P1 glob + conflict derivation (17 cases)
+bun run test/git-count.ts           # widget git-segment pure derivations (24 cases)
 ```
 
-Coverage intent: **pure, dependency-free logic** (state.ts) carries regression
-suites; I/O-touching layers (board.ts / index.ts) are covered by the smoke test
-exercising all three tools end-to-end against a temp board.
+Coverage intent: **pure, dependency-free logic** (state.ts, git-count.ts)
+carries regression suites; I/O-touching layers (board.ts / index.ts) are
+covered by the smoke test exercising all three tools end-to-end against a
+temp board.
 
 The same gate runs in CI on every `v*` tag push before the npm publish step
 (`.github/workflows/release.yml`) — a tag that fails the gate never ships.

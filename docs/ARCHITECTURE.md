@@ -84,6 +84,7 @@ activity tail — they never mutate the file, and callers cannot "write" them:
 index.ts     # extension entry: 3 tools + widget + reminder + lifecycle
 state.ts     # pure schema / validation / fold / read derivations (no I/O)
 board.ts     # disk layer (append-only JSONL) + config normalization
+git-count.ts # widget dirty/session file-count derivations (no I/O)
 test/        # pure-logic + smoke suites (see CONTRACTS.md gates)
 docs/        # this documentation set
 ```

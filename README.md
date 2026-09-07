@@ -18,6 +18,8 @@ status dashboard. **Conflict awareness**: completing a task with `changedFiles`
 globs lets `tower_do_status` flag *overlaps* (an active task's scope matches a
 just-completed task's receipt) and *collisions* (two in-progress tasks'
 scopes intersect) — advisory warnings, resolved by messaging, not gates.
+The above-editor widget also shows a git segment (worktree dirty vs files
+this session actually changed); see [docs/PRODUCT.md](docs/PRODUCT.md).
 
 Three tools:
 
@@ -122,7 +124,7 @@ are no mutable state files besides the log. Full data flow and derivations:
 | [docs/PRODUCT.md](docs/PRODUCT.md) | Product scope & high-level experience |
 | [docs/ARCHITECTURE.md](docs/ARCHITECTURE.md) | System boundary, event log & folding, read derivations (presence / block / scope conflicts / retention) |
 | [docs/CONTRACTS.md](docs/CONTRACTS.md) | Task-model invariants (incl. `changedFiles` receipt + scope-conflict contracts), ownership guard, revision gate, test gate |
-| [docs/DECISIONS.md](docs/DECISIONS.md) | Why: share boundary facts not diffs (P0/P1), file-as-state, every-field owner guard, advisory scope |
+| [docs/DECISIONS.md](docs/DECISIONS.md) | Why: share boundary facts not diffs (P0/P1), widget git segment, file-as-state, every-field owner guard, advisory scope |
 | [docs/OPERATIONS.md](docs/OPERATIONS.md) | Install, config, runtime layout, troubleshooting |
 | [README.zh-CN.md](./README.zh-CN.md) | 中文版说明 |
 
@@ -132,7 +134,8 @@ are no mutable state files besides the log. Full data flow and derivations:
 ├── index.ts     # extension entry: 3 tools + widget + reminder + lifecycle
 ├── state.ts     # pure schema/validation/fold/read-derivations (no I/O)
 ├── board.ts     # disk layer: append-only JSONL (file-as-state) + config
-├── test/        # smoke + owner-guard + presence-retention + changed-files + scope-conflicts + config
+├── git-count.ts # pure git dirty/session file-count derivations for the widget (no I/O)
+├── test/        # smoke + owner-guard + presence-retention + changed-files + scope-conflicts + config + git-count
 ├── docs/        # PRODUCT / ARCHITECTURE / CONTRACTS / DECISIONS / OPERATIONS
 └── README.md
 ```
@@ -148,6 +151,7 @@ bun run test/owner-guard.ts         # every-field owner guard (10 cases)
 bun run test/presence-retention.ts  # read receipts / retirement / presence (34)
 bun run test/changed-files.ts       # P0 delivery-receipt invariants (10 cases)
 bun run test/scope-conflicts.ts     # P1 glob matching + conflict derivation (17 cases)
+bun run test/git-count.ts           # widget git-segment derivations (24 cases)
 ```
 
 See [docs/CONTRACTS.md](docs/CONTRACTS.md) for what each suite proves.
