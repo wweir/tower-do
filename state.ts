@@ -701,6 +701,9 @@ export function taskIsBlocked(
   task: TowerDoTask,
   board: TowerBoardView,
 ): boolean {
+  // Completed means delivered — a stale blockedBy left on a completed task
+  // must not keep it visually blocked forever.
+  if (task.status === "completed") return false;
   if (task.status === "blocked") return true;
   if (task.blockedBy.length > 0) return true;
   const statusByKey = new Map(
@@ -1080,6 +1083,29 @@ export function readBoardSnapshot(value: unknown): TowerBoardView | undefined {
   };
 }
 
+/**
+ * Latest valid board checkpoint on a session branch. Pi's `getBranch()` is
+ * root-to-leaf (oldest first), so the *last* matching custom entry is the
+ * one written by the most recent compact. Taking the first would resurrect
+ * todos that a later compact already superseded.
+ */
+export function latestBoardCheckpoint(
+  entries: readonly {
+    type?: unknown;
+    customType?: unknown;
+    data?: unknown;
+  }[],
+): TowerBoardView | undefined {
+  let latest: TowerBoardView | undefined;
+  for (const entry of entries) {
+    if (entry.type !== "custom" || entry.customType !== TOWER_DO_BOARD_TYPE)
+      continue;
+    const parsed = readBoardSnapshot(entry.data);
+    if (parsed !== undefined) latest = parsed;
+  }
+  return latest;
+}
+
 export const REMINDER_TASK_LINE_CAP = 12;
 
 /**
@@ -1437,6 +1463,38 @@ export function derivePresence(
     return a.identity.localeCompare(b.identity);
   });
   return lines;
+}
+
+/** Escape a string for literal use inside a RegExp. */
+function escapeRegExp(s: string): string {
+  return s.replace(/[.*+?^${}()|[\]\\]/g, "\\$&");
+}
+
+/**
+ * True for status lines that describe the caller's own session. Prefixes
+ * (header, presence `(me)`, activity byline, messages section) are owned
+ * by the renderer. The task-line alternative looks for ` @<id> (me)`
+ * before a renderer suffix (` ←` / ` [` / ` —`) or EOL: a mention in the
+ * middle of a subject, or on a line that still has a real other owner
+ * after it, does not match. An *unowned* subject that itself ends with
+ * that token can still match — closing that needs structured line marks,
+ * not a tighter regex.
+ *
+ * Keep in sync with the renderers in index.ts (status sections, presence
+ * `(me)` label, owner `(me)` suffix, activity feed format).
+ */
+export function isCallerLine(line: string, caller: string): boolean {
+  if (caller === "") return false;
+  const id = escapeRegExp(caller);
+  return new RegExp(
+    [
+      `^TowerDo shared board — identity ${id}, revision`,
+      `^- ${id} \\(me\\) —`,
+      `^- ${id} · `,
+      `^- [◐✓○✗] .* @${id} \\(me\\)(?= ←| \\[| —|$)`,
+      `^## Messages for ${id} \\(`,
+    ].join("|"),
+  ).test(line);
 }
 
 export function formatPresenceLine(line: PresenceLine, now: number): string {

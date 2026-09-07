@@ -12,6 +12,8 @@
  *     flagged.
  *  4. activity rendering: raw JSON event lines fold into compact human lines.
  *  5. backward compatibility: pre-readBy persisted messages stay valid.
+ *  6. session checkpoints: restore takes the latest valid compact snapshot
+ *     (getBranch is oldest-first), never an earlier cancelled board.
  *
  * Run: bun test/presence-retention.ts
  */
@@ -26,11 +28,14 @@ import {
   formatActivityEntry,
   formatActivityFeed,
   formatPresenceLine,
+  isCallerLine,
   isMessageFullyRead,
   latestActivity,
   parseActivityLine,
   retainMessages,
   unreadMessagesToMe,
+  latestBoardCheckpoint,
+  TOWER_DO_BOARD_TYPE,
   writeBoardSnapshot,
   type TowerBoardView,
   type TowerDoMessage,
@@ -488,6 +493,128 @@ async function layer3(): Promise<void> {
   );
 }
 
+// --- layer 5: caller-line highlight matching ---------------------------------
+// The status renderer bolds lines that describe the caller's own session.
+// Matching must be token-exact: a caller named "alice" must NOT highlight
+// lines about "alice-2" (suffix collision) and vice versa (prefix collision).
+function layer5(): void {
+  const header = "TowerDo shared board — identity alice, revision 4";
+  const headerOther = "TowerDo shared board — identity alice-2, revision 4";
+  const ownPresence = "- alice (me) — last seen 5m ago";
+  const otherPresence = "- alice-2 — last seen 5m ago";
+  const ownTask = "- ◐ key: subject @alice (me)";
+  const otherTask = "- ◐ key: subject @alice-2 (me)";
+  const msgs = "## Messages for alice (1; 0 unread)";
+  const msgsOther = "## Messages for alice-2 (1; 0 unread)";
+
+  check("caller header matches", isCallerLine(header, "alice"));
+  check(
+    "caller header does not match another identity's suffix",
+    !isCallerLine(headerOther, "alice"),
+  );
+  check(
+    "suffix caller matches its own full identity",
+    isCallerLine(headerOther, "alice-2"),
+  );
+  check("caller presence line matches", isCallerLine(ownPresence, "alice"));
+  check(
+    "caller presence does not match @owner suffix collision",
+    !isCallerLine(otherPresence, "alice"),
+  );
+  check("caller task owner matches", isCallerLine(ownTask, "alice"));
+  check(
+    "caller owner does not match another owner's suffix",
+    !isCallerLine(otherTask, "alice"),
+  );
+  check(
+    "suffix owner matches its own full identity",
+    isCallerLine(otherTask, "alice-2"),
+  );
+  check("caller messages section matches", isCallerLine(msgs, "alice"));
+  check(
+    "caller messages does not match suffix collision",
+    !isCallerLine(msgsOther, "alice"),
+  );
+  check(
+    "unrelated line never matches",
+    !isCallerLine("- ○ other: unrelated subject @bob", "alice") &&
+      !isCallerLine("(no tasks match the filter)", "alice"),
+  );
+  check("empty caller never matches", !isCallerLine(header, ""));
+  // Regex metacharacters in identities are matched literally.
+  const dotted = "- ◐ key: subject @a.b (me)";
+  check("regex metachars escaped", isCallerLine(dotted, "a.b"));
+
+  // A subject that merely MENTIONS the caller must not highlight a line
+  // owned by someone else — the owner fragment is anchored to the renderer's
+  // ` @<owner> (me)` syntax, not a bare @mention.
+  const subjectMention = "- ◐ key: ask @alice to review @bob";
+  check(
+    "subject mention of caller is not a caller line",
+    !isCallerLine(subjectMention, "alice"),
+  );
+  const mentionPlusOwned = "- ◐ key: ask @alice to review @bob (me)";
+  check(
+    "owner fragment still matches its real owner",
+    isCallerLine(mentionPlusOwned, "bob") &&
+      !isCallerLine(mentionPlusOwned, "alice"),
+  );
+  // Unowned tasks have no renderer-owned `@owner (me)` suffix, so a subject
+  // that itself ends with that token currently matches (lookahead `$`).
+  // Known limitation — not closed without structured line marks.
+  check(
+    "unowned subject ending with @caller (me) currently matches",
+    isCallerLine("- ◐ k: ask @alice (me)", "alice"),
+  );
+
+  // Task lines where the owner fragment is followed by each renderer suffix:
+  // deps ( ←), scope/files/blocked ( [), a reason ( —), or the line end.
+  const ownDep = "- ◐ key: subject @alice (me) ← z, w";
+  const ownScope = "- ◐ key: subject @alice (me) [scope: z.ts]";
+  const ownFiles = "- ✓ key: subject @alice (me) [files: z.ts]";
+  const ownReason = "- ✗ key: subject @alice (me) — waiting for deps: z";
+  check(
+    "owner fragment before deps matches",
+    isCallerLine(ownDep, "alice") && !isCallerLine(ownDep, "bob"),
+  );
+  check(
+    "owner fragment before scope matches",
+    isCallerLine(ownScope, "alice") && !isCallerLine(ownScope, "bob"),
+  );
+  check(
+    "owner fragment before changed-files matches",
+    isCallerLine(ownFiles, "alice") && !isCallerLine(ownFiles, "bob"),
+  );
+  check(
+    "owner fragment before a reason matches",
+    isCallerLine(ownReason, "alice") && !isCallerLine(ownReason, "bob"),
+  );
+
+  // Activity feed entries: own byline matches, others' do not, and a detail
+  // that merely mentions `@caller (me)` never masquerades as a task line.
+  check(
+    "caller activity feed line matches",
+    isCallerLine("- alice · just now · ◐ key: subject", "alice"),
+  );
+  check(
+    "other's activity feed line does not match",
+    !isCallerLine("- bob · just now · ◐ key: subject", "alice"),
+  );
+  check(
+    "mention inside another session's activity detail does not match",
+    !isCallerLine("- bob · just now · ◐ key: subject @alice (me)", "alice"),
+  );
+
+  // A message body quoting the header format is not the header itself.
+  check(
+    "header format quoted in a message body does not match",
+    !isCallerLine(
+      "- [m1] [UNREAD] bob → me: subj — body identity alice, revision 9",
+      "alice",
+    ),
+  );
+}
+
 // --- layer 4: orphan / audience retirement semantics -------------------------
 // Two ways a message can become unreadable forever; both must retire instead
 // of pinning the retention budget:
@@ -786,11 +913,57 @@ async function layer4(): Promise<void> {
   );
 }
 
+// --- layer 6: session-checkpoint replay (oldest-first branch) ---------------
+// Pi getBranch() is root-to-leaf. Restore must take the LAST valid custom
+// board snapshot, otherwise a later compact's cancelled todos come back.
+function layer6(): void {
+  const board = (key: string, subject: string): TowerBoardView =>
+    writeBoardSnapshot(
+      createEmptyBoard(),
+      {
+        tasks: [{ key, subject, status: "in_progress" }],
+      },
+      "alice",
+    ).view;
+  const cancelled = board("old", "cancelled work");
+  const current = board("new", "current work");
+  const picked = latestBoardCheckpoint([
+    { type: "custom", customType: TOWER_DO_BOARD_TYPE, data: cancelled },
+    { type: "message" },
+    {
+      type: "custom",
+      customType: TOWER_DO_BOARD_TYPE,
+      data: { schemaVersion: 1 },
+    },
+    { type: "custom", customType: TOWER_DO_BOARD_TYPE, data: current },
+  ]);
+  check(
+    "latest valid checkpoint wins over older and malformed",
+    picked?.tasks.length === 1 && picked.tasks[0]?.key === "new",
+  );
+  check(
+    "empty branch has no checkpoint",
+    latestBoardCheckpoint([]) === undefined,
+  );
+  check(
+    "custom_message steer payload is not a checkpoint",
+    latestBoardCheckpoint([
+      {
+        type: "custom_message",
+        customType: TOWER_DO_BOARD_TYPE,
+        data: cancelled,
+      },
+    ]) === undefined,
+  );
+}
+
 async function main(): Promise<void> {
   await layer1();
   layer2();
   await layer3();
   await layer4();
+  layer5();
+  layer6();
   console.log(`\n${passed} passed, ${failures} failed`);
   if (failures > 0) process.exit(1);
 }
