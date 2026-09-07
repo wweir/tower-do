@@ -79,6 +79,7 @@ git tag v0.3.0 && git push origin main --tags
   session checkpoint for display (disk stays authoritative).
 - **Conflicting scope advisories** — advisory only: message the peer owner or
   re-scope. They never block writes.
-- **Peer edits invisible** — every read path re-folds from disk; if a widget
-  looks stale, any tool call refreshes `currentView`. Cross-process writers are
-  last-writer-wins past the revision gate (single-tower assumption).
+- **Peer edits invisible** — every read path re-folds from disk. Widget and
+  context reminders also re-fold on `agent_settled` / each LLM `context` event,
+  so a peer's cancel shows up without waiting for a tool call. Cross-process
+  writers are last-writer-wins past the revision gate (single-tower assumption).

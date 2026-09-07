@@ -20,7 +20,7 @@ who wants to keep an existing task must replay it (usually unchanged).
 | `scope` | declared file-glob mission boundary; owner/tower guarded; advisory (no file enforcement) |
 | `changedFiles` | **delivery receipt** (P0): files the owner actually changed, repo-relative; see below |
 | `dependsOn` | must resolve against the full board + this batch; cycles rejected; `in_progress`/`completed` require deps completed (`blocked` exempt) |
-| `blockedBy` | advisory parked-reason keys |
+| `blockedBy` | advisory parked-reason keys; non-empty renders the task blocked (as do `status: "blocked"` and unresolved `dependsOn`), except `status: "completed"` which is never blocked |
 | `updatedAt` | last write time; **no-op replays keep the original value** (no drift) |
 
 ### changedFiles receipt (P0) — worker-set-once, owner/tower amendable audit trail
@@ -86,7 +86,7 @@ bunx tsc --noEmit -p tsconfig.json      # strict + noUnused, zero errors
 bun run test/smoke.ts               # end-to-end: 3 tools, persistence, scoping, changedFiles disk round-trip
 bun run test/config.ts              # config fail-loud + reserved identity (11 cases)
 bun run test/owner-guard.ts         # every-field owner guard (10 cases)
-bun run test/presence-retention.ts  # read receipts / retirement / presence (34)
+bun run test/presence-retention.ts  # read receipts / retirement / presence / caller-line match / checkpoints (61)
 bun run test/changed-files.ts       # P0 receipt invariants (10 cases)
 bun run test/scope-conflicts.ts     # P1 glob + conflict derivation (17 cases)
 bun run test/git-count.ts           # widget git-segment pure derivations (24 cases)

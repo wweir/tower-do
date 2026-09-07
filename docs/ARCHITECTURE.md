@@ -61,8 +61,10 @@ activity tail — they never mutate the file, and callers cannot "write" them:
 - **Presence** (`Who is around`): per-identity last-seen from parsed activity
   lines; three states — active / `⚠ idle` (>10 min quiet) / (not started).
   Real idle owners of unfinished tasks are footnoted on `tower_do` receipts.
-- **Block reasons**: `taskIsBlocked` / `findAllUnresolvedDeps` derive
-  "waiting on deps" from the folded task graph.
+- **Block reasons**: `taskIsBlocked` is a read derivation over explicit
+  `status: "blocked"`, the persisted `blockedBy` field, and unresolved
+  `dependsOn`. `findAllUnresolvedDeps` only lists the dependency reason.
+  `status: "completed"` is never blocked (stale `blockedBy` does not count).
 - **Scope conflicts** (P1): `findScopeConflicts` derives two advisory signals
   from `scope` declarations + `changedFiles` receipts:
   1. **overlap** — a completed task's receipt file lies inside an in-progress /
