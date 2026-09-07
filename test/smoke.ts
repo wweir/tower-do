@@ -5,7 +5,7 @@
  *  2. the real extension via a mock ExtensionAPI (tools execute end-to-end)
  * Run with: bun run test/smoke.ts
  */
-import { mkdirSync, mkdtempSync, writeFileSync } from "node:fs";
+import { mkdirSync, mkdtempSync, unlinkSync, writeFileSync } from "node:fs";
 import { tmpdir } from "node:os";
 import { join } from "node:path";
 
@@ -14,6 +14,7 @@ import {
   createEmptyBoard,
   findAllUnresolvedDeps,
   taskIsBlocked,
+  TOWER_DO_BOARD_TYPE,
   writeBoardSnapshot,
 } from "../state.ts";
 
@@ -151,6 +152,46 @@ async function layer1(): Promise<void> {
   check(
     "dependent unblocked after dep done",
     !taskIsBlocked(view.tasks.find((t) => t.key === "test")!, view),
+  );
+
+  // Completed tasks ignore stale blockedBy (widget/reminder counts and
+  // [blocked] markers all derive from taskIsBlocked); non-completed ones
+  // with blockedBy stay blocked.
+  const staleDone = writeBoardSnapshot(
+    createEmptyBoard(),
+    {
+      tasks: [
+        {
+          key: "done",
+          subject: "delivered work",
+          status: "completed",
+          blockedBy: ["msg-1"],
+        },
+      ],
+    },
+    "alice",
+  );
+  check(
+    "completed task ignores stale blockedBy",
+    !taskIsBlocked(staleDone.view.tasks[0], staleDone.view),
+  );
+  const stillWaiting = writeBoardSnapshot(
+    createEmptyBoard(),
+    {
+      tasks: [
+        {
+          key: "wait",
+          subject: "waiting on review",
+          status: "in_progress",
+          blockedBy: ["msg-1"],
+        },
+      ],
+    },
+    "alice",
+  );
+  check(
+    "non-completed task with blockedBy still blocked",
+    taskIsBlocked(stillWaiting.view.tasks[0], stillWaiting.view),
   );
 
   // Talk artifacts via append/fold.
@@ -337,6 +378,7 @@ async function layer2(): Promise<void> {
     }>;
   };
   const tools = new Map<string, ToolDef>();
+  let lastAppend: { customType: string; data: unknown } | undefined;
 
   const pi = {
     on: (event: string, handler: Handler): void => {
@@ -345,7 +387,9 @@ async function layer2(): Promise<void> {
     registerTool: (def: ToolDef): void => {
       tools.set(def.name, def);
     },
-    appendEntry: (): void => {},
+    appendEntry: (customType: string, data: unknown): void => {
+      lastAppend = { customType, data };
+    },
     sendMessage: (): void => {},
     sendUserMessage: (): void => {},
     getSessionName: () => "smoke-session",
@@ -885,6 +929,347 @@ async function layer2(): Promise<void> {
     "worktree does not leak to the parent dir",
     !outerSeesWt.text.includes("wt-only"),
     "worktree isolation",
+  );
+
+  // Regression: a completed task with a stale blockedBy must not render
+  // [blocked] or a waiting reason in the status output.
+  await run("tower_do", {
+    tasks: [
+      {
+        key: "auth",
+        subject: "refactor auth module",
+        status: "completed",
+        owner: "alice",
+      },
+      {
+        key: "billing",
+        subject: "wire billing events",
+        status: "pending",
+        owner: "bob",
+        dependsOn: ["auth"],
+      },
+      {
+        key: "stale",
+        subject: "delivered despite blockedBy",
+        status: "completed",
+        blockedBy: ["msg-1"],
+      },
+      {
+        key: "wait",
+        subject: "still blocked",
+        status: "in_progress",
+        blockedBy: ["msg-2"],
+      },
+      {
+        key: "mine",
+        subject: "session owned work",
+        status: "in_progress",
+        owner: "smoke-session",
+      },
+    ],
+    as: "tower",
+  } as never);
+  await run("tower_do_talk", {
+    action: "send",
+    to: "smoke-session",
+    subject: "ping me",
+    body: "hello",
+    as: "alice",
+  } as never);
+  const staleRow = await run("tower_do_status", {});
+  const statusLines = staleRow.text.split("\n");
+  // Pin the Completed-group glyph+key, not a substring that also appears
+  // in the activity feed (`- tower · … · ✓ stale: …`).
+  const staleLine =
+    statusLines.find((line) => line.startsWith("- ✓ stale:")) ?? "";
+  check(
+    "completed row found for stale blockedBy",
+    staleLine !== "",
+    staleRow.text.slice(0, 80),
+  );
+  check(
+    "completed row shows no [blocked] marker",
+    staleLine !== "" && !staleLine.includes("[blocked]"),
+    staleLine || "(missing)",
+  );
+  check(
+    "completed row shows no waiting reason",
+    staleLine !== "" && !staleLine.includes("waiting"),
+    staleLine || "(missing)",
+  );
+  const waitLine =
+    statusLines.find((line) => line.startsWith("- ◐ wait:")) ?? "";
+  check(
+    "in_progress + blockedBy row found",
+    waitLine !== "",
+    staleRow.text.slice(0, 80),
+  );
+  check(
+    "in_progress + blockedBy still marked [blocked]",
+    waitLine.includes("[blocked]"),
+    waitLine || "(missing)",
+  );
+  check(
+    "in_progress + blockedBy still shows waiting",
+    waitLine.includes("waiting"),
+    waitLine || "(missing)",
+  );
+  const mineLine =
+    statusLines.find((line) => line.startsWith("- ◐ mine:")) ?? "";
+  check(
+    "status renderer marks the caller's owned task with (me)",
+    mineLine.includes("@smoke-session (me)"),
+    mineLine || "(missing)",
+  );
+  check(
+    "status renderer addresses inbox lines as → me",
+    statusLines.some((line) => line.includes(" → me")),
+    staleRow.text.slice(0, 120),
+  );
+
+  const aborted = new AbortController();
+  aborted.abort();
+  let abortMsg = "NO ERROR";
+  try {
+    await tools
+      .get("tower_do")!
+      .execute(
+        "call-abort",
+        { tasks: [{ key: "nope", subject: "x", status: "pending" }] } as never,
+        aborted.signal,
+        undefined,
+        ctxBase,
+      );
+  } catch (error) {
+    abortMsg = error instanceof Error ? error.message : String(error);
+  }
+  const afterAbort = await new TowerBoard(
+    join(dir, ".pi", "tower-do", "board.jsonl"),
+  ).fold();
+  check(
+    "aborted tower_do does not write",
+    /cancelled|aborted/i.test(abortMsg) &&
+      !afterAbort.tasks.some((task) => task.key === "nope"),
+    abortMsg.slice(0, 80),
+  );
+
+  // Context reminders must re-fold disk so a peer cancel is what the LLM
+  // sees, even when this session has not made a tool call since.
+  const ctxDir = mkdtempSync(join(tmpdir(), "tower-do-ctxfold-"));
+  await run(
+    "tower_do",
+    {
+      tasks: [
+        {
+          key: "stale-todo",
+          subject: "old",
+          status: "in_progress",
+        },
+      ],
+      as: "tower",
+    } as never,
+    ctxDir,
+  );
+  const ctxGhost = new TowerBoard(
+    join(ctxDir, ".pi", "tower-do", "board.jsonl"),
+  );
+  const ctxFolded = await ctxGhost.fold();
+  await ctxGhost.append(
+    writeBoardSnapshot(
+      ctxFolded,
+      {
+        tasks: [
+          {
+            key: "live-todo",
+            subject: "after cancel",
+            status: "in_progress",
+          },
+        ],
+        baseRevision: ctxFolded.revision,
+      },
+      "tower",
+    ).taskEvents,
+  );
+  const ctxHandler = handlers.get("context");
+  let ctxReminder = "";
+  if (ctxHandler !== undefined) {
+    for (let i = 0; i < 3; i += 1) {
+      const injected = (await ctxHandler(
+        { messages: [] } as never,
+        { ...ctxBase, cwd: ctxDir } as never,
+      )) as { messages?: Array<{ content?: string }> } | undefined;
+      const last = injected?.messages?.at(-1)?.content;
+      if (typeof last === "string") ctxReminder = last;
+    }
+  }
+  check(
+    "context reminder re-folds peer cancel without a tool call",
+    ctxReminder.includes("live-todo") && !ctxReminder.includes("stale-todo"),
+    ctxReminder.slice(0, 120),
+  );
+  const replaced = ctxHandler
+    ? ((await ctxHandler(
+        {
+          messages: [
+            {
+              role: "custom",
+              customType: TOWER_DO_BOARD_TYPE,
+              content:
+                "TowerDo shared board (revision 1; 1 task(s), 0 blocked, 0 unread message(s) for you).\n- [in_progress] stale-todo: old",
+            },
+          ],
+        } as never,
+        { ...ctxBase, cwd: ctxDir } as never,
+      )) as { messages?: Array<{ customType?: string; content?: string }> })
+    : undefined;
+  const replacedText = (replaced?.messages ?? [])
+    .map((message) => message.content ?? "")
+    .join("\n");
+  check(
+    "context strips compact snapshots so cancelled todos leave the LLM",
+    replacedText.includes("live-todo") &&
+      !replacedText.includes("stale-todo") &&
+      !(replaced?.messages ?? []).some(
+        (message) => message.customType === TOWER_DO_BOARD_TYPE,
+      ),
+    replacedText.slice(0, 160),
+  );
+
+  // Compact must re-fold disk so a later session's cancel is what gets
+  // checkpointed — otherwise restore-from-missing-board resurrects the
+  // cancelled in-memory todos.
+  const compactDir = mkdtempSync(join(tmpdir(), "tower-do-compact-"));
+  await run(
+    "tower_do",
+    {
+      tasks: [
+        {
+          key: "stale-todo",
+          subject: "should not checkpoint",
+          status: "in_progress",
+        },
+      ],
+      as: "tower",
+    } as never,
+    compactDir,
+  );
+  const compactFile = join(compactDir, ".pi", "tower-do", "board.jsonl");
+  const ghost = new TowerBoard(compactFile);
+  const folded = await ghost.fold();
+  const live = writeBoardSnapshot(
+    folded,
+    {
+      tasks: [
+        {
+          key: "live-todo",
+          subject: "after cancel",
+          status: "in_progress",
+        },
+      ],
+      baseRevision: folded.revision,
+    },
+    "tower",
+  );
+  await ghost.append(live.taskEvents);
+  lastAppend = undefined;
+  const compactHandler = handlers.get("session_compact");
+  check("session_compact handler registered", compactHandler !== undefined);
+  if (compactHandler !== undefined) {
+    await compactHandler(
+      { willRetry: false } as never,
+      {
+        ...ctxBase,
+        cwd: compactDir,
+        hasPendingMessages: () => false,
+      } as never,
+    );
+  }
+  const checkpoint = lastAppend?.data as
+    | { tasks?: Array<{ key: string }> }
+    | undefined;
+  const checkpointKeys = (checkpoint?.tasks ?? []).map((task) => task.key);
+  check(
+    "compact checkpoint re-folds disk so cancelled todos do not come back",
+    lastAppend?.customType === TOWER_DO_BOARD_TYPE &&
+      checkpointKeys.includes("live-todo") &&
+      !checkpointKeys.includes("stale-todo"),
+    checkpointKeys.join(","),
+  );
+  const afterCompact = await ghost.fold();
+  const postCompact = writeBoardSnapshot(
+    afterCompact,
+    {
+      tasks: [
+        {
+          key: "post-compact",
+          subject: "cancel landed after compact",
+          status: "in_progress",
+        },
+      ],
+      baseRevision: afterCompact.revision,
+    },
+    "tower",
+  );
+  await ghost.append(postCompact.taskEvents);
+  const agentStart = handlers.get("before_agent_start");
+  const injectedBoard = agentStart
+    ? ((await agentStart(
+        {} as never,
+        { ...ctxBase, cwd: compactDir } as never,
+      )) as
+        | {
+            message?: {
+              details?: { tasks?: Array<{ key: string }> };
+            };
+          }
+        | undefined)
+    : undefined;
+  const injectedKeys = (injectedBoard?.message?.details?.tasks ?? []).map(
+    (task) => task.key,
+  );
+  check(
+    "before_agent_start re-folds so compact injection is not a stale cancel",
+    injectedKeys.includes("post-compact") &&
+      !injectedKeys.includes("live-todo") &&
+      !injectedKeys.includes("stale-todo"),
+    injectedKeys.join(","),
+  );
+  unlinkSync(compactFile);
+  const startHandler = handlers.get("session_start");
+  if (startHandler !== undefined && lastAppend !== undefined) {
+    await startHandler(
+      {} as never,
+      {
+        ...ctxBase,
+        cwd: compactDir,
+        sessionManager: {
+          getSessionId: () => "compact-sess",
+          getBranch: () => [
+            {
+              type: "custom",
+              customType: TOWER_DO_BOARD_TYPE,
+              data: lastAppend.data,
+            },
+          ],
+        },
+      } as never,
+    );
+  }
+  const contextHandler = handlers.get("context");
+  let reminder = "";
+  if (contextHandler !== undefined) {
+    for (let i = 0; i < 3; i += 1) {
+      const injected = (await contextHandler({ messages: [] } as never)) as
+        | { messages?: Array<{ content?: string }> }
+        | undefined;
+      const last = injected?.messages?.at(-1)?.content;
+      if (typeof last === "string") reminder = last;
+    }
+  }
+  check(
+    "restore after compact uses live checkpoint, not cancelled todos",
+    reminder.includes("live-todo") && !reminder.includes("stale-todo"),
+    reminder.slice(0, 120),
   );
 
   // Broken config.json fails loudly instead of silently resetting identity —

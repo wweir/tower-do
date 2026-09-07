@@ -78,8 +78,10 @@ import {
   findScopeConflicts,
   formatPresenceLine,
   getAllTasks,
+  isCallerLine,
   isTowerDoStatus,
   latestActivity,
+  latestBoardCheckpoint,
   MAX_FINDING_SUMMARY_CHARS,
   MAX_FINDING_TITLE_CHARS,
   MAX_MESSAGE_BYTES,
@@ -87,7 +89,6 @@ import {
   MAX_TOWER_DO_TASKS,
   messagesToMe,
   parseActivityLine,
-  readBoardSnapshot,
   relativeTime,
   retainMessages,
   taskIsBlocked,
@@ -333,7 +334,7 @@ const TowerDoTaskSchema = Type.Object({
   blockedBy: Type.Optional(
     Type.Array(Type.String(), {
       description:
-        "Optional keys (message/finding ids) describing what blocks this task. Advisory; visible to everyone.",
+        "Optional keys (message/finding ids) describing what blocks this task. Advisory; non-empty renders a non-completed task as blocked.",
       maxItems: 20,
     }),
   ),
@@ -591,8 +592,10 @@ export default function towerDoExtension(pi: ExtensionAPI): void {
   /** A live state with a usable content baseline and attribution window. */
   const isSeeded = (
     counts: LiveGitCounts | undefined,
-  ): counts is LiveGitCounts &
-    { startHashes: Map<string, string>; lastHead: string } =>
+  ): counts is LiveGitCounts & {
+    startHashes: Map<string, string>;
+    lastHead: string;
+  } =>
     counts !== undefined &&
     counts.startHashes !== undefined &&
     counts.lastHead !== undefined;
@@ -771,9 +774,7 @@ export default function towerDoExtension(pi: ExtensionAPI): void {
     const currentHashes = await hashPaths(root, dirtyPaths);
     if (seq !== gitRefreshSeq) return;
     if (currentHashes === undefined) {
-      if (existing !== undefined) {
-        gitCounts = { ...existing, dirty: dirtyPaths.length };
-      } else {
+      if (existing === undefined) {
         gitCounts = {
           disabled: false,
           root,
@@ -784,6 +785,8 @@ export default function towerDoExtension(pi: ExtensionAPI): void {
           dirty: dirtyPaths.length,
           session: 0,
         };
+      } else {
+        gitCounts = { ...existing, dirty: dirtyPaths.length };
       }
       return;
     }
@@ -909,9 +912,7 @@ export default function towerDoExtension(pi: ExtensionAPI): void {
     root: string,
     lastHead: string,
     head: string | undefined,
-  ): Promise<
-    { hashes: Map<string, string>; head: string } | undefined
-  > => {
+  ): Promise<{ hashes: Map<string, string>; head: string } | undefined> => {
     if (head === undefined || head === lastHead) {
       return { hashes: new Map(), head: lastHead };
     }
@@ -1036,7 +1037,9 @@ export default function towerDoExtension(pi: ExtensionAPI): void {
                 const owner =
                   task.owner === undefined
                     ? ""
-                    : theme.fg("dim", ` @${task.owner}`);
+                    : task.owner === identity
+                      ? theme.fg("accent", theme.bold(` @${task.owner}`))
+                      : theme.fg("dim", ` @${task.owner}`);
                 lines.push(
                   `${theme.fg(color, glyph)} ${theme.fg("text", task.subject)}${owner}`,
                 );
@@ -1095,6 +1098,16 @@ export default function towerDoExtension(pi: ExtensionAPI): void {
     return { board: entry.board, caller, view };
   };
 
+  const throwIfAborted = (
+    signal: AbortSignal | undefined,
+    label: string,
+  ): void => {
+    if (!signal?.aborted) return;
+    throw signal.reason instanceof Error
+      ? signal.reason
+      : new Error(`${label} cancelled`);
+  };
+
   // -------------------------------------------------------------------------
   // tower_do — plan / claim / update / complete / block shared tasks
   // -------------------------------------------------------------------------
@@ -1107,7 +1120,7 @@ export default function towerDoExtension(pi: ExtensionAPI): void {
 - Omitted optional fields on existing keys are preserved; new keys require subject and status.
 - Owner guard: a task with an owner can only be changed (any field) or removed by its owner or the "tower" identity.
 - Always pass baseRevision from tower_do_status; omitting it disables the stale-write check.
-- Up to ${MAX_TOWER_DO_TASKS} tasks. Optional per-task fields: dependsOn (must exist on the board or in this call), scope (file globs the task may touch), blockedBy (non-empty renders the task as blocked).`,
+- Up to ${MAX_TOWER_DO_TASKS} tasks. Optional per-task fields: dependsOn (must exist on the board or in this call), scope (file globs the task may touch), blockedBy (non-empty renders a non-completed task as blocked).`,
     promptSnippet:
       "Maintain the shared multi-agent task board with one atomic update",
     promptGuidelines: [
@@ -1122,22 +1135,21 @@ export default function towerDoExtension(pi: ExtensionAPI): void {
     executionMode: "sequential",
 
     async execute(_toolCallId, params, signal, _onUpdate, ctx) {
-      if (signal?.aborted) {
-        throw signal.reason instanceof Error
-          ? signal.reason
-          : new Error("TowerDo update cancelled");
-      }
+      throwIfAborted(signal, "TowerDo update");
       const { board, caller } = await prepare(ctx, params.as);
       return withFileMutationQueue(board.file, async () => {
         // Re-fold INSIDE the mutation queue: the revision guard and diff must
         // see the freshest events, or a same-process call that appended
         // between prepare() and the queue would be silently clobbered.
+        throwIfAborted(signal, "TowerDo update");
         const freshView = await foldRetained(ctx.cwd);
+        throwIfAborted(signal, "TowerDo update");
         const details = writeBoardSnapshot(
           freshView,
           { tasks: params.tasks, baseRevision: params.baseRevision },
           caller,
         );
+        throwIfAborted(signal, "TowerDo update");
         await board.append(details.taskEvents);
         currentView = cloneBoard(details.view);
         llmCallsSinceReminder = 0;
@@ -1204,9 +1216,15 @@ export default function towerDoExtension(pi: ExtensionAPI): void {
         const status = isTowerDoStatus(task.status) ? task.status : "pending";
         const glyph = STATUS_GLYPH[status];
         const color = statusColor(status);
+        // `as` overrides the session identity for this call; trimmed to
+        // match resolveCaller on the execute side.
+        const asArg = typeof args.as === "string" ? args.as.trim() : "";
+        const acting = asArg || sessionIdentity(activeCwd, pi);
         const owner2 =
           typeof task.owner === "string" && task.owner
-            ? theme.fg("dim", ` @${task.owner}`)
+            ? task.owner === acting
+              ? theme.fg("accent", theme.bold(` @${task.owner}`))
+              : theme.fg("dim", ` @${task.owner}`)
             : "";
         const deps =
           Array.isArray(task.dependsOn) && task.dependsOn.length
@@ -1269,11 +1287,7 @@ export default function towerDoExtension(pi: ExtensionAPI): void {
     executionMode: "sequential",
 
     async execute(_toolCallId, params, signal, _onUpdate, ctx) {
-      if (signal?.aborted) {
-        throw signal.reason instanceof Error
-          ? signal.reason
-          : new Error("TowerDo talk cancelled");
-      }
+      throwIfAborted(signal, "TowerDo talk");
       const { board, caller, view } = await prepare(ctx, params.as);
       const now = Date.now();
 
@@ -1326,7 +1340,9 @@ export default function towerDoExtension(pi: ExtensionAPI): void {
           ...(params.taskKey === undefined ? {} : { taskKey: params.taskKey }),
         };
         await withFileMutationQueue(board.file, async () => {
+          throwIfAborted(signal, "TowerDo talk");
           const fresh = await foldRetained(ctx.cwd);
+          throwIfAborted(signal, "TowerDo talk");
           ensureKnown(fresh, to);
           // Snapshot the broadcast audience (owners at send time, sender
           // excluded) so full-read / retirement uses the people who were
@@ -1347,6 +1363,7 @@ export default function towerDoExtension(pi: ExtensionAPI): void {
               ? {}
               : { audience }),
           };
+          throwIfAborted(signal, "TowerDo talk");
           await board.append([
             { kind: "message", message, by: caller, at: now },
           ]);
@@ -1374,7 +1391,9 @@ export default function towerDoExtension(pi: ExtensionAPI): void {
         // Reading your inbox acks the messages shown (LWW readBy update): the
         // sender learns you saw them, and fully-read history can be retired.
         return withFileMutationQueue(board.file, async () => {
+          throwIfAborted(signal, "TowerDo talk");
           const fresh = await foldRetained(ctx.cwd);
+          throwIfAborted(signal, "TowerDo talk");
           const mine = messagesToMe(fresh, caller)
             .sort((a, b) => b.at - a.at)
             .slice(0, limit);
@@ -1393,6 +1412,7 @@ export default function towerDoExtension(pi: ExtensionAPI): void {
             (message) => !(message.readBy ?? []).includes(caller),
           );
           if (unacked.length > 0) {
+            throwIfAborted(signal, "TowerDo talk");
             await board.append(
               unacked.map((message) => ({
                 kind: "message" as const,
@@ -1442,9 +1462,11 @@ export default function towerDoExtension(pi: ExtensionAPI): void {
       // action === finding
       if (params.findingId !== undefined) {
         const updated = await withFileMutationQueue(board.file, async () => {
+          throwIfAborted(signal, "TowerDo talk");
           // Re-fold inside the queue: the finding may have changed since the
           // pre-queue fold in prepare().
           const fresh = await foldRetained(ctx.cwd);
+          throwIfAborted(signal, "TowerDo talk");
           const existing = fresh.findings.find(
             (finding) => finding.id === params.findingId,
           );
@@ -1463,6 +1485,7 @@ export default function towerDoExtension(pi: ExtensionAPI): void {
             status: params.status as FindingStatus,
             at: now,
           };
+          throwIfAborted(signal, "TowerDo talk");
           await board.append([
             { kind: "finding", finding: next, by: caller, at: now },
           ]);
@@ -1539,7 +1562,9 @@ export default function towerDoExtension(pi: ExtensionAPI): void {
         at: now,
       };
       await withFileMutationQueue(board.file, async () => {
+        throwIfAborted(signal, "TowerDo talk");
         const fresh = await foldRetained(ctx.cwd);
+        throwIfAborted(signal, "TowerDo talk");
         await board.append([{ kind: "finding", finding, by: caller, at: now }]);
         currentView = cloneBoard({
           ...fresh,
@@ -1639,11 +1664,7 @@ export default function towerDoExtension(pi: ExtensionAPI): void {
     executionMode: "sequential",
 
     async execute(_toolCallId, params, signal, _onUpdate, ctx) {
-      if (signal?.aborted) {
-        throw signal.reason instanceof Error
-          ? signal.reason
-          : new Error("TowerDo status cancelled");
-      }
+      throwIfAborted(signal, "TowerDo status");
       const { board, caller, view } = await prepare(ctx, undefined);
       const tasks = getAllTasks(view);
       const byStatus = (status: TowerDoStatus) =>
@@ -1734,7 +1755,15 @@ export default function towerDoExtension(pi: ExtensionAPI): void {
       const historicalCount = presence.length - relevantPresence.length;
       lines.push(`## Who is around (${relevantPresence.length})`);
       for (const person of relevantPresence) {
-        lines.push(`- ${formatPresenceLine(person, now)}`);
+        // Marker hugs the identity: "←" already means "depends on" on task
+        // lines, so keep a single meaning per symbol.
+        const label =
+          person.identity === caller
+            ? `${person.identity} (me)`
+            : person.identity;
+        lines.push(
+          `- ${formatPresenceLine({ ...person, identity: label }, now)}`,
+        );
       }
       if (historicalCount > 0) {
         lines.push(`- … ${historicalCount} more with only historical activity`);
@@ -1746,7 +1775,10 @@ export default function towerDoExtension(pi: ExtensionAPI): void {
         if (group.length === 0) return;
         lines.push(`## ${label}`);
         for (const task of group) {
-          const owner = task.owner === undefined ? "" : ` @${task.owner}`;
+          const owner =
+            task.owner === undefined
+              ? ""
+              : ` @${task.owner}${task.owner === caller ? " (me)" : ""}`;
           const deps = task.dependsOn.length
             ? ` ← ${task.dependsOn.join(",")}`
             : "";
@@ -1756,10 +1788,13 @@ export default function towerDoExtension(pi: ExtensionAPI): void {
           const blocked = taskIsBlocked(task, view) ? " [blocked]" : "";
           const unresolved = findAllUnresolvedDeps(task, view);
           let reason = "";
-          if (task.status === "blocked" || task.blockedBy.length > 0) {
-            reason = ` — waiting${task.blockedBy.length ? ` (blockedBy: ${task.blockedBy.join(", ")})` : ""}`;
-          } else if (unresolved.length > 0) {
-            reason = ` — waiting for deps: ${unresolved.join(", ")}`;
+          // Completed rows never show waiting reasons (stale blockedBy etc.).
+          if (task.status !== "completed") {
+            if (task.status === "blocked" || task.blockedBy.length > 0) {
+              reason = ` — waiting${task.blockedBy.length ? ` (blockedBy: ${task.blockedBy.join(", ")})` : ""}`;
+            } else if (unresolved.length > 0) {
+              reason = ` — waiting for deps: ${unresolved.join(", ")}`;
+            }
           }
           lines.push(
             `- ${STATUS_GLYPH[task.status]} ${task.key}: ${task.subject}${owner}${deps}${scope}${changedFilesSuffix(task)}${blocked}${reason}`,
@@ -1798,7 +1833,7 @@ export default function towerDoExtension(pi: ExtensionAPI): void {
           ? "read"
           : "UNREAD";
         lines.push(
-          `- [${message.id}] [${readMark}] ${message.from} → you${message.taskKey === undefined ? "" : ` (task ${message.taskKey})`}: ${message.subject} — ${message.body.split("\n")[0]}`,
+          `- [${message.id}] [${readMark}] ${message.from} → me${message.taskKey === undefined ? "" : ` (task ${message.taskKey})`}: ${message.subject} — ${message.body.split("\n")[0]}`,
         );
       }
       if (myMessages.length === 0) lines.push("(none)");
@@ -1870,10 +1905,21 @@ export default function towerDoExtension(pi: ExtensionAPI): void {
       }
       const lines = output.split("\n");
       const keep = expanded ? lines.length : Math.min(lines.length, 14);
-      let rendered = theme.fg(
-        context.isError ? "error" : "toolOutput",
-        lines.slice(0, keep).join("\n"),
-      );
+      // Caller-owned lines stand out: accent + bold vs plain toolOutput. The
+      // execute side already resolved the caller; prefer it over re-deriving.
+      const details = (result.details ?? {}) as Record<string, unknown>;
+      const caller =
+        typeof details.identity === "string"
+          ? details.identity
+          : sessionIdentity(activeCwd, pi);
+      let rendered = lines
+        .slice(0, keep)
+        .map((line) =>
+          !context.isError && isCallerLine(line, caller)
+            ? theme.fg("accent", theme.bold(line))
+            : theme.fg(context.isError ? "error" : "toolOutput", line),
+        )
+        .join("\n");
       if (lines.length > keep) {
         rendered += theme.fg(
           "dim",
@@ -1902,26 +1948,15 @@ export default function towerDoExtension(pi: ExtensionAPI): void {
     if (existsSync(entry.board.file)) {
       currentView = await foldRetained(ctx.cwd);
     } else {
-      for (const rawEntry of ctx.sessionManager.getBranch()) {
-        if (
-          rawEntry.type === "custom" &&
-          rawEntry.customType === TOWER_DO_BOARD_TYPE &&
-          rawEntry.data !== undefined
-        ) {
-          const checkpoint = readBoardSnapshot(rawEntry.data);
-          if (checkpoint) {
-            // Replay the checkpoint as a *display* only: the disk board is
-            // still empty (revision 0). Pin revision to 0 so the widget and
-            // reminders never advertise a stale baseRevision that the disk
-            // gate would reject.
-            currentView = cloneBoard({ ...checkpoint, revision: 0 });
-            break;
-          }
-        }
-      }
-      if (currentView.tasks.length === 0) {
-        currentView = createEmptyBoard();
-      }
+      // Always replace the in-memory view: a previous session's currentView
+      // must not leak into this one when the board file is gone. getBranch
+      // is root-to-leaf, so take the last valid checkpoint (see
+      // latestBoardCheckpoint), not the first.
+      const checkpoint = latestBoardCheckpoint(ctx.sessionManager.getBranch());
+      currentView =
+        checkpoint === undefined
+          ? createEmptyBoard()
+          : cloneBoard({ ...checkpoint, revision: 0 });
     }
     contextCheckpointNeeded = false;
     llmCallsSinceReminder = 0;
@@ -1954,39 +1989,58 @@ export default function towerDoExtension(pi: ExtensionAPI): void {
       activeCwd === undefined
     )
       return;
+    // Peer cancels must show up without waiting for a tool call.
+    const settledEntry = boards.entryFor(activeCwd);
+    if (existsSync(settledEntry.board.file)) {
+      currentView = await foldRetained(activeCwd);
+    }
     await refreshGitCounts(activeCwd);
     updateWidget();
     widgetTui?.requestRender();
   });
 
-  pi.on("context", (event) => {
+  pi.on("context", async (event, ctx) => {
+    // Compact / before_agent_start inject TOWER_DO_BOARD_TYPE snapshots that
+    // persist in the session transcript. They must not keep cancelled todos
+    // in the LLM context after a peer writes; strip and replace from disk.
+    const isBoardContext = (message: {
+      role?: string;
+      customType?: string;
+    }): boolean =>
+      message.role === "custom" &&
+      (message.customType === TOWER_DO_REMINDER_TYPE ||
+        message.customType === TOWER_DO_BOARD_TYPE);
+    const hadBoardContext = event.messages.some(isBoardContext);
     const messages = event.messages.filter(
-      (message) =>
-        !(
-          message.role === "custom" &&
-          message.customType === TOWER_DO_REMINDER_TYPE
-        ),
+      (message) => !isBoardContext(message),
     );
-    if (activeCwd === undefined) {
-      return messages.length === event.messages.length
-        ? undefined
-        : { messages };
+    const cwd = ctx?.cwd ?? activeCwd;
+    if (cwd === undefined) {
+      return hadBoardContext || messages.length !== event.messages.length
+        ? { messages }
+        : undefined;
     }
-    const identity = sessionIdentity(activeCwd, pi);
+    const contextEntry = boards.entryFor(cwd);
+    if (existsSync(contextEntry.board.file)) {
+      currentView = await foldRetained(cwd);
+    }
+    const identity = sessionIdentity(cwd, pi);
     const tasks = getAllTasks(currentView);
     const hasUnfinished = tasks.some((task) => task.status !== "completed");
     const hasInbox = unreadMessagesToMe(currentView, identity).length > 0;
     if (!hasUnfinished && !hasInbox) {
       llmCallsSinceReminder = 0;
-      return messages.length === event.messages.length
-        ? undefined
-        : { messages };
+      return hadBoardContext || messages.length !== event.messages.length
+        ? { messages }
+        : undefined;
     }
-    llmCallsSinceReminder += 1;
-    if (llmCallsSinceReminder < REMINDER_INTERVAL) {
-      return messages.length === event.messages.length
-        ? undefined
-        : { messages };
+    if (!hadBoardContext) {
+      llmCallsSinceReminder += 1;
+      if (llmCallsSinceReminder < REMINDER_INTERVAL) {
+        return messages.length === event.messages.length
+          ? undefined
+          : { messages };
+      }
     }
     llmCallsSinceReminder = 0;
     return {
@@ -2004,19 +2058,28 @@ export default function towerDoExtension(pi: ExtensionAPI): void {
   });
 
   pi.on("session_compact", async (event, ctx) => {
-    pi.appendEntry(TOWER_DO_BOARD_TYPE, cloneBoard(currentView));
+    // Fold + checkpoint under the same mutation queue as tower_do so a
+    // concurrent cancel cannot land between the snapshot and appendEntry.
+    const compactEntry = boards.entryFor(ctx.cwd);
+    let snapshot = cloneBoard(currentView);
+    if (existsSync(compactEntry.board.file)) {
+      await withFileMutationQueue(compactEntry.board.file, async () => {
+        currentView = await foldRetained(ctx.cwd);
+        snapshot = cloneBoard(currentView);
+        pi.appendEntry(TOWER_DO_BOARD_TYPE, snapshot);
+      });
+    } else {
+      pi.appendEntry(TOWER_DO_BOARD_TYPE, snapshot);
+    }
     if (event.willRetry || ctx.hasPendingMessages()) {
       contextCheckpointNeeded = false;
       llmCallsSinceReminder = 0;
       pi.sendMessage(
         {
           customType: TOWER_DO_BOARD_TYPE,
-          content: formatBoardReminder(
-            currentView,
-            sessionIdentity(ctx.cwd, pi),
-          ),
+          content: formatBoardReminder(snapshot, sessionIdentity(ctx.cwd, pi)),
           display: false,
-          details: cloneBoard(currentView),
+          details: snapshot,
         },
         { deliverAs: "steer" },
       );
@@ -2025,17 +2088,23 @@ export default function towerDoExtension(pi: ExtensionAPI): void {
     }
   });
 
-  pi.on("before_agent_start", () => {
+  pi.on("before_agent_start", async (_event, ctx) => {
     if (!contextCheckpointNeeded) return;
     contextCheckpointNeeded = false;
     llmCallsSinceReminder = 0;
+    const cwd = ctx?.cwd ?? activeCwd;
+    if (cwd !== undefined) {
+      const entry = boards.entryFor(cwd);
+      if (existsSync(entry.board.file)) {
+        await withFileMutationQueue(entry.board.file, async () => {
+          currentView = await foldRetained(cwd);
+        });
+      }
+    }
     return {
       message: {
         customType: TOWER_DO_BOARD_TYPE,
-        content: formatBoardReminder(
-          currentView,
-          sessionIdentity(activeCwd, pi),
-        ),
+        content: formatBoardReminder(currentView, sessionIdentity(cwd, pi)),
         display: false,
         details: cloneBoard(currentView),
       },
@@ -2047,6 +2116,7 @@ export default function towerDoExtension(pi: ExtensionAPI): void {
     uiContext = undefined;
     lastContext = undefined;
     activeCwd = undefined;
+    currentView = createEmptyBoard();
     resetGitCounts();
     contextCheckpointNeeded = false;
     llmCallsSinceReminder = 0;
