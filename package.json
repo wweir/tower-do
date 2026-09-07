@@ -20,6 +20,7 @@
     "index.ts",
     "state.ts",
     "board.ts",
+    "git-count.ts",
     "test/",
     "docs/",
     "tsconfig.json",

@@ -14,5 +14,5 @@
     "resolveJsonModule": true,
     "forceConsistentCasingInFileNames": true
   },
-  "include": ["state.ts", "board.ts", "index.ts"]
+  "include": ["state.ts", "board.ts", "git-count.ts", "index.ts"]
 }

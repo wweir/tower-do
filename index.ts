@@ -45,6 +45,7 @@ import {
   type Theme,
 } from "@earendil-works/pi-coding-agent";
 import { Text, truncateToWidth, type TUI } from "@earendil-works/pi-tui";
+import { execFile } from "node:child_process";
 import { existsSync, readFileSync, statSync } from "node:fs";
 import { randomUUID } from "node:crypto";
 import { dirname, join } from "node:path";
@@ -55,6 +56,14 @@ import {
   TowerBoard,
   type TowerDoConfig,
 } from "./board.ts";
+import {
+  ABSENT_HASH,
+  formatGitSegment,
+  parseDiffNames,
+  parsePorcelain,
+  sessionTouchedDelta,
+  zipHashObject,
+} from "./git-count.ts";
 import {
   cloneBoard,
   createEmptyBoard,
@@ -565,6 +574,340 @@ export default function towerDoExtension(pi: ExtensionAPI): void {
   // Widget (above-editor status line)
   // -------------------------------------------------------------------------
 
+  // Git dirty/session counts for the widget header. Populated asynchronously
+  // (session_start snapshot + agent_settled refresh); render stays sync and
+  // only reads this cache. "disabled" means cwd is not a git worktree — the
+  // segment stays hidden instead of erroring.
+  type LiveGitCounts = {
+    disabled: false;
+    root: string; // git toplevel; porcelain paths are relative to this
+    startHashes: Map<string, string>; // content baseline captured on the first successful hash
+    lastHead: string; // attribution window start; the empty tree when unborn
+    lastDirty: Set<string>;
+    touched: Set<string>;
+    dirty: number;
+    session: number;
+  };
+  let gitCounts: { disabled: true } | LiveGitCounts | undefined;
+  // Captured by the widget factory so async refreshes can force a repaint —
+  // render() is only invoked on TUI-driven redraws otherwise.
+  let widgetTui: TUI | undefined;
+  // Sequence token guarding refreshGitCounts write-backs (see above).
+  let gitRefreshSeq = 0;
+
+  const git = (cwd: string, args: string[]): Promise<string | undefined> =>
+    new Promise((resolve) => {
+      execFile(
+        "git",
+        args,
+        { cwd, encoding: "utf8", maxBuffer: 16 * 1024 * 1024 },
+        (error, stdout) => resolve(error === null ? stdout : undefined),
+      );
+    });
+
+  const gitStdin = (
+    cwd: string,
+    args: string[],
+    stdin: string,
+  ): Promise<string | undefined> =>
+    new Promise((resolve) => {
+      const child = execFile(
+        "git",
+        args,
+        { cwd, encoding: "utf8", maxBuffer: 16 * 1024 * 1024 },
+        (error, stdout) => resolve(error === null ? stdout : undefined),
+      );
+      child.stdin?.on("error", () => {});
+      child.stdin?.end(stdin);
+    });
+
+  // git's canonical empty tree — startHead stand-in for an unborn HEAD.
+  const EMPTY_TREE_HASH = "4b825dc642cb6eb9a060e54bf8d69288fbee4904";
+  // Hashing cost must stay bounded: the widget refreshes after every settled
+  // agent run, so a huge untracked tree must not be stat'ed + hashed each
+  // time. Past the cap the session viewpoint pauses (keeps its last count)
+  // while dirty stays correct.
+  const MAX_HASHED_PATHS = 2000;
+
+  // `git hash-object --stdin-paths` splits stdin on newlines and C-unquotes
+  // lines starting with `"` — encode such paths so they survive round-trip.
+  const hashStdinLine = (path: string): string =>
+    path.startsWith('"')
+      ? `"${path.replace(/\\/g, "\\\\").replace(/"/g, '\\"')}"`
+      : path;
+
+  const hashPaths = async (
+    root: string,
+    paths: string[],
+  ): Promise<Map<string, string> | undefined> => {
+    const hashes = new Map<string, string>();
+    if (paths.length > MAX_HASHED_PATHS) return undefined;
+    const files: string[] = [];
+    const lines: string[] = [];
+    for (const path of paths) {
+      try {
+        if (statSync(join(root, path)).isFile()) {
+          if (path.includes("\n")) {
+            // cannot cross the line-based stdin-paths protocol; baseline and
+            // current both see ABSENT, so it just never counts
+            hashes.set(path, ABSENT_HASH);
+          } else {
+            files.push(path);
+            lines.push(hashStdinLine(path));
+          }
+        } else {
+          hashes.set(path, ABSENT_HASH);
+        }
+      } catch {
+        hashes.set(path, ABSENT_HASH);
+      }
+    }
+    if (files.length === 0) return hashes;
+    const out = await gitStdin(
+      root,
+      ["hash-object", "--stdin-paths"],
+      `${lines.join("\n")}\n`,
+    );
+    if (out === undefined) return undefined;
+    const zipped = zipHashObject(files, out);
+    if (zipped === undefined) return undefined;
+    for (const [path, hash] of zipped) hashes.set(path, hash);
+    return hashes;
+  };
+
+  /** HEAD blob names for committed paths; a missing blob becomes ABSENT. */
+  const headBlobHashes = async (
+    root: string,
+    paths: string[],
+  ): Promise<Map<string, string> | undefined> => {
+    const hashes = new Map<string, string>();
+    const send: string[] = [];
+    for (const path of paths) {
+      if (path.includes("\n")) hashes.set(path, ABSENT_HASH);
+      else send.push(path);
+    }
+    if (send.length === 0) return hashes;
+    const out = await gitStdin(
+      root,
+      ["cat-file", "--batch-check=%(objectname)"],
+      `${send.map((path) => `HEAD:${path}`).join("\n")}\n`,
+    );
+    if (out === undefined) return undefined;
+    const lines = out === "" ? [] : out.replace(/\n$/, "").split("\n");
+    if (lines.length !== send.length) return undefined;
+    for (let i = 0; i < send.length; i++) {
+      // missing entries echo "<request> missing" instead of an object name
+      hashes.set(
+        send[i],
+        lines[i].startsWith("HEAD:") ? ABSENT_HASH : lines[i],
+      );
+    }
+    return hashes;
+  };
+
+  const writeLive = (
+    root: string,
+    startHashes: Map<string, string>,
+    lastHead: string,
+    lastDirty: Set<string>,
+    touched: Set<string>,
+    dirty: number,
+  ): void => {
+    gitCounts = {
+      disabled: false,
+      root,
+      startHashes,
+      lastHead,
+      lastDirty,
+      touched,
+      dirty,
+      session: touched.size,
+    };
+  };
+
+  // Above this many new commits in one settle window, HEAD movement is
+  // treated as external (pull / rebase / branch switch): its roster is not
+  // folded into sess and the window re-anchors at the new HEAD. A merge
+  // commit in the window is also treated as external — a fast-forward pull
+  // of few commits is the accepted blind spot.
+  const EXTERNAL_MOVE_MAX_COMMITS = 20;
+
+  const headMovedExternally = async (
+    root: string,
+    from: string,
+    to: string,
+  ): Promise<boolean> => {
+    const merges = await git(root, [
+      "rev-list",
+      "--merges",
+      "--count",
+      `${from}..${to}`,
+    ]);
+    if (merges === undefined) return true;
+    if (Number.parseInt(merges.trim(), 10) > 0) return true;
+    const count = await git(root, ["rev-list", "--count", `${from}..${to}`]);
+    if (count === undefined) return true;
+    return Number.parseInt(count.trim(), 10) > EXTERNAL_MOVE_MAX_COMMITS;
+  };
+
+  /** First successful observation: hash the dirty worktree, freeze the
+   * attribution window at the current HEAD (unborn → the empty tree). A
+   * hash failure leaves gitCounts unset; the next refresh re-seeds. */
+  const seedGitCounts = async (
+    root: string,
+    seq: number,
+    dirtyPaths: string[],
+  ): Promise<void> => {
+    const currentHashes = await hashPaths(root, dirtyPaths);
+    if (seq !== gitRefreshSeq) return;
+    if (currentHashes === undefined) return;
+    const lastHead =
+      (await git(root, ["rev-parse", "--verify", "HEAD"]))?.trim() ??
+      EMPTY_TREE_HASH;
+    if (seq !== gitRefreshSeq) return;
+    writeLive(
+      root,
+      currentHashes,
+      lastHead,
+      new Set(dirtyPaths),
+      new Set(),
+      dirtyPaths.length,
+    );
+  };
+
+  const refreshGitCounts = async (cwd: string): Promise<void> => {
+    if (gitCounts?.disabled) return;
+    const seq = ++gitRefreshSeq;
+    const existing =
+      gitCounts === undefined || gitCounts.disabled ? undefined : gitCounts;
+    const root =
+      existing?.root ??
+      (await git(cwd, ["rev-parse", "--show-toplevel"]))?.trim();
+    if (seq !== gitRefreshSeq) return;
+    if (!root) {
+      // Transient failure — retry on the next refresh; only a non-worktree
+      // cwd disables the segment.
+      const inside = await git(cwd, ["rev-parse", "--is-inside-work-tree"]);
+      if (seq !== gitRefreshSeq) return;
+      if (inside?.trim() !== "true") gitCounts = { disabled: true };
+      return;
+    }
+    // Run from the toplevel so paths are root-relative regardless of the
+    // status.relativePaths config; -z keeps raw path bytes (no C-quoting) and
+    // -uall expands untracked directories to file granularity.
+    const porcelain = await git(root, ["status", "--porcelain", "-z", "-uall"]);
+    if (seq !== gitRefreshSeq) return;
+    if (porcelain === undefined) {
+      if (existing !== undefined) return;
+      const inside = await git(root, ["rev-parse", "--is-inside-work-tree"]);
+      if (seq !== gitRefreshSeq) return;
+      if (inside?.trim() !== "true") gitCounts = { disabled: true };
+      return;
+    }
+    const { changed, untracked } = parsePorcelain(porcelain);
+    const dirtyPaths = [...changed, ...untracked];
+    if (existing === undefined) {
+      await seedGitCounts(root, seq, dirtyPaths);
+      return;
+    }
+    await attributeGitCounts(root, seq, existing, dirtyPaths);
+  };
+
+  /** Steady state: fold worktree hash deltas and the commit window
+   * lastHead..HEAD into the persistent touched set. */
+  const attributeGitCounts = async (
+    root: string,
+    seq: number,
+    existing: LiveGitCounts,
+    dirtyPaths: string[],
+  ): Promise<void> => {
+    const currentSet = new Set(dirtyPaths);
+    const currentHashes = await hashPaths(root, dirtyPaths);
+    if (seq !== gitRefreshSeq) return;
+    if (currentHashes === undefined) {
+      gitCounts = { ...existing, dirty: dirtyPaths.length };
+      return;
+    }
+    const left = [...existing.lastDirty].filter(
+      (path) => !currentSet.has(path),
+    );
+    const leftHashes =
+      left.length === 0
+        ? new Map<string, string>()
+        : await hashPaths(root, left);
+    if (seq !== gitRefreshSeq) return;
+    if (leftHashes === undefined) {
+      gitCounts = { ...existing, dirty: dirtyPaths.length };
+      return;
+    }
+    // Fold commits since the last refresh: catches content changed *and*
+    // committed between two refreshes (never visible in lastDirty).
+    const head = (await git(root, ["rev-parse", "--verify", "HEAD"]))?.trim();
+    if (seq !== gitRefreshSeq) return;
+    const window = await commitWindow(root, existing.lastHead, head);
+    if (seq !== gitRefreshSeq) return;
+    if (window === undefined) {
+      gitCounts = { ...existing, dirty: dirtyPaths.length };
+      return;
+    }
+    // Worktree hashes for paths that left the dirty set (deleted, or
+    // committed and untouched since) join the HEAD roster.
+    for (const [path, hash] of leftHashes) {
+      if (!window.hashes.has(path)) window.hashes.set(path, hash);
+    }
+    const touched = new Set(existing.touched);
+    for (const path of sessionTouchedDelta(
+      currentHashes,
+      existing.startHashes,
+      window.hashes,
+    )) {
+      touched.add(path);
+    }
+    writeLive(
+      root,
+      existing.startHashes,
+      window.head,
+      currentSet,
+      touched,
+      dirtyPaths.length,
+    );
+  };
+
+  /** Resolve the roster of commits since the last refresh. External HEAD
+   * movement (pull / rebase / branch switch) re-anchors the window instead
+   * of folding foreign work into sess. */
+  const commitWindow = async (
+    root: string,
+    lastHead: string,
+    head: string | undefined,
+  ): Promise<
+    { hashes: Map<string, string>; head: string } | undefined
+  > => {
+    if (head === undefined || head === lastHead) {
+      return { hashes: new Map(), head: lastHead };
+    }
+    if (await headMovedExternally(root, lastHead, head)) {
+      return { hashes: new Map(), head };
+    }
+    const diffOut = await git(root, [
+      "diff",
+      "--name-only",
+      "-z",
+      lastHead,
+      head,
+    ]);
+    if (diffOut === undefined) return undefined;
+    const hashes = await headBlobHashes(root, parseDiffNames(diffOut));
+    if (hashes === undefined) return undefined;
+    return { hashes, head };
+  };
+
+  /** Reset the git viewpoint (new session / shutdown); supersedes in-flight refreshes. */
+  const resetGitCounts = (): void => {
+    gitRefreshSeq += 1;
+    gitCounts = undefined;
+  };
+
   const clearWidget = (): void => {
     if (widgetRegistered && uiContext?.hasUI) {
       try {
@@ -574,19 +917,34 @@ export default function towerDoExtension(pi: ExtensionAPI): void {
       }
     }
     widgetRegistered = false;
+    widgetTui = undefined;
   };
 
   const updateWidget = (ctx?: ExtensionContext): void => {
     if (ctx) uiContext = ctx;
     if (!uiContext?.hasUI || uiContext.mode !== "tui") return;
-    if (currentView.tasks.length === 0 && currentView.messages.length === 0) {
+    // The widget survives an empty board: the git segment is independent of
+    // board content and should stay visible. Only when there is neither
+    // board content nor a git segment is there nothing to render.
+    const boardEmpty =
+      currentView.tasks.length === 0 && currentView.messages.length === 0;
+    // Gate on the rendered segment string, not just data availability: a
+    // clean repo yields counts (0, 0) and formatGitSegment(""), which would
+    // otherwise register a permanently blank widget.
+    const gitSegment =
+      gitCounts !== undefined && !gitCounts.disabled
+        ? formatGitSegment(gitCounts.dirty, gitCounts.session)
+        : "";
+    if (boardEmpty && gitSegment === "") {
       clearWidget();
       return;
     }
     if (!widgetRegistered) {
+      widgetRegistered = true;
       uiContext.ui.setWidget(
         WIDGET_KEY,
-        (_tui: TUI, theme: Theme) => {
+        (tui: TUI, theme: Theme) => {
+          widgetTui = tui;
           return {
             render: (width: number) => {
               const tasks = getAllTasks(currentView);
@@ -596,25 +954,47 @@ export default function towerDoExtension(pi: ExtensionAPI): void {
               const blocked = tasks.filter((task) =>
                 taskIsBlocked(task, currentView),
               );
+              const boardEmpty =
+                currentView.tasks.length === 0 &&
+                currentView.messages.length === 0;
+              const gitSegment =
+                gitCounts !== undefined && !gitCounts.disabled
+                  ? formatGitSegment(
+                      gitCounts.dirty,
+                      gitCounts.session,
+                      (n, which) =>
+                        theme.fg(
+                          which === "dirty" ? "warning" : "accent",
+                          theme.bold(String(n)),
+                        ),
+                      (s) => theme.fg("dim", s),
+                    )
+                  : "";
               const identity = sessionIdentity(activeCwd, pi);
               const inboxForMe = unreadMessagesToMe(
                 currentView,
                 identity,
               ).length;
-              const header =
-                theme.fg(
-                  "accent",
-                  theme.bold(
-                    `TowerDo ${tasks.length - unfinished.length}/${tasks.length}`,
-                  ),
-                ) +
-                theme.fg("dim", ` rev ${currentView.revision}`) +
-                (blocked.length > 0
-                  ? theme.fg("error", ` ${blocked.length} blocked`)
-                  : "") +
-                (inboxForMe > 0
-                  ? theme.fg("warning", ` ${inboxForMe} msg`)
-                  : "");
+              let header = "";
+              if (!boardEmpty) {
+                header =
+                  theme.fg(
+                    "accent",
+                    theme.bold(
+                      `TowerDo ${tasks.length - unfinished.length}/${tasks.length}`,
+                    ),
+                  ) + theme.fg("dim", ` rev ${currentView.revision}`);
+                if (blocked.length > 0) {
+                  header += theme.fg("error", ` ${blocked.length} blocked`);
+                }
+                if (inboxForMe > 0) {
+                  header += theme.fg("warning", ` ${inboxForMe} msg`);
+                }
+              }
+              if (gitSegment !== "") {
+                header +=
+                  (header === "" ? "" : theme.fg("dim", " │ ")) + gitSegment;
+              }
               const lines = [header];
               // WIDGET_TASK_LIMIT caps how many unfinished tasks the
               // above-editor line shows; the rest fold into an overflow note.
@@ -640,7 +1020,9 @@ export default function towerDoExtension(pi: ExtensionAPI): void {
                   ),
                 );
               }
-              return lines.map((line) => truncateToWidth(line, width, "…"));
+              return lines
+                .filter((line) => line.length > 0)
+                .map((line) => truncateToWidth(line, width, "…"));
             },
             invalidate: () => {},
             dispose: () => {},
@@ -648,7 +1030,6 @@ export default function towerDoExtension(pi: ExtensionAPI): void {
         },
         { placement: "aboveEditor" },
       );
-      widgetRegistered = true;
     }
   };
 
@@ -1516,7 +1897,14 @@ export default function towerDoExtension(pi: ExtensionAPI): void {
     contextCheckpointNeeded = false;
     llmCallsSinceReminder = 0;
     uiContext = ctx;
+    // New session ⇒ new viewpoint: drop the previous session's counts
+    // *before* the first paint so /tree cannot flash a stale git segment.
+    resetGitCounts();
     updateWidget(ctx);
+    void refreshGitCounts(ctx.cwd).then(() => {
+      updateWidget();
+      widgetTui?.requestRender();
+    });
   };
 
   pi.on("session_start", async (_event, ctx) => {
@@ -1524,6 +1912,22 @@ export default function towerDoExtension(pi: ExtensionAPI): void {
   });
   pi.on("session_tree", async (_event, ctx) => {
     await restore(ctx);
+  });
+
+  // Refresh dirty/session counts after each settled agent run (post-retry,
+  // cheaper and steadier than per-turn). TUI mode only — print/RPC never has
+  // a widget. Runs even when the widget is not (yet) registered: the git
+  // segment must initialize on an empty board too.
+  pi.on("agent_settled", async () => {
+    if (
+      uiContext?.mode !== "tui" ||
+      !uiContext?.hasUI ||
+      activeCwd === undefined
+    )
+      return;
+    await refreshGitCounts(activeCwd);
+    updateWidget();
+    widgetTui?.requestRender();
   });
 
   pi.on("context", (event) => {
@@ -1614,6 +2018,7 @@ export default function towerDoExtension(pi: ExtensionAPI): void {
     uiContext = undefined;
     lastContext = undefined;
     activeCwd = undefined;
+    resetGitCounts();
     contextCheckpointNeeded = false;
     llmCallsSinceReminder = 0;
     // Re-resolve project roots next session: the filesystem may have gained

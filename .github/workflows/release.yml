@@ -38,6 +38,7 @@ jobs:
           bun run test/presence-retention.ts
           bun run test/changed-files.ts
           bun run test/scope-conflicts.ts
+          bun run test/git-count.ts
 
       - name: Verify tag matches package version
         run: |
