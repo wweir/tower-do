@@ -4,5 +4,5 @@ coverage/
 *.log
 *.tgz
 .DS_Store
-# runtime board (file-as-state) when the extension runs inside this repo
+# local pi state (agents, skills); tower-do state now lives in ~/.pi
 .pi/
