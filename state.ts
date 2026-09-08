@@ -1470,32 +1470,59 @@ export function derivePresence(
   return lines;
 }
 
-/**
- * Window (ms) within which a session's last board write counts as "running
- * right now" for the widget's live-session segment. Aligned with
- * SESSION_BREAK_GAP_MS: past the break gap it is a different sitting, not a
- * concurrent one. Any board interaction refreshes liveness (status/inbox
- * append read acks), but a session doing pure code work without touching the
- * board is invisible until its next board call — the window is deliberately
- * generous to cover that blind spot.
- */
-export const SESSION_LIVE_WINDOW_MS = SESSION_BREAK_GAP_MS;
+/** Heartbeat cadence for the per-session liveness sidecar (`live/<sessionId>.json`, see index.ts): each session rewrites its own record on this cadence. */
+export const LIVE_HEARTBEAT_MS = 30_000;
+
+/** Liveness window: a sidecar record older than this no longer counts as
+ * running. A clean session exit deletes its file; a crashed one is expired
+ * after four missed heartbeats. Deliberately much shorter than the old
+ * board-activity window (SESSION_BREAK_GAP_MS): liveness now tracks running
+ * processes, not last board interaction. */
+export const LIVE_WINDOW_MS = 2 * 60_000;
+
+/** Records older than this are unlinked by readers (best-effort GC of files
+ * left behind by crashed sessions). Far beyond the window so a slow
+ * heartbeat or modest clock skew cannot get a live session's file pruned. */
+export const LIVE_PRUNE_MS = 10 * 60_000;
+
+/** One per-session liveness sidecar record: `live/<sessionId>.json`. */
+export interface LiveRecord {
+  identity: string;
+  at: number;
+}
+
+/** Parse the raw JSON content of a liveness sidecar file. Corrupt or
+ * foreign content returns undefined (caller skips the file). */
+export function parseLiveRecord(raw: string): LiveRecord | undefined {
+  let candidate: unknown;
+  try {
+    candidate = JSON.parse(raw);
+  } catch {
+    return undefined;
+  }
+  if (!candidate || typeof candidate !== "object") return undefined;
+  const record = candidate as Record<string, unknown>;
+  const { identity, at } = record;
+  if (typeof identity !== "string" || identity.trim() === "") return undefined;
+  if (typeof at !== "number" || !Number.isFinite(at)) return undefined;
+  return { identity, at };
+}
 
 /**
- * Count sessions currently running against this board: distinct activity
- * identities seen within the window, plus `self` (a fresh session may have
- * no board writes yet but is by definition live). Pure read derivation;
- * never writes.
+ * Count sessions currently running against this board: distinct identities
+ * seen fresh in the liveness sidecar within the window, plus `self` (own
+ * record write failed / has not landed yet — self is by definition running).
+ * Pure read derivation over the sidecar; never touches the board.
  */
 export function liveSessionCount(
-  entries: readonly ActivityEntry[],
+  records: readonly LiveRecord[],
   self: string,
   now: number,
-  windowMs: number = SESSION_LIVE_WINDOW_MS,
+  windowMs: number = LIVE_WINDOW_MS,
 ): number {
   const live = new Set<string>();
-  for (const entry of entries) {
-    if (entry.at >= now - windowMs) live.add(entry.by);
+  for (const record of records) {
+    if (record.at >= now - windowMs) live.add(record.identity);
   }
   if (self !== "") live.add(self);
   return live.size;

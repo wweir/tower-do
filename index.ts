@@ -46,7 +46,22 @@ import {
 } from "@earendil-works/pi-coding-agent";
 import { Text, truncateToWidth, type TUI } from "@earendil-works/pi-tui";
 import { execFile } from "node:child_process";
-import { existsSync, readFileSync, statSync } from "node:fs";
+import {
+  existsSync,
+  mkdirSync,
+  readFileSync,
+  statSync,
+  watch,
+  type FSWatcher,
+} from "node:fs";
+import {
+  mkdir,
+  readFile,
+  readdir,
+  rename,
+  unlink,
+  writeFile,
+} from "node:fs/promises";
 import { randomUUID } from "node:crypto";
 import { dirname, join } from "node:path";
 import { Type } from "typebox";
@@ -84,7 +99,10 @@ import {
   isTowerDoStatus,
   latestActivity,
   latestBoardCheckpoint,
+  LIVE_HEARTBEAT_MS,
+  LIVE_PRUNE_MS,
   liveSessionCount,
+  parseLiveRecord,
   MAX_FINDING_SUMMARY_CHARS,
   MAX_FINDING_TITLE_CHARS,
   MAX_MESSAGE_BYTES,
@@ -109,6 +127,7 @@ import {
   type FindingKind,
   type FindingSeverity,
   type FindingStatus,
+  type LiveRecord,
   type TowerBoardView,
   type TowerDoFinding,
   type TowerDoMessage,
@@ -606,11 +625,25 @@ export default function towerDoExtension(pi: ExtensionAPI): void {
   // Captured by the widget factory so async refreshes can force a repaint —
   // render() is only invoked on TUI-driven redraws otherwise.
   let widgetTui: TUI | undefined;
-  // Live-session count for the widget header: distinct board identities with
-  // recent activity, plus this session (see liveSessionCount). Refreshed with
-  // the git counts (session_start / agent_settled); render stays sync and
-  // only reads this cache. Undefined until the first refresh lands.
+  // Live-session count for the widget header: distinct identities fresh in
+  // the per-session liveness sidecar (live/<session>.json, heartbeat-driven),
+  // plus this session (see liveSessionCount). Kept fresh by fs.watch (peer
+  // enter/exit/write) and agent_settled; render stays sync and only reads
+  // this cache. Undefined until the first refresh lands.
   let liveSessions: { count: number } | undefined;
+  // Liveness sidecar wiring — session-scoped, all (re)set in restore() and
+  // torn down in session_shutdown.
+  let liveHeartbeat: ReturnType<typeof setInterval> | undefined;
+  let liveWatchers: FSWatcher[] = [];
+  let liveRefreshTimer: ReturnType<typeof setTimeout> | undefined;
+  // Set when a watcher event asked for a board re-fold during the debounce
+  // window (OR-merged across sources); cleared when the refresh runs.
+  let liveRefreshNeedsFold = false;
+  // This session's liveness file path — computed ONCE in restore(). The
+  // empty-session-id fallback is a fresh random UUID and identity can change
+  // mid-session, so recomputing per call would churn the filename every
+  // heartbeat and strand the record past clean exit.
+  let selfLivePath: string | undefined;
   // Sequence token guarding refreshGitCounts write-backs (see above).
   let gitRefreshSeq = 0;
 
@@ -949,34 +982,201 @@ export default function towerDoExtension(pi: ExtensionAPI): void {
     liveSessions = undefined;
   };
 
-  /** Live-session count from the board activity tail: distinct identities
-   * seen within SESSION_LIVE_WINDOW_MS, plus this session. Boardless
+  // --- Liveness sidecar (per-session files + heartbeat + fs.watch) ---------
+  //
+  // Liveness is a different signal from board activity ("process running"
+  // vs "touched the board"), so it lives in its own channel: each session
+  // owns exactly one file `.pi/tower-do/live/<identity>.<sessionId>.json`
+  // rewritten on a heartbeat cadence and deleted on clean exit. Own-file
+  // writes never contend cross-process; exit is a delete, a crash expires
+  // via LIVE_WINDOW_MS. fs.watch makes peer enter/exit/write visible within
+  // one debounce tick instead of at our next settle.
+
+  const liveDirFor = (cwd: string): string =>
+    join(dirname(boards.entryFor(cwd).board.file), "live");
+
+  /** Filename-safe component (identities/session ids are human-chosen). */
+  const sanitizeLiveName = (s: string): string =>
+    s.replace(/[^A-Za-z0-9._-]/g, "_").slice(0, 64) || "x";
+
+  const selfSessionId = (ctx?: ExtensionContext): string => {
+    const manager = ctx?.sessionManager ?? lastContext?.sessionManager;
+    const getSessionId = manager?.getSessionId;
+    const id = typeof getSessionId === "function" ? (getSessionId() ?? "") : "";
+    return id !== "" ? id : randomUUID().slice(0, 8);
+  };
+
+  /** Rewrite this session's liveness record (temp + rename, own file at the
+   * stable selfLivePath). Best-effort: a failed write degrades to self-only
+   * counting via the liveSessionCount `self` union, never a wrong peer
+   * count. */
+  const writeSelfLive = async (cwd: string): Promise<void> => {
+    if (selfLivePath === undefined) return;
+    try {
+      await mkdir(dirname(selfLivePath), { recursive: true });
+      const tmp = `${selfLivePath}.${randomUUID()}.tmp`;
+      await writeFile(
+        tmp,
+        JSON.stringify({ identity: sessionIdentity(cwd, pi), at: Date.now() }),
+      );
+      await rename(tmp, selfLivePath);
+    } catch {
+      // Best-effort by design (see above).
+    }
+  };
+
+  /** Live-session count from the liveness sidecar: distinct identities with
+   * a record no older than LIVE_WINDOW_MS, plus this session. Boardless
    * directories have nothing to be live about — the segment stays hidden
-   * there instead of showing a meaningless `live 1` everywhere. Best-effort:
-   * a read failure leaves the previous count in place. */
+   * there instead of showing a meaningless `live 1` everywhere. */
   const refreshLiveSessions = async (cwd: string): Promise<void> => {
     const boardEntry = boards.entryFor(cwd);
     if (!existsSync(boardEntry.board.file)) {
       liveSessions = undefined;
       return;
     }
-    let tail: string[];
+    const records: LiveRecord[] = [];
     try {
-      tail = (await boardEntry.board.rawTail(200)).reverse();
+      const dir = liveDirFor(cwd);
+      const now = Date.now();
+      for (const name of await readdir(dir)) {
+        // Only .json counts: skips .tmp rename intermediates of peers.
+        if (!name.endsWith(".json")) continue;
+        const path = join(dir, name);
+        try {
+          const record = parseLiveRecord(await readFile(path, "utf8"));
+          if (record === undefined) continue;
+          if (record.at < now - LIVE_PRUNE_MS) {
+            // Crashed-session residue. Unlink far beyond the window so a
+            // slow heartbeat or modest clock skew cannot prune a live peer;
+            // never our own file.
+            if (path !== selfLivePath) void unlink(path).catch(() => {});
+            continue;
+          }
+          records.push(record);
+        } catch {
+          // Unreadable file: skip it.
+        }
+      }
     } catch {
-      // Empty file → [] → live 1 (self). I/O failure must not collapse
-      // to that; keep the previous count.
-      return;
+      // No live dir yet (first session in this project): only self.
     }
     // Restore may have switched projects while this refresh was in flight;
     // a stale count from another board must not land.
     if (activeCwd !== cwd) return;
-    const entries = tail
-      .map((line) => parseActivityLine(line))
-      .filter((entry): entry is ActivityEntry => entry !== undefined);
     liveSessions = {
-      count: liveSessionCount(entries, sessionIdentity(cwd, pi), Date.now()),
+      count: liveSessionCount(records, sessionIdentity(cwd, pi), Date.now()),
     };
+  };
+
+  const stopLiveWatchers = (): void => {
+    if (liveRefreshTimer !== undefined) {
+      clearTimeout(liveRefreshTimer);
+      liveRefreshTimer = undefined;
+    }
+    if (liveHeartbeat !== undefined) {
+      clearInterval(liveHeartbeat);
+      liveHeartbeat = undefined;
+    }
+    for (const watcher of liveWatchers) {
+      try {
+        watcher.close();
+      } catch {
+        // Already closed.
+      }
+    }
+    liveWatchers = [];
+    liveRefreshNeedsFold = false;
+    selfLivePath = undefined;
+  };
+
+  /** Coalesce fs.watch bursts into one refresh. `foldBoard` requests a
+   * board re-fold (peer task writes); live-dir events (heartbeats, peer
+   * enter/exit) only refresh the count — folding a growing board on every
+   * 30s heartbeat of every peer would be pure churn. */
+  const scheduleLiveRefresh = (foldBoard: boolean): void => {
+    if (foldBoard) liveRefreshNeedsFold = true;
+    if (liveRefreshTimer !== undefined) return;
+    liveRefreshTimer = setTimeout(() => {
+      liveRefreshTimer = undefined;
+      const needsFold = liveRefreshNeedsFold;
+      liveRefreshNeedsFold = false;
+      if (activeCwd === undefined) return;
+      void (async () => {
+        const entry = boards.entryFor(activeCwd);
+        if (needsFold && existsSync(entry.board.file)) {
+          try {
+            currentView = await foldRetained(activeCwd);
+          } catch {
+            // Display cache only: keep the previous view on a failed fold.
+          }
+        }
+        await refreshLiveSessions(activeCwd);
+        updateWidget();
+        widgetTui?.requestRender();
+      })();
+    }, 250);
+  };
+
+  const startLiveWatchers = (cwd: string): void => {
+    const towerDir = dirname(boards.entryFor(cwd).board.file);
+    const watchDir = (
+      target: string,
+      foldBoard: boolean,
+      filter?: (name: string) => boolean,
+    ): void => {
+      try {
+        const watcher = watch(target, (_event, filename) => {
+          const name = filename === null ? undefined : filename.toString();
+          if (name !== undefined && filter && !filter(name)) return;
+          scheduleLiveRefresh(foldBoard);
+        });
+        watcher.on("error", () => {
+          // Best-effort: a failed watcher falls back to the old
+          // settle-driven refresh cadence.
+          try {
+            watcher.close();
+          } catch {
+            // Already closed.
+          }
+        });
+        liveWatchers.push(watcher);
+      } catch {
+        // Missing dir (first session) or unsupported platform: same fallback.
+      }
+    };
+    watchDir(liveDirFor(cwd), false);
+    watchDir(towerDir, true, (name) => name === "board.jsonl");
+  };
+
+  const startLiveHeartbeat = (cwd: string): void => {
+    void writeSelfLive(cwd);
+    if (liveHeartbeat !== undefined) clearInterval(liveHeartbeat);
+    liveHeartbeat = setInterval(() => {
+      if (activeCwd === undefined) return;
+      void writeSelfLive(activeCwd);
+    }, LIVE_HEARTBEAT_MS);
+    liveHeartbeat.unref?.();
+  };
+
+  /** Set up the session-scoped liveness wiring once, and only against a
+   * board that exists: without a board there is no live segment, and
+   * heartbeat files would pollute non-tower projects. Re-invoked from
+   * agent_settled so a board created mid-session (first tower_do call in a
+   * fresh project) still joins the live channel. */
+  const startLiveWiring = (cwd: string, ctx?: ExtensionContext): void => {
+    if (selfLivePath !== undefined) return;
+    if (!existsSync(boards.entryFor(cwd).board.file)) return;
+    selfLivePath = join(
+      liveDirFor(cwd),
+      `${sanitizeLiveName(sessionIdentity(cwd, pi))}.${sanitizeLiveName(selfSessionId(ctx))}.json`,
+    );
+    // The live dir must exist before watch(): the first session in a project
+    // would otherwise miss its watcher forever (ENOENT swallowed, never
+    // retried).
+    mkdirSync(liveDirFor(cwd), { recursive: true });
+    startLiveHeartbeat(cwd);
+    startLiveWatchers(cwd);
   };
 
   const clearWidget = (): void => {
@@ -2049,6 +2249,10 @@ export default function towerDoExtension(pi: ExtensionAPI): void {
     uiContext = ctx;
     // New session ⇒ new viewpoint: drop the previous session's counts
     // *before* the first paint so /tree cannot flash a stale git segment.
+    // Also restart the liveness sidecar wiring: pi fires session_shutdown
+    // for the old instance before session_start/session_tree, but a
+    // defensive stop keeps double-restore idempotent.
+    stopLiveWatchers();
     resetGitCounts();
     updateWidget(ctx);
     void Promise.all([
@@ -2058,6 +2262,11 @@ export default function towerDoExtension(pi: ExtensionAPI): void {
       updateWidget();
       widgetTui?.requestRender();
     });
+    // Announce self and stay fresh: the heartbeat makes this session visible
+    // to peers regardless of board activity; the watchers make peer
+    // enter/exit/write visible to us within one debounce tick. Gated on an
+    // existing board — see startLiveWiring.
+    startLiveWiring(ctx.cwd, ctx);
   };
 
   pi.on("session_start", async (_event, ctx) => {
@@ -2072,6 +2281,9 @@ export default function towerDoExtension(pi: ExtensionAPI): void {
   // a widget. Runs even when the widget is not (yet) registered: the git
   // segment must initialize on an empty board too.
   pi.on("agent_settled", async () => {
+    // Late wiring: a board created mid-session (first tower_do call) still
+    // joins the live channel — cheap no-op once wired.
+    if (activeCwd !== undefined) startLiveWiring(activeCwd);
     if (
       uiContext?.mode !== "tui" ||
       !uiContext?.hasUI ||
@@ -2202,6 +2414,12 @@ export default function towerDoExtension(pi: ExtensionAPI): void {
   });
 
   pi.on("session_shutdown", () => {
+    // Exit signal first (delete while selfLivePath is still known), then
+    // tear down the session-scoped wiring.
+    if (selfLivePath !== undefined) {
+      void unlink(selfLivePath).catch(() => {});
+    }
+    stopLiveWatchers();
     clearWidget();
     uiContext = undefined;
     lastContext = undefined;
