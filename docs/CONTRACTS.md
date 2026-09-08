@@ -66,9 +66,10 @@ another owner's content or roll back a concurrent update.
 
 ## Message contracts
 
-- Recipient must be a known task owner, `tower`, or `all`; **self-send banned**;
-  subject/recipient single-line; body ≤ 32 KiB (pointer-style references for
-  long reports).
+- Recipient must be a current task owner, `tower`, `all`, or an identity with
+  recent board activity (a peer whose tasks are all completed stays reachable
+  via its historical bylines); **self-send banned**; subject/recipient
+  single-line; body ≤ 32 KiB (pointer-style references for long reports).
 - `inbox` **acks** what it shows (LWW `readBy` update). Sender never counts as a
   reader of its own broadcast; a broadcast's send-time owner list is snapshotted
   as `audience` — late joiners aren't part of it and can't pin retirement.

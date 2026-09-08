@@ -44,8 +44,8 @@ Three tools:
 | Tool | Purpose |
 | --- | --- |
 | `tower_do` | One-shot atomic board update: plan / claim (`owner` + `in_progress`) / complete (`changedFiles` receipt) / block (`blocked` + `blockedBy`). `baseRevision` protects against clobbering |
-| `tower_do_talk` | Cross-agent messaging: `send` (known owner or `all`; self-send rejected), `inbox`, `finding` (structured out-of-scope report / status update) |
-| `tower_do_status` | Shared dashboard: everyone's in-progress work (owner / deps / scope / changedFiles / block reasons), **scope conflicts**, messages, open findings, activity + presence |
+| `tower_do_talk` | Cross-agent messaging: `send` (owner / recent-activity identity / `all`; self-send rejected), `inbox`, `finding` (structured out-of-scope report / status update) |
+| `tower_do_status` | Shared dashboard: everyone's in-progress work (owner / deps / scope / changedFiles / block reasons), **scope conflicts**, messages, open findings, activity + presence; `taskKey` returns one task's full detail |
 
 ## Install
 

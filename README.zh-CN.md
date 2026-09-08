@@ -27,8 +27,8 @@
 | 工具 | 用途 |
 | --- | --- |
 | `tower_do` | 一次性原子更新看板：计划 / 认领（`owner` + `in_progress`）/ 完成（带 `changedFiles` 回执）/ 阻塞（`blocked` + `blockedBy`）。`baseRevision` 防覆盖 |
-| `tower_do_talk` | 跨 agent 消息：`send`（已知 owner 或 `all`；禁止自发）/ `inbox` / `finding`（结构化越界上报） |
-| `tower_do_status` | 共享仪表盘：所有人的进行中工作（owner / deps / scope / changedFiles / 阻塞原因）、**scope 冲突**、消息、open findings、活动与在场状态 |
+| `tower_do_talk` | 跨 agent 消息：`send`（owner / 近期有活动的 identity / `all`；禁止自发）/ `inbox` / `finding`（结构化越界上报） |
+| `tower_do_status` | 共享仪表盘：所有人的进行中工作（owner / deps / scope / changedFiles / 阻塞原因）、**scope 冲突**、消息、open findings、活动与在场状态；`taskKey` 返回单任务全字段详情 |
 
 ## 安装
 
