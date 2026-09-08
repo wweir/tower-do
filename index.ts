@@ -261,8 +261,8 @@ function loadConfig(): TowerDoConfig {
  * one there — BEFORE any board logic, so a config-only leftover still
  * reaches the global path even when the state dir was already migrated (the
  * retired layout documented config.json as safe to commit, so it can
- * reappear from git). A legacy board next to a fresh one is a genuine merge
- * conflict and fails loud below. */
+ * reappear from git). If the target already exists, leftover project dirs
+ * are ignored: the global records home is authoritative. */
 function migrateLegacyState(cwd: string): void {
   const legacy = join(projectRoot(cwd), CONFIG_DIR_NAME, "tower-do");
   if (resolve(legacy) === resolve(homeDir(), ".pi", "tower-do")) return;
@@ -298,7 +298,7 @@ function migrateLegacyState(cwd: string): void {
  * atomic but fails with EXDEV when the project and $HOME live on different
  * filesystems; fall back to copy + remove only for that case. Any other
  * rename failure (EEXIST, EACCES, …) must propagate — a silent copy+rm
- * into an already-created target would bypass the two-board conflict guard. */
+ * into an already-created target would silently merge two boards. */
 function moveDir(from: string, to: string): void {
   try {
     renameSync(from, to);
@@ -309,21 +309,6 @@ function moveDir(from: string, to: string): void {
   }
 }
 
-/** Merge-conflict guard: fires only when auto-migration could not run (a
- * state dir already exists at the new location) while a legacy board still
- * sits at the retired one — merging two boards needs a human decision.
- * Heartbeat-only leftovers never trip this: live/ is ephemeral (2-min TTL).
- * The global state root itself is NOT a legacy remnant: a session whose
- * project root resolves to $HOME has legacy === the records home. */
-function assertNoLegacyState(cwd: string): void {
-  const legacy = join(projectRoot(cwd), CONFIG_DIR_NAME, "tower-do");
-  if (resolve(legacy) === resolve(homeDir(), ".pi", "tower-do")) return;
-  if (!existsSync(join(legacy, "board.jsonl"))) return;
-  throw new Error(
-    `tower-do state ${legacy} conflicts with existing ${stateDirFor(cwd)} — merge the legacy board.jsonl into it, then delete the legacy dir`,
-  );
-}
-
 class BoardCache {
   private readonly entries = new Map<string, BoardEntry>();
 
@@ -332,7 +317,6 @@ class BoardCache {
     let entry = this.entries.get(file);
     if (entry === undefined) {
       migrateLegacyState(cwd);
-      assertNoLegacyState(cwd);
       entry = {
         board: new TowerBoard(file),
         config: loadConfig(),

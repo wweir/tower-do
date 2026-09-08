@@ -1495,8 +1495,8 @@ async function layer2(): Promise<void> {
     migrateFailMsg.slice(0, 120),
   );
 
-  // A legacy board NEXT TO an already-initialized state dir is a genuine
-  // merge conflict — loud, never a silent pick between two boards.
+  // A leftover project dir next to an already-initialized state dir must
+  // not brick the session — the global records home is authoritative.
   const conflictDir = mkdtempSync(join(tmpdir(), "tower-do-conflict-"));
   mkdirSync(join(conflictDir, ".pi", "tower-do"), { recursive: true });
   writeFileSync(join(conflictDir, ".pi", "tower-do", "board.jsonl"), "");
@@ -1507,8 +1507,8 @@ async function layer2(): Promise<void> {
     conflictDir,
   );
   check(
-    "legacy board beside an initialized state dir fails loud",
-    /conflicts with/.test(conflictMsg),
+    "legacy board leftover is ignored when the state dir exists",
+    conflictMsg === "NO ERROR",
     conflictMsg.slice(0, 120),
   );
 
