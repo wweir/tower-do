@@ -2,15 +2,17 @@
  * git-count — pure derivation tests for the TowerDo widget git segment.
  *
  * Covers: porcelain -z parsing (status / untracked / rename / raw special
- * paths), content-hash pairing, session-touched deltas, and the segment
- * formatting.
+ * paths), content-hash pairing, session-touched deltas, the attribution
+ * re-anchor decision (headMoveIsExternal), and the segment formatting.
  *
  * Run: bun run test/git-count.ts
  */
 
 import {
   ABSENT_HASH,
+  EXTERNAL_MOVE_MAX_COMMITS,
   formatGitSegment,
+  headMoveIsExternal,
   parseDiffNames,
   parsePorcelain,
   sessionTouchedDelta,
@@ -160,6 +162,48 @@ check(
   "session: committed-between-refresh path not in lastDirty counts",
   sessionTouchedDelta(new Map(), start, new Map([["new.ts", "h4"]]))[0] ===
     "new.ts",
+);
+
+// --- headMoveIsExternal (attribution-window re-anchor decision) ---
+// Accepted blind spot: a forward-only move with few commits (fast-forward
+// pull, switch to a descendant branch) is indistinguishable from the
+// session's own commits — it stays attributed as internal by design.
+
+check(
+  "external: small branch switch detected via ancestry (no merge, 3 commits)",
+  headMoveIsExternal({ ancestor: false, merges: 0, commits: 3 }),
+);
+check(
+  "external: diverged rebase/pull detected via ancestry",
+  headMoveIsExternal({ ancestor: false, merges: 0, commits: 1 }),
+);
+check(
+  "external: merge commit in an ancestral window",
+  headMoveIsExternal({ ancestor: true, merges: 1, commits: 5 }),
+);
+check(
+  "external: oversized ancestral batch (over the commit cap)",
+  headMoveIsExternal({
+    ancestor: true,
+    merges: 0,
+    commits: EXTERNAL_MOVE_MAX_COMMITS + 1,
+  }),
+);
+check(
+  "internal: few own commits on top of lastHead",
+  !headMoveIsExternal({ ancestor: true, merges: 0, commits: 3 }),
+);
+check(
+  "internal: commit cap is inclusive (own fast-forward at the cap)",
+  !headMoveIsExternal({
+    ancestor: true,
+    merges: 0,
+    commits: EXTERNAL_MOVE_MAX_COMMITS,
+  }),
+);
+check(
+  "internal: no movement (empty window)",
+  !headMoveIsExternal({ ancestor: true, merges: 0, commits: 0 }),
 );
 
 // --- formatGitSegment ---

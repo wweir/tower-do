@@ -78,6 +78,7 @@ import {
 import {
   ABSENT_HASH,
   formatGitSegment,
+  headMoveIsExternal,
   parseDiffNames,
   parsePorcelain,
   sessionTouchedDelta,
@@ -895,18 +896,35 @@ export default function towerDoExtension(pi: ExtensionAPI): void {
     };
   };
 
-  // Above this many new commits in one settle window, HEAD movement is
-  // treated as external (pull / rebase / branch switch): its roster is not
-  // folded into sess and the window re-anchors at the new HEAD. A merge
-  // commit in the window is also treated as external — a fast-forward pull
-  // of few commits is the accepted blind spot.
-  const EXTERNAL_MOVE_MAX_COMMITS = 20;
-
   const headMovedExternally = async (
     root: string,
     from: string,
     to: string,
   ): Promise<boolean> => {
+    // Non-ancestor move (diverged pull / rebase / branch switch) first: when
+    // `from` is not an ancestor of `to`, nothing in from..to is this
+    // session's own forward progress. A small *diverged* switch (no merge,
+    // few commits) has no merge/count signal — only ancestry exposes it.
+    // `git merge-base --is-ancestor` exits 1 (not an ancestor) without
+    // stdout, so our git() wrapper yields undefined → external (re-anchor),
+    // as does a real git error. A *descendant* branch switch (from is an
+    // ancestor) with few commits is the accepted blind spot — same signal
+    // profile as a fast-forward pull, and ref-tracking would mislabel a
+    // session-created branch as external.
+    //
+    // Unborn baseline: `from` is the empty tree, not a commit.
+    // `merge-base --is-ancestor` exits 128 and would drop this session's
+    // first commit from `mine`. Skip ancestry only; merge/count still
+    // distinguish a large pull into a fresh repo from a single first commit.
+    if (from !== EMPTY_TREE_HASH) {
+      const ancestor = await git(root, [
+        "merge-base",
+        "--is-ancestor",
+        from,
+        to,
+      ]);
+      if (ancestor === undefined) return true;
+    }
     const merges = await git(root, [
       "rev-list",
       "--merges",
@@ -914,10 +932,13 @@ export default function towerDoExtension(pi: ExtensionAPI): void {
       `${from}..${to}`,
     ]);
     if (merges === undefined) return true;
-    if (Number.parseInt(merges.trim(), 10) > 0) return true;
     const count = await git(root, ["rev-list", "--count", `${from}..${to}`]);
     if (count === undefined) return true;
-    return Number.parseInt(count.trim(), 10) > EXTERNAL_MOVE_MAX_COMMITS;
+    return headMoveIsExternal({
+      ancestor: true, // ancestry succeeded, or from is the empty tree
+      merges: Number.parseInt(merges.trim(), 10),
+      commits: Number.parseInt(count.trim(), 10),
+    });
   };
 
   /** First observation (or re-seed after a paused state): hash the dirty

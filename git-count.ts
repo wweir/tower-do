@@ -14,6 +14,11 @@
  *            it was committed since startHead with a blob different from the
  *            baseline. Pre-dirty files this session never edits do not count.
  *
+ * Attribution re-anchors when HEAD moved externally — a non-ancestor move
+ * (diverged pull / rebase / branch switch) — instead of folding foreign work
+ * into `session`. Forward-only moves with few commits (fast-forward pull,
+ * switch to a descendant branch) stay the accepted blind spot.
+ *
  * No I/O here: the caller runs the git commands and hands over raw stdout.
  */
 
@@ -95,6 +100,41 @@ export function sessionTouchedDelta(
  for (const [path, hash] of currentHashes) consider(path, hash);
  for (const [path, hash] of committedHashes) consider(path, hash);
  return touched;
+}
+
+/** A commit batch larger than this in one settle window is external (pull /
+ * rebase / branch switch) even when the previous HEAD is an ancestor of the
+ * new one: its roster is not folded into the session viewpoint and the
+ * window re-anchors at the new HEAD. A fast-forward pull of few commits —
+ * and a switch to a descendant branch with few commits — is the accepted
+ * blind spot: forward-only moves carry no signal that distinguishes them
+ * from the session's own commits short of tracking the branch ref, which
+ * would mislabel a session-created branch as external. */
+export const EXTERNAL_MOVE_MAX_COMMITS = 20;
+
+/**
+ * External-movement decision for the attribution window `lastHead..head`.
+ * The caller hands over raw git facts (no I/O here):
+ *  - `ancestor` false (lastHead is not an ancestor of head) → external:
+ *    history was rewritten or the branch switched under us, so nothing in
+ *    the window is this session's own forward progress. This catches a
+ *    small branch switch (no merge, few commits), which merge/count signals
+ *    alone would wrongly fold into `session`.
+ *  - a merge commit in the window → external (a pull merged foreign work).
+ *  - more than EXTERNAL_MOVE_MAX_COMMITS commits → external (big batch).
+ * Otherwise the window is this session's own commits and stays attributed.
+ */
+export function headMoveIsExternal(facts: {
+ /** lastHead reachable from head (`git merge-base --is-ancestor` exit 0). */
+ ancestor: boolean;
+ /** merge commits in `lastHead..head`. */
+ merges: number;
+ /** total commits in `lastHead..head`. */
+ commits: number;
+}): boolean {
+ if (!facts.ancestor) return true;
+ if (facts.merges > 0) return true;
+ return facts.commits > EXTERNAL_MOVE_MAX_COMMITS;
 }
 
 /** Header segment `mine N · dirty N`. `em` wraps numbers; `label` wraps viewpoint words.

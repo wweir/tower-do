@@ -93,9 +93,15 @@ how much of that this session caused, without a second unit (lines, commits).
   edits do not count. A later commit can still show `mine N · dirty 0`.
 
 External HEAD movement (pull / rebase / branch switch) never folds its
-roster into the session viewpoint: a window containing a merge commit or more than 20
-commits re-anchors the window at the new HEAD. A fast-forward pull of few
-commits is the accepted blind spot.
+roster into the session viewpoint: the previous HEAD not being an ancestor
+of the current one (branch switch / rebase / diverged pull — ancestry is the
+only signal a *small* switch emits; a merge/count heuristic alone folds it
+into `mine`), a window containing a merge commit, or a window of more than 20
+commits, all re-anchor the window at the new HEAD. Forward-only small moves
+— a fast-forward pull, or a switch to a *descendant* branch with few
+commits — carry no signal that distinguishes them from the session's own
+commits short of tracking the branch ref (which would mislabel a
+session-created branch as external), so they are the accepted blind spot.
 
 Cost bound: refresh hashes at most 2000 dirty paths per settle; past the
 cap (or on a hashing failure) the session viewpoint pauses — dirty stays
