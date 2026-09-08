@@ -54,7 +54,7 @@ pi 启动时自动发现扩展；已开会话用 `/reload` 加载。
 
 ## 快速上手
 
-**单个 pi 会话 + 子代理（典型用法）**：父会话在板上规划并认领 owner；把 `tower_do_status` 打印的看板路径交给子代理（file-as-state）；子代理回报结果；父会话收口。**多个 pi 会话共享同一项目**：两边自动读写同一个 `<project>/.pi/tower-do/board.jsonl` —— 发消息、对方 `inbox` 读取，即跨 agent 通讯。
+**单个 pi 会话 + 子代理（典型用法）**：父会话在板上规划并认领 owner；把 `tower_do_status` 打印的看板路径交给子代理（file-as-state）；子代理回报结果；父会话收口。**多个 pi 会话共享同一项目**：两边自动读写同一个 `~/.pi/tower-do/<project>/board.jsonl` —— 发消息、对方 `inbox` 读取，即跨 agent 通讯。
 
 身份解析：`as` 参数 > 项目配置 `identity` > 会话名 > 会话 id。代子代理记录工作时传它的 id（如 `as: "coder-1"`）。
 
@@ -72,7 +72,7 @@ pi 启动时自动发现扩展；已开会话用 `/reload` 加载。
 
 ## 工作原理
 
-每个项目一个追加式 JSONL 文件（`<project>/.pi/tower-do/board.jsonl`）是唯一事实源——状态与通信是同一份存储。每次读取都从日志重新折叠；写入携带单调递增的 revision，同伴的并发更新会被拒绝而不是被静默覆盖。系统边界、事件语义与只读派生见 [docs/ARCHITECTURE.md](docs/ARCHITECTURE.md)。
+每个项目一个追加式 JSONL 文件（`~/.pi/tower-do/<project>/board.jsonl`）是唯一事实源——状态与通信是同一份存储。每次读取都从日志重新折叠；写入携带单调递增的 revision，同伴的并发更新会被拒绝而不是被静默覆盖。系统边界、事件语义与只读派生见 [docs/ARCHITECTURE.md](docs/ARCHITECTURE.md)。
 
 ## 文档
 

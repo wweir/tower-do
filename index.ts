@@ -206,7 +206,7 @@ export function projectRoot(cwd: string): string {
  * session records (board.jsonl, live sidecars) never ride inside a repo. The
  * slug keeps the directory readable; the path hash guarantees uniqueness
  * (`/a/b` vs `/a_b` would slug identically). */
-export function stateDirFor(cwd: string): string {
+function stateDirFor(cwd: string): string {
   const root = projectRoot(cwd);
   const slug =
     root.replace(/[^A-Za-z0-9._-]+/g, "-").replace(/^-+|-+$/g, "") || "project";

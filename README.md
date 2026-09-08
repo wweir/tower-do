@@ -74,7 +74,7 @@ Pi auto-discovers the extension at startup; existing sessions pick it up with `/
 **One session + subagents (typical).** Parent plans tasks on the board and
 claims owners; hands subagents the board path from `tower_do_status`
 (file-as-state); they report back; parent closes out. **Multiple sessions, one
-project.** Both read/write the same `<project>/.pi/tower-do/board.jsonl` — send
+project.** Both read/write the same `~/.pi/tower-do/<project>/board.jsonl` — send
 a message, the peer reads it via `inbox`.
 
 Identity resolution: `as` param > project config `identity` > session name >
@@ -95,7 +95,7 @@ project). No environment variables.
 
 ## How it works
 
-One append-only JSONL file per project (`<project>/.pi/tower-do/board.jsonl`)
+One append-only JSONL file per project (`~/.pi/tower-do/<project>/board.jsonl`)
 is the single source of truth — state and communication are the same storage.
 Every read re-folds the log; writes carry a monotonic revision so a peer's
 concurrent update is rejected instead of silently clobbered. System boundary,

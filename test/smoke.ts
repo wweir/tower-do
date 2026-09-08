@@ -1445,13 +1445,7 @@ async function layer2(): Promise<void> {
     recursive: true,
   });
   writeFileSync(
-    join(
-      homeProject,
-      ".pi",
-      "tower-do",
-      "seeded-project",
-      "board.jsonl",
-    ),
+    join(homeProject, ".pi", "tower-do", "seeded-project", "board.jsonl"),
     "",
   );
   const homeMsg = await runThrow("tower_do_status", {} as never, homeProject);
@@ -1459,6 +1453,25 @@ async function layer2(): Promise<void> {
     "session rooted at $HOME does not trip the legacy guard",
     !/no longer read/.test(homeMsg),
     homeMsg.slice(0, 80),
+  );
+
+  // Beyond the guard not firing: a real write must land in the global
+  // records home. Fold the resolved path back and assert the round-trip.
+  await run(
+    "tower_do",
+    {
+      tasks: [
+        { key: "home-write", subject: "pinned at home", status: "in_progress" },
+      ],
+    } as never,
+    homeProject,
+  );
+  const homeBoard = await new TowerBoard(boardFileFor(homeProject)).fold();
+  check(
+    "session rooted at $HOME writes into the global records home",
+    homeBoard.revision >= 1 &&
+      homeBoard.tasks.some((task) => task.key === "home-write"),
+    `rev=${homeBoard.revision} file=${boardFileFor(homeProject)}`,
   );
 }
 
