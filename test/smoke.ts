@@ -572,6 +572,26 @@ async function layer2(): Promise<void> {
     "billing in Blocked, absent from Pending",
   );
 
+  // The status filter follows the same derived contract as the rendering:
+  // status:"blocked" finds gated pending tasks, status:"pending" does not.
+  const asBlocked = await run("tower_do_status", { status: "blocked" } as never);
+  check(
+    "status filter blocked finds gated pending task",
+    /## Blocked[\s\S]*?billing[\s\S]*?\[blocked by: auth\]/.test(
+      asBlocked.text,
+    ) &&
+      /Tasks: 2 total \(1 in_progress, 1 blocked, 0 pending, 0 completed\)/.test(
+        asBlocked.text,
+      ),
+    "billing listed under Blocked",
+  );
+  const asPending = await run("tower_do_status", { status: "pending" } as never);
+  check(
+    "status filter pending excludes gated pending task",
+    asPending.text.includes("(no tasks match the filter)"),
+    "pending filter empty",
+  );
+
   // bob (as subagent id) tries to complete alice's task → ownership error.
   const blockedMsg = await runThrow("tower_do", {
     tasks: [

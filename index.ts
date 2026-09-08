@@ -1984,21 +1984,20 @@ export default function towerDoExtension(pi: ExtensionAPI): void {
       const { board, caller, view } = await prepare(ctx, undefined);
       const tasks = getAllTasks(view);
       // Blocked is DERIVED (taskIsBlocked), matching the reminder header and
-      // row suffixes; raw status only feeds in_progress/pending, and
-      // derived-blocked tasks leave those buckets so the summary line and
-      // the sections below never disagree about the same task.
-      const isBlockedNow = (task: TowerDoTask): boolean =>
-        task.status !== "completed" && taskIsBlocked(task, view);
-      const inProgressCount = tasks.filter(
-        (task) => task.status === "in_progress" && !isBlockedNow(task),
-      ).length;
-      const pendingCount = tasks.filter(
-        (task) => task.status === "pending" && !isBlockedNow(task),
-      ).length;
-      const completedCount = tasks.filter(
-        (task) => task.status === "completed",
-      ).length;
-      const blockedCount = tasks.filter(isBlockedNow).length;
+      // row suffixes. displayStatus is the single rendering contract: the
+      // summary counts, the status filter, and the sections below all go
+      // through it, so a gated pending task is found, counted, and grouped
+      // as blocked everywhere.
+      const displayStatus = (task: TowerDoTask): TowerDoStatus =>
+        task.status !== "completed" && taskIsBlocked(task, view)
+          ? "blocked"
+          : task.status;
+      const statusCount = (status: TowerDoStatus): number =>
+        tasks.filter((task) => displayStatus(task) === status).length;
+      const inProgressCount = statusCount("in_progress");
+      const pendingCount = statusCount("pending");
+      const completedCount = statusCount("completed");
+      const blockedCount = statusCount("blocked");
       // Fetch a wider tail than the rendered window: presence (who is around,
       // who went idle) needs enough history to judge inactivity, while the
       // rendered activity feed only shows the configured activity tail.
@@ -2046,7 +2045,8 @@ export default function towerDoExtension(pi: ExtensionAPI): void {
           ? tasks.filter(
               (task) =>
                 (params.owner === undefined || task.owner === params.owner) &&
-                (params.status === undefined || task.status === params.status),
+                (params.status === undefined ||
+                  displayStatus(task) === params.status),
             )
           : tasks;
       const limit = params.limit ?? 200;
@@ -2207,16 +2207,13 @@ export default function towerDoExtension(pi: ExtensionAPI): void {
         }
         lines.push("");
       };
-      renderGroup("Blocked", isBlockedNow);
+      renderGroup("Blocked", (task) => displayStatus(task) === "blocked");
       renderGroup(
         "In progress",
-        (task) => task.status === "in_progress" && !isBlockedNow(task),
+        (task) => displayStatus(task) === "in_progress",
       );
-      renderGroup(
-        "Pending",
-        (task) => task.status === "pending" && !isBlockedNow(task),
-      );
-      renderGroup("Completed", (task) => task.status === "completed");
+      renderGroup("Pending", (task) => displayStatus(task) === "pending");
+      renderGroup("Completed", (task) => displayStatus(task) === "completed");
 
       if (shown.length === 0) lines.push("(no tasks match the filter)");
 
