@@ -336,7 +336,7 @@ const TowerDoTaskSchema = Type.Object({
   blockedBy: Type.Optional(
     Type.Array(Type.String(), {
       description:
-        "Optional keys (message/finding ids) describing what blocks this task. Advisory; non-empty renders a non-completed task as blocked.",
+        "Free-form blocker ids this task waits on — task, message, or finding ids; not validated against the board. Non-empty renders a non-completed task as blocked (task-status gating goes through dependsOn instead).",
       maxItems: 20,
     }),
   ),
@@ -1177,7 +1177,7 @@ export default function towerDoExtension(pi: ExtensionAPI): void {
       "Use tower_do for the task plan instead of direct file edits when multiple agents or sessions share the work; it is the shared board, not a private todo list.",
       "When a task needs a plan of 3+ steps, define it yourself and call tower_do with subject + status before beginning substantive work.",
       "Include baseRevision (from tower_do_status) in every tower_do call; a stale revision is rejected so you never silently overwrite a peer's update.",
-      "Mark a task completed only after implementation and verification succeed. Use status blocked with a blockedBy note instead of leaving it hanging.",
+      "Mark a task completed only after implementation and verification succeed, attaching changedFiles (files you actually changed, repo-relative) in the same call. Use status blocked with a blockedBy note instead of leaving it hanging.",
       "Claim shared tasks by setting owner and in_progress together. Only the owner or the orchestrator identity tower may change an owned task's fields or remove it — to remove or reassign another agent's task, message the owner via tower_do_talk instead of editing it directly.",
       "Reconcile actual progress with the shared board before your final response, and do not issue a no-op tower_do call only to acknowledge a reminder.",
     ],
@@ -1835,19 +1835,26 @@ export default function towerDoExtension(pi: ExtensionAPI): void {
           const scope = task.scope?.length
             ? ` [scope: ${task.scope.join(", ")}]`
             : "";
-          const blocked = taskIsBlocked(task, view) ? " [blocked]" : "";
-          const unresolved = findAllUnresolvedDeps(task, view);
-          let reason = "";
-          // Completed rows never show waiting reasons (stale blockedBy etc.).
-          if (task.status !== "completed") {
-            if (task.status === "blocked" || task.blockedBy.length > 0) {
-              reason = ` — waiting${task.blockedBy.length ? ` (blockedBy: ${task.blockedBy.join(", ")})` : ""}`;
-            } else if (unresolved.length > 0) {
-              reason = ` — waiting for deps: ${unresolved.join(", ")}`;
-            }
-          }
+          const blocked = taskIsBlocked(task, view);
+          // Same contract as the board reminder: the marker must carry the
+          // WHY (blockedBy ∪ unresolved deps), never a bare duplicate of the
+          // status glyph. Completed rows never show waiting reasons.
+          const blockers =
+            task.status === "completed"
+              ? []
+              : [
+                  ...new Set([
+                    ...task.blockedBy,
+                    ...findAllUnresolvedDeps(task, view),
+                  ]),
+                ];
+          const blockedSuffix = blocked
+            ? blockers.length > 0
+              ? ` [blocked by: ${blockers.join(",")}]`
+              : " [blocked]"
+            : "";
           lines.push(
-            `- ${STATUS_GLYPH[task.status]} ${task.key}: ${task.subject}${owner}${deps}${scope}${changedFilesSuffix(task)}${blocked}${reason}`,
+            `- ${STATUS_GLYPH[task.status]} ${task.key}: ${task.subject}${owner}${deps}${scope}${changedFilesSuffix(task)}${blockedSuffix}`,
           );
         }
         lines.push("");

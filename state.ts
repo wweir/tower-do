@@ -1556,18 +1556,33 @@ export function formatBoardReminder(
 ): string {
   const tasks = getAllTasks(view);
   const unfinished = tasks.filter((task) => task.status !== "completed");
+  const completed = tasks.length - unfinished.length;
   const blocked = tasks.filter((task) => taskIsBlocked(task, view));
   const unread = unreadMessagesToMe(view, identity).length;
+  // The agent reading this snapshot must know which owner suffix is itself,
+  // or owner matching / (me) markers are guesswork.
   const lines = [
-    `TowerDo shared board (revision ${view.revision}; ${tasks.length} task(s), ${blocked.length} blocked, ${unread} unread message(s) for you).`,
+    `TowerDo shared board — you are ${identity} (revision ${view.revision}; ${tasks.length} task(s)${completed > 0 ? `, ${completed} completed hidden` : ""}, ${blocked.length} blocked, ${unread} unread message(s) for you).`,
   ];
   const shown = unfinished.slice(0, REMINDER_TASK_LINE_CAP);
   for (const task of shown) {
-    const owner = task.owner === undefined ? "" : ` @${task.owner}`;
+    const owner =
+      task.owner === undefined
+        ? ""
+        : task.owner === identity
+          ? ` @${task.owner} (me)`
+          : ` @${task.owner}`;
     const deps = task.dependsOn.length ? ` ← ${task.dependsOn.join(",")}` : "";
-    const blocked = taskIsBlocked(task, view) ? " [blocked]" : "";
+    // The status tag already says "blocked" — the suffix must add the WHY
+    // (which keys still gate it) or it is pure duplication.
+    const blockers = [
+      ...new Set([...task.blockedBy, ...findAllUnresolvedDeps(task, view)]),
+    ];
+    const blockedBy = blockers.length
+      ? ` [blocked by: ${blockers.join(",")}]`
+      : "";
     lines.push(
-      `- [${task.status}] ${task.key}: ${task.subject}${owner}${deps}${blocked}`,
+      `- [${task.status}] ${task.key}: ${task.subject}${owner}${deps}${blockedBy}`,
     );
   }
   if (unfinished.length > shown.length) {
@@ -1576,9 +1591,10 @@ export function formatBoardReminder(
     );
   }
   lines.push(
-    "Before the final response, reconcile actual progress with this shared board. " +
-      `If task status/ownership/deps changed, call tower_do with baseRevision ${view.revision}, ` +
-      "and use tower_do_talk to message task owners or file findings instead of silently changing owned tasks. " +
+    "Before your final response, reconcile actual progress with this shared board. " +
+      "If your work changed (or should change) any task's status, owner, or deps, write it via tower_do " +
+      `with baseRevision ${view.revision} — attach changedFiles (files you actually changed) when completing. ` +
+      "To coordinate, message the task owner or file a finding via tower_do_talk instead of silently changing tasks you don't own. " +
       "Do not call tower_do only to acknowledge this reminder.",
   );
   return lines.join("\n");

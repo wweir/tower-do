@@ -1005,13 +1005,13 @@ async function layer2(): Promise<void> {
     staleRow.text.slice(0, 80),
   );
   check(
-    "in_progress + blockedBy still marked [blocked]",
-    waitLine.includes("[blocked]"),
+    "in_progress + blockedBy still marked blocked",
+    waitLine.includes("[blocked by: msg-2]"),
     waitLine || "(missing)",
   );
   check(
-    "in_progress + blockedBy still shows waiting",
-    waitLine.includes("waiting"),
+    "in_progress + blockedBy still names the blocker",
+    waitLine.includes("msg-2"),
     waitLine || "(missing)",
   );
   const mineLine =
