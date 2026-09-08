@@ -55,6 +55,19 @@ The board is shared per **project** = nearest ancestor git work-tree root (a
 `gitdir:`); when no git boundary exists, the directory itself is the project.
 `config.json` anchors to the same root, so `identity` is project-level.
 
+## Liveness sidecar (not board events)
+
+The widget's `live N` does not read the board log: each running session owns
+exactly one file `.pi/tower-do/live/<identity>.<sessionId>.json`
+(`{"identity", "at"}`), rewritten on a 30s heartbeat and deleted on clean
+exit. The count is a pure read derivation (`liveSessionCount` in `state.ts`):
+distinct identities with a record fresh within 2 minutes, plus self. `fs.watch`
+on the sidecar dir and `board.jsonl` (debounced ~250ms, session-scoped) makes
+peer enter/exit — and peer board writes, which also re-fold the view — visible
+within one tick. The board log keeps exactly task/message/finding events:
+liveness never churns `revision` or the activity feed, and directories without
+a board file get neither a live segment nor sidecar writes.
+
 ## Read derivations (never written)
 
 Several board views are **pure read derivations** over the folded view / raw

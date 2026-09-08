@@ -94,7 +94,7 @@ bun run test/presence-retention.ts  # read receipts / retirement / presence / ca
 bun run test/changed-files.ts       # P0 receipt invariants (12 cases)
 bun run test/scope-conflicts.ts     # P1 glob + conflict derivation (17 cases)
 bun run test/git-count.ts           # widget git-segment pure derivations (24 cases)
-bun run test/live-sessions.ts       # widget live-segment presence window (12 cases)
+bun run test/live-sessions.ts       # widget live-segment liveness window + sidecar-record parsing (24 cases)
 bun run test/board-progress.ts      # widget board-progress remaining-work glance (8 cases)
 ```
 

@@ -42,10 +42,12 @@ TowerDo is its state/communication substrate.
   with intersecting scopes, are flagged in `tower_do_status` — resolve by
   messaging, not by gate.
 - **Above-editor widget.** Board progress plus two segments: `live N` (sessions
-  running against this board — distinct identities with board activity in the
-  last 30 minutes, plus this one; a session doing pure code work without
-  touching the board stays invisible until its next board call; hidden in
-  directories without a board) and the git segment (`mine M · dirty N`):
+  running against this board right now — each session heartbeats a tiny
+  liveness sidecar file and deletes it on exit; `fs.watch` makes peers
+  appear/disappear within a second or two; crashed sessions expire after a
+  2-minute silence window; counted by identity, so one configured identity
+  running three sessions reads `live 1`; hidden in directories without a
+  board) and the git segment (`mine M · dirty N`):
   worktree dirty file count vs files whose content this session actually
   changed (pre-dirty files count only if edited again; edits committed between
   refreshes are counted too, while a mid-session pull re-anchors attribution

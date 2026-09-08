@@ -4,32 +4,47 @@
 > / reviews live in docs/plans + docs/reviews and get folded here when they
 > become durable rules.
 
-## 2026-09 — widget `live N` segment: presence-derived, never written
+## 2026-09 — widget `live N`: per-session liveness sidecar, watched
 
 **Context.** The widget should show how many sessions are concurrently
-running against this project's board.
+running against this project's board. The first cut derived the count from
+the board activity log (distinct identities with an event in the last 30
+minutes, plus self) and refreshed it only on `session_start` /
+`agent_settled`. Both directions were wrong for minutes at a time: a new
+session was invisible to peers until its first board call (so an old session
+kept `live 1` while the newcomer already saw `live 2`), a session doing pure
+code work stayed invisible, and a crashed session haunted the count until its
+last activity aged out of the window. The blind spot accepted below the old
+entry is superseded.
 
-**Decision.** Derive the count from the activity log (same signal as
-`tower_do_status`'s who-is-around): distinct identities with a board event in
-the last 30 minutes (aligned with `SESSION_BREAK_GAP_MS`), plus self — a
-fresh session with no board writes yet is by definition running. Any board
-interaction refreshes liveness (status/inbox append read acks), so the count
-tracks tool activity, not OS processes.
+**Decision.** Liveness is a different signal from board activity ("process
+running" vs "touched the board"), so it gets its own channel:
+`.pi/tower-do/live/<identity>.<sessionId>.json` — one file per session,
+rewritten on a 30s heartbeat (`LIVE_HEARTBEAT_MS`), deleted on clean exit.
+The count is a pure derivation (`liveSessionCount` in state.ts over the
+sidecar records): distinct identities with a record fresh within 2 minutes
+(`LIVE_WINDOW_MS`), plus self. `fs.watch` on the sidecar dir and board.jsonl
+(debounced, started in `session_start`, torn down in `session_shutdown`)
+makes peer enter/exit/write visible within one tick; board events also fold
+into the widget's progress segment. Wiring gates on board existence — no
+board, no `live` segment, no sidecar writes in non-tower projects.
 
-Known blind spot, accepted: a session doing pure code work without touching
-the board stays invisible until its next board call — a generous window
-covers it. A true liveness signal (heartbeats) would add a second write path
-to the file-as-state board for one display number; rejected.
+Properties that made a per-session file beat appending to a shared log:
+heartbeat writes never contend cross-process (own file, temp + rename);
+exit is a delete (unambiguous, instant); a crash expires after four missed
+heartbeats instead of 30 minutes; the channel is bounded (O(sessions) files,
+not O(heartbeats) lines) so no truncation races. `board.jsonl` keeps exactly
+task/message/finding events — liveness never churns `revision` or the
+activity feed. Still counted by identity: one configured identity running
+three sessions reads `live 1` (roles, not processes, are what a coordinator
+reasons about).
 
-Directories without a board file show no `live` segment at all — a
-meaningless `live 1` in every random directory would break the widget's
-show-something-only-when-there-is-something minimalism. A board-file read
-failure keeps the last count (an empty file is `live 1` via self; collapsing
-a failed read to that would hide a real `live N`).
-
-**Rejected.** Process/IPC probing (pi sessions are not enumerable portably);
-writing a heartbeat event on every turn (board growth + revision churn for
-derived data).
+**Rejected.** Heartbeat events appended to board.jsonl (a second write path
+on the board plus unbounded growth, for a display number — same reason as
+the original rejection); process/IPC probing (pi sessions are not enumerable
+portably); counting sessions instead of identities (an orchestrator's
+subagents would inflate the count); folding the board on live-dir events
+(30s heartbeat churn per peer for data the heartbeat cannot change).
 
 ## 2026-09 — widget progress counts remaining work, not lifetime
 
