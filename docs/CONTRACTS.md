@@ -27,7 +27,11 @@ who wants to keep an existing task must replay it (usually unchanged).
 
 - **Set only in the same call that sets `status: "completed"`** — providing
   `changedFiles` with any other status is a validation error (no silent
-  "receipt on an unfinished task").
+  "receipt on an unfinished task"). Leaving `completed` (reopen / send back)
+  without an explicit `changedFiles` **voids** the inherited receipt — a
+  delivery record does not apply to an unfinished task. The JSONL history
+  still has the old receipt. Explicit `changedFiles: []` on `completed`
+  clears it while staying completed.
 - **Owner-guarded like every other field**: a worker cannot add / rewrite /
   clear another owner's receipt (the owner guard compares every field). A
   worker sets it once when completing its own task; its owner and `tower` may
@@ -87,7 +91,7 @@ bun run test/smoke.ts               # end-to-end: 3 tools, persistence, scoping,
 bun run test/config.ts              # config fail-loud + reserved identity (11 cases)
 bun run test/owner-guard.ts         # every-field owner guard (10 cases)
 bun run test/presence-retention.ts  # read receipts / retirement / presence / caller-line match / checkpoints (61)
-bun run test/changed-files.ts       # P0 receipt invariants (10 cases)
+bun run test/changed-files.ts       # P0 receipt invariants (12 cases)
 bun run test/scope-conflicts.ts     # P1 glob + conflict derivation (17 cases)
 bun run test/git-count.ts           # widget git-segment pure derivations (24 cases)
 bun run test/live-sessions.ts       # widget live-segment presence window (12 cases)

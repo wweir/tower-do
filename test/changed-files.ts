@@ -13,6 +13,8 @@
  *      test/smoke.ts layer1.
  *   5. Setting changedFiles while NOT completed is rejected with a clear
  *      error (no silent "receipt on an unfinished task").
+ *   6. Reopening a completed task (omit changedFiles, new status) voids the
+ *      inherited receipt; a worker still cannot reopen another owner's task.
  *
  * Run: bun test/changed-files.ts
  */
@@ -287,6 +289,40 @@ async function main(): Promise<void> {
   check(
     "explicit empty changedFiles clears the receipt",
     (wCleared.view.tasks[0].changedFiles ?? []).length === 0,
+  );
+
+  // --- 6. Reopen voids an inherited receipt; owner guard still applies ---
+
+  const wReopen = writeBoardSnapshot(
+    wDone.view,
+    {
+      tasks: [{ key: "a", status: "in_progress" }],
+      baseRevision: wDone.view.revision,
+    },
+    "A",
+  );
+  check(
+    "reopening completed+receipt to in_progress voids the receipt",
+    wReopen.view.tasks[0].status === "in_progress" &&
+      wReopen.view.tasks[0].changedFiles === undefined &&
+      wReopen.view.tasks[0].owner === "A" &&
+      wReopen.view.tasks[0].subject === "S",
+  );
+
+  expectThrows(
+    "worker cannot reopen another owner's completed task",
+    () =>
+      writeBoardSnapshot(
+        setup.view,
+        {
+          tasks: snapshotOf(setup.view).map((t) =>
+            t.key === "a" ? { key: "a", status: "in_progress" } : { ...t },
+          ),
+          baseRevision: setup.view.revision,
+        },
+        "B",
+      ),
+    /owned by "A"/,
   );
 
   // --- summary ---

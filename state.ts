@@ -314,6 +314,14 @@ export function writeBoardSnapshot(
     if (owner !== undefined) {
       normalizeIdentity(owner, `tasks[${index}].owner`);
     }
+    // Receipts describe a completed delivery: do not inherit one onto a
+    // reopen, or normalizeTask rejects a field the caller never sent.
+    const changedFiles =
+      patch.changedFiles !== undefined
+        ? patch.changedFiles
+        : status === "completed"
+          ? existing?.changedFiles
+          : undefined;
 
     resolved.push(
       normalizeTask(
@@ -336,10 +344,7 @@ export function writeBoardSnapshot(
           ...(patch.scope !== undefined || existing?.scope !== undefined
             ? { scope: patch.scope ?? existing!.scope }
             : {}),
-          ...(patch.changedFiles !== undefined ||
-          existing?.changedFiles !== undefined
-            ? { changedFiles: patch.changedFiles ?? existing!.changedFiles }
-            : {}),
+          ...(changedFiles !== undefined ? { changedFiles } : {}),
           blockedBy:
             patch.blockedBy === undefined
               ? existing
