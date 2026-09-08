@@ -97,7 +97,9 @@ export function sessionTouchedDelta(
  return touched;
 }
 
-/** Header segment `sess M · git N`. `em` wraps numbers; `label` wraps viewpoint words. Defaults keep the empty-segment gate on plain text. */
+/** Header segment `mine N · dirty N`. `em` wraps numbers; `label` wraps viewpoint words.
+ * Labels are self-describing (mine = files this session changed, dirty = worktree
+ * dirty files); defaults keep the empty-segment gate on plain text. */
 export function formatGitSegment(
  dirty: number,
  session: number,
@@ -106,9 +108,9 @@ export function formatGitSegment(
 ): string {
  if (dirty === 0 && session === 0) return "";
  return (
-  label("sess ") +
+  label("mine ") +
   em(session, "session") +
-  label(" · git ") +
+  label(" · dirty ") +
   em(dirty, "dirty")
  );
 }

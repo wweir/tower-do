@@ -167,21 +167,21 @@ check(
 check("segment: both counts zero hidden", formatGitSegment(0, 0) === "");
 check(
   "segment: committed session files still show when dirty is 0",
-  formatGitSegment(0, 3) === "sess 3 · git 0",
+  formatGitSegment(0, 3) === "mine 3 · dirty 0",
 );
 check(
   "segment: both viewpoints always labeled",
-  formatGitSegment(3, 3) === "sess 3 · git 3" &&
-    formatGitSegment(8, 3) === "sess 3 · git 8",
+  formatGitSegment(3, 3) === "mine 3 · dirty 3" &&
+    formatGitSegment(8, 3) === "mine 3 · dirty 8",
 );
 check(
   "segment: em wraps numbers by viewpoint",
   formatGitSegment(8, 3, (n, which) => `${which[0]}${n}`) ===
-    "sess s3 · git d8",
+    "mine s3 · dirty d8",
 );
 check(
   "segment: label wraps viewpoint words only",
-  formatGitSegment(8, 3, String, (s) => `[${s}]`) === "[sess ]3[ · git ]8",
+  formatGitSegment(8, 3, String, (s) => `[${s}]`) === "[mine ]3[ · dirty ]8",
 );
 
 console.log(`\n${passed} passed, ${failures} failed`);

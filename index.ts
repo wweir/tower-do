@@ -76,12 +76,14 @@ import {
   formatActivityFeed,
   formatBoardReminder,
   findScopeConflicts,
+  formatLiveSegment,
   formatPresenceLine,
   getAllTasks,
   isCallerLine,
   isTowerDoStatus,
   latestActivity,
   latestBoardCheckpoint,
+  liveSessionCount,
   MAX_FINDING_SUMMARY_CHARS,
   MAX_FINDING_TITLE_CHARS,
   MAX_MESSAGE_BYTES,
@@ -603,6 +605,11 @@ export default function towerDoExtension(pi: ExtensionAPI): void {
   // Captured by the widget factory so async refreshes can force a repaint —
   // render() is only invoked on TUI-driven redraws otherwise.
   let widgetTui: TUI | undefined;
+  // Live-session count for the widget header: distinct board identities with
+  // recent activity, plus this session (see liveSessionCount). Refreshed with
+  // the git counts (session_start / agent_settled); render stays sync and
+  // only reads this cache. Undefined until the first refresh lands.
+  let liveSessions: { count: number } | undefined;
   // Sequence token guarding refreshGitCounts write-backs (see above).
   let gitRefreshSeq = 0;
 
@@ -936,6 +943,32 @@ export default function towerDoExtension(pi: ExtensionAPI): void {
   const resetGitCounts = (): void => {
     gitRefreshSeq += 1;
     gitCounts = undefined;
+    // Same lifecycle as the git viewpoint: a stale count from the previous
+    // session must not outlive the restore that recomputes it.
+    liveSessions = undefined;
+  };
+
+  /** Live-session count from the board activity tail: distinct identities
+   * seen within SESSION_LIVE_WINDOW_MS, plus this session. Boardless
+   * directories have nothing to be live about — the segment stays hidden
+   * there instead of showing a meaningless `live 1` everywhere. Best-effort:
+   * a read failure leaves the previous count in place. */
+  const refreshLiveSessions = async (cwd: string): Promise<void> => {
+    const boardEntry = boards.entryFor(cwd);
+    if (!existsSync(boardEntry.board.file)) {
+      liveSessions = undefined;
+      return;
+    }
+    const tail = (await boardEntry.board.rawTail(200)).reverse();
+    // Restore may have switched projects while this refresh was in flight;
+    // a stale count from another board must not land.
+    if (activeCwd !== cwd) return;
+    const entries = tail
+      .map((line) => parseActivityLine(line))
+      .filter((entry): entry is ActivityEntry => entry !== undefined);
+    liveSessions = {
+      count: liveSessionCount(entries, sessionIdentity(cwd, pi), Date.now()),
+    };
   };
 
   const clearWidget = (): void => {
@@ -953,9 +986,10 @@ export default function towerDoExtension(pi: ExtensionAPI): void {
   const updateWidget = (ctx?: ExtensionContext): void => {
     if (ctx) uiContext = ctx;
     if (!uiContext?.hasUI || uiContext.mode !== "tui") return;
-    // The widget survives an empty board: the git segment is independent of
-    // board content and should stay visible. Only when there is neither
-    // board content nor a git segment is there nothing to render.
+    // The widget survives an empty board: the git and live segments are
+    // independent of board content and should stay visible. Only when there
+    // is neither board content nor a git/live segment is there nothing to
+    // render.
     const boardEmpty =
       currentView.tasks.length === 0 && currentView.messages.length === 0;
     // Gate on the rendered segment string, not just data availability: a
@@ -965,7 +999,9 @@ export default function towerDoExtension(pi: ExtensionAPI): void {
       gitCounts !== undefined && !gitCounts.disabled
         ? formatGitSegment(gitCounts.dirty, gitCounts.session)
         : "";
-    if (boardEmpty && gitSegment === "") {
+    const liveSegment =
+      liveSessions === undefined ? "" : formatLiveSegment(liveSessions.count);
+    if (boardEmpty && gitSegment === "" && liveSegment === "") {
       clearWidget();
       return;
     }
@@ -1000,6 +1036,14 @@ export default function towerDoExtension(pi: ExtensionAPI): void {
                       (s) => theme.fg("dim", s),
                     )
                   : "";
+              const liveSegment =
+                liveSessions === undefined
+                  ? ""
+                  : formatLiveSegment(
+                      liveSessions.count,
+                      (n) => theme.fg("success", theme.bold(String(n))),
+                      (s) => theme.fg("dim", s),
+                    );
               const identity = sessionIdentity(activeCwd, pi);
               const inboxForMe = unreadMessagesToMe(
                 currentView,
@@ -1013,13 +1057,19 @@ export default function towerDoExtension(pi: ExtensionAPI): void {
                     theme.bold(
                       `TowerDo ${tasks.length - unfinished.length}/${tasks.length}`,
                     ),
-                  ) + theme.fg("dim", ` rev ${currentView.revision}`);
+                  ) +
+                  theme.fg("dim", " done · rev") +
+                  theme.fg("dim", ` ${currentView.revision}`);
                 if (blocked.length > 0) {
                   header += theme.fg("error", ` ${blocked.length} blocked`);
                 }
                 if (inboxForMe > 0) {
                   header += theme.fg("warning", ` ${inboxForMe} msg`);
                 }
+              }
+              if (liveSegment !== "") {
+                header +=
+                  (header === "" ? "" : theme.fg("dim", " │ ")) + liveSegment;
               }
               if (gitSegment !== "") {
                 header +=
@@ -1041,7 +1091,7 @@ export default function towerDoExtension(pi: ExtensionAPI): void {
                       ? theme.fg("accent", theme.bold(` @${task.owner}`))
                       : theme.fg("dim", ` @${task.owner}`);
                 lines.push(
-                  `${theme.fg(color, glyph)} ${theme.fg("text", task.subject)}${owner}`,
+                  `${theme.fg(color, glyph)} ${theme.fg("dim", `${task.key}:`)} ${theme.fg("text", task.subject)}${owner}`,
                 );
               }
               if (unfinished.length > shown.length) {
@@ -1965,7 +2015,10 @@ export default function towerDoExtension(pi: ExtensionAPI): void {
     // *before* the first paint so /tree cannot flash a stale git segment.
     resetGitCounts();
     updateWidget(ctx);
-    void refreshGitCounts(ctx.cwd).then(() => {
+    void Promise.all([
+      refreshGitCounts(ctx.cwd),
+      refreshLiveSessions(ctx.cwd),
+    ]).then(() => {
       updateWidget();
       widgetTui?.requestRender();
     });
@@ -1995,6 +2048,7 @@ export default function towerDoExtension(pi: ExtensionAPI): void {
       currentView = await foldRetained(activeCwd);
     }
     await refreshGitCounts(activeCwd);
+    await refreshLiveSessions(activeCwd);
     updateWidget();
     widgetTui?.requestRender();
   });

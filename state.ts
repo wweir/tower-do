@@ -1465,6 +1465,47 @@ export function derivePresence(
   return lines;
 }
 
+/**
+ * Window (ms) within which a session's last board write counts as "running
+ * right now" for the widget's live-session segment. Aligned with
+ * SESSION_BREAK_GAP_MS: past the break gap it is a different sitting, not a
+ * concurrent one. Any board interaction refreshes liveness (status/inbox
+ * append read acks), but a session doing pure code work without touching the
+ * board is invisible until its next board call — the window is deliberately
+ * generous to cover that blind spot.
+ */
+export const SESSION_LIVE_WINDOW_MS = SESSION_BREAK_GAP_MS;
+
+/**
+ * Count sessions currently running against this board: distinct activity
+ * identities seen within the window, plus `self` (a fresh session may have
+ * no board writes yet but is by definition live). Pure read derivation;
+ * never writes.
+ */
+export function liveSessionCount(
+  entries: readonly ActivityEntry[],
+  self: string,
+  now: number,
+  windowMs: number = SESSION_LIVE_WINDOW_MS,
+): number {
+  const live = new Set<string>();
+  for (const entry of entries) {
+    if (entry.at >= now - windowMs) live.add(entry.by);
+  }
+  if (self !== "") live.add(self);
+  return live.size;
+}
+
+/** Header segment `live N`. Defaults keep the empty-segment gate on plain text. */
+export function formatLiveSegment(
+  count: number,
+  em: (n: number) => string = String,
+  label: (s: string) => string = (s) => s,
+): string {
+  if (count < 1) return "";
+  return label("live ") + em(count);
+}
+
 /** Escape a string for literal use inside a RegExp. */
 function escapeRegExp(s: string): string {
   return s.replace(/[.*+?^${}()|[\]\\]/g, "\\$&");
