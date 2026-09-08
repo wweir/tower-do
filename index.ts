@@ -639,15 +639,20 @@ function formatChange(
   caller: string,
   change: { added: string[]; updated: string[]; removed: string[] },
 ): string {
-  if (view.tasks.length === 0) {
-    return `TowerDo board cleared (revision ${view.revision}).`;
-  }
+  // No-op first — an identical full-list replay (even of an empty board) is
+  // NOT a clear: nothing was removed, so reporting "board cleared" would
+  // mislead a caller that replayed an already-empty board.
   if (
     change.added.length === 0 &&
     change.updated.length === 0 &&
     change.removed.length === 0
   ) {
     return `TowerDo board unchanged (revision ${view.revision}, ${view.tasks.length} task(s)) by ${caller} — no field on any task changed.`;
+  }
+  if (view.tasks.length === 0) {
+    // A write that ends with zero tasks only removes (an added task would
+    // survive) — name what the caller actually removed.
+    return `TowerDo board cleared (revision ${view.revision}) by ${caller}: removed ${change.removed.join(", ")}.`;
   }
   const lines: string[] = [];
   const byKey = new Map(view.tasks.map((task) => [task.key, task]));
