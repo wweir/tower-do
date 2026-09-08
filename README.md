@@ -9,7 +9,7 @@
 
 [中文版说明 / Chinese README](./README.zh-CN.md)
 
-![tower-do above-editor widget: board progress (`TowerDo 2 open · 1 blocked`), live session count, `mine/dirty` file segments, and annotated unfinished-task rows](https://raw.githubusercontent.com/wweir/tower-do/main/docs/pi-tower-do.png)
+![tower-do above-editor widget: board progress (`TowerDo 6 open · 1 blocked`), live session count, `mine/dirty` file segments, and annotated unfinished-task rows](https://raw.githubusercontent.com/wweir/tower-do/main/docs/pi-tower-do.png)
 
 ## What it does
 

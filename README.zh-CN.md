@@ -9,7 +9,7 @@
 
 [English README](./README.md)
 
-![tower-do 编辑器上方 widget：剩余工作进度（`TowerDo 2 open · 1 blocked`）、活跃 session 数、`mine/dirty` 文件段、带标注的未完成任务行](https://raw.githubusercontent.com/wweir/tower-do/main/docs/pi-tower-do.png)
+![tower-do 编辑器上方 widget：剩余工作进度（`TowerDo 6 open · 1 blocked`）、活跃 session 数、`mine/dirty` 文件段、带标注的未完成任务行](https://raw.githubusercontent.com/wweir/tower-do/main/docs/pi-tower-do.png)
 
 ## 解决什么问题
 
