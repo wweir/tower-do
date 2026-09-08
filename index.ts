@@ -1001,8 +1001,13 @@ export default function towerDoExtension(pi: ExtensionAPI): void {
 
   const selfSessionId = (ctx?: ExtensionContext): string => {
     const manager = ctx?.sessionManager ?? lastContext?.sessionManager;
-    const getSessionId = manager?.getSessionId;
-    const id = typeof getSessionId === "function" ? (getSessionId() ?? "") : "";
+    // Call the method BOUND to the manager: extracting it into a local first
+    // (unbound call) makes `this` undefined inside pi's SessionManager and
+    // crashes with "undefined is not an object (evaluating 'this.sessionId')".
+    const id =
+      typeof manager?.getSessionId === "function"
+        ? (manager.getSessionId() ?? "")
+        : "";
     return id !== "" ? id : randomUUID().slice(0, 8);
   };
 
@@ -1173,8 +1178,14 @@ export default function towerDoExtension(pi: ExtensionAPI): void {
     );
     // The live dir must exist before watch(): the first session in a project
     // would otherwise miss its watcher forever (ENOENT swallowed, never
-    // retried).
-    mkdirSync(liveDirFor(cwd), { recursive: true });
+    // retried). Not writable: skip the whole channel (best-effort liveness —
+    // peers still count us via the liveSessionCount self union).
+    try {
+      mkdirSync(liveDirFor(cwd), { recursive: true });
+    } catch {
+      selfLivePath = undefined;
+      return;
+    }
     startLiveHeartbeat(cwd);
     startLiveWatchers(cwd);
   };
