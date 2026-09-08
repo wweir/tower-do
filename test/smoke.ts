@@ -1529,7 +1529,10 @@ async function layer2(): Promise<void> {
     lateMsg = await runThrow("tower_do_status", {} as never, lateDir);
   });
   const lateConfig = JSON.parse(
-    readFileSync(join(lateHome, ".pi", "agent", "tower-do", "config.json"), "utf8"),
+    readFileSync(
+      join(lateHome, ".pi", "agent", "tower-do", "config.json"),
+      "utf8",
+    ),
   );
   check(
     "config-only leftover migrates even when the state dir exists",
