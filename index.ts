@@ -296,13 +296,15 @@ function migrateLegacyState(cwd: string): void {
 
 /** Move a file or directory across the migration boundary. rename(2) is
  * atomic but fails with EXDEV when the project and $HOME live on different
- * filesystems; fall back to copy + remove only for that case. Any other
- * rename failure (EEXIST, EACCES, …) must propagate — a silent copy+rm
- * into an already-created target would silently merge two boards. */
+ * filesystems; fall back to copy + remove only for that case. If `to`
+ * already exists (lost the race with another session), leave the source
+ * unread — the global path is authoritative and leftover project dirs
+ * must not brick or overwrite. */
 function moveDir(from: string, to: string): void {
   try {
     renameSync(from, to);
   } catch (error) {
+    if (existsSync(to)) return;
     if ((error as NodeJS.ErrnoException).code !== "EXDEV") throw error;
     cpSync(from, to, { recursive: true });
     rmSync(from, { recursive: true, force: true });
