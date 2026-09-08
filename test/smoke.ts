@@ -1512,6 +1512,32 @@ async function layer2(): Promise<void> {
     conflictMsg.slice(0, 120),
   );
 
+  // A config-only leftover when the state dir was ALREADY migrated must
+  // still reach the global path — target-exists must not silently drop the
+  // pinned identity (the retired layout called config.json safe to commit,
+  // so it can reappear from git at any time).
+  const lateHome = mkdtempSync(join(tmpdir(), "tower-do-late-home-"));
+  const lateDir = mkdtempSync(join(tmpdir(), "tower-do-late-"));
+  mkdirSync(join(lateDir, ".pi", "tower-do"), { recursive: true });
+  writeFileSync(
+    join(lateDir, ".pi", "tower-do", "config.json"),
+    '{ "identity": "late-pinned" }',
+  );
+  mkdirSync(stateDirFor(lateDir), { recursive: true });
+  let lateMsg = "";
+  await withHome(lateHome, async () => {
+    lateMsg = await runThrow("tower_do_status", {} as never, lateDir);
+  });
+  const lateConfig = JSON.parse(
+    readFileSync(join(lateHome, ".pi", "agent", "tower-do", "config.json"), "utf8"),
+  );
+  check(
+    "config-only leftover migrates even when the state dir exists",
+    !/could not be migrated|conflicts with/.test(lateMsg) &&
+      lateConfig.identity === "late-pinned",
+    lateMsg.slice(0, 120),
+  );
+
   // The global state root must never trip the legacy guard: a session whose
   // project root resolves to $HOME (no git boundary above it) has its legacy
   // path EQUAL to the records home, which holds real boards — throwing there

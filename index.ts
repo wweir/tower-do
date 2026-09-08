@@ -258,12 +258,27 @@ function loadConfig(): TowerDoConfig {
  * state dir wholesale into the global records home so no task/history data
  * is silently abandoned and no session gets bricked by a leftover. A pinned
  * identity rides along to the global config path unless the user already has
- * one there. Skipped when the target already exists — a legacy board next to
- * a fresh one is a genuine merge conflict and fails loud below. */
+ * one there — BEFORE any board logic, so a config-only leftover still
+ * reaches the global path even when the state dir was already migrated (the
+ * retired layout documented config.json as safe to commit, so it can
+ * reappear from git). A legacy board next to a fresh one is a genuine merge
+ * conflict and fails loud below. */
 function migrateLegacyState(cwd: string): void {
   const legacy = join(projectRoot(cwd), CONFIG_DIR_NAME, "tower-do");
   if (resolve(legacy) === resolve(homeDir(), ".pi", "tower-do")) return;
   if (!existsSync(legacy)) return;
+  const legacyConfig = join(legacy, "config.json");
+  const globalConfig = configFile();
+  if (existsSync(legacyConfig) && !existsSync(globalConfig)) {
+    mkdirSync(dirname(globalConfig), { recursive: true });
+    try {
+      moveDir(legacyConfig, globalConfig);
+    } catch (error) {
+      throw new Error(
+        `tower-do config ${legacyConfig} could not be migrated to ${globalConfig}: ${error instanceof Error ? error.message : String(error)}`,
+      );
+    }
+  }
   const target = stateDirFor(cwd);
   if (existsSync(target)) return;
   try {
@@ -276,16 +291,6 @@ function migrateLegacyState(cwd: string): void {
     throw new Error(
       `tower-do state ${legacy} could not be migrated to ${target}: ${error instanceof Error ? error.message : String(error)}`,
     );
-  }
-  const legacyConfig = join(target, "config.json");
-  const globalConfig = configFile();
-  if (existsSync(legacyConfig) && !existsSync(globalConfig)) {
-    try {
-      mkdirSync(dirname(globalConfig), { recursive: true });
-      renameSync(legacyConfig, globalConfig);
-    } catch {
-      // Left inside the migrated dir: harmless (unread), the user can move it.
-    }
   }
 }
 
