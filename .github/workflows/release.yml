@@ -14,7 +14,12 @@ jobs:
       contents: write # create the GitHub Release
       id-token: write # for npm provenance (public registry)
     steps:
+      # fetch-depth 0: the release notes below walk back to the previous v* tag,
+      # which a default depth-1 checkout cannot see — it silently degraded the
+      # notes to the "Release <tag>" placeholder for v0.3.0 and v0.3.1.
       - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+        with:
+          fetch-depth: 0
 
       # bun install is fast on this repo; no cache to avoid the
       # cache-poisoning surface.
