@@ -64,7 +64,7 @@ import {
 } from "node:fs/promises";
 import { createHash, randomUUID } from "node:crypto";
 import { homedir } from "node:os";
-import { dirname, join } from "node:path";
+import { dirname, join, resolve } from "node:path";
 import { Type } from "typebox";
 
 import {
@@ -268,9 +268,12 @@ function loadConfig(cwd: string): TowerDoConfig {
 
 /** Loud migration guard: state at the retired per-project location would
  * otherwise be silently abandoned — an empty replacement board drops every
- * task and the whole activity history. */
+ * task and the whole activity history. The global state root itself is NOT a
+ * legacy remnant: a session whose project root resolves to $HOME (no git
+ * boundary above it) has legacy === the records home, and must not trip. */
 function assertNoLegacyState(cwd: string): void {
   const legacy = join(projectRoot(cwd), CONFIG_DIR_NAME, "tower-do");
+  if (resolve(legacy) === resolve(homeDir(), ".pi", "tower-do")) return;
   const hasBoard = existsSync(join(legacy, "board.jsonl"));
   const hasLive = existsSync(join(legacy, "live"));
   if (!hasBoard && !hasLive) return;

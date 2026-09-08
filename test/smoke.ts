@@ -465,7 +465,7 @@ async function layer2(): Promise<void> {
   } as never;
 
   const { default: towerDoExtension, boardFileFor } = await import(
-    "../index.ts",
+    "../index.ts"
   );
   towerDoExtension(pi as never);
 
@@ -1434,6 +1434,31 @@ async function layer2(): Promise<void> {
     "legacy per-project config fails loud with migration hint",
     /no longer read/.test(legacyMsg) && legacyMsg.includes("config.json"),
     legacyMsg.slice(0, 120),
+  );
+
+  // The global state root must never trip the legacy guard: a session whose
+  // project root resolves to $HOME (no git boundary above it) has its legacy
+  // path EQUAL to the records home, which holds real boards — throwing there
+  // would brick tower-do for home-dir sessions.
+  const homeProject = process.env.HOME!;
+  mkdirSync(join(homeProject, ".pi", "tower-do", "seeded-project"), {
+    recursive: true,
+  });
+  writeFileSync(
+    join(
+      homeProject,
+      ".pi",
+      "tower-do",
+      "seeded-project",
+      "board.jsonl",
+    ),
+    "",
+  );
+  const homeMsg = await runThrow("tower_do_status", {} as never, homeProject);
+  check(
+    "session rooted at $HOME does not trip the legacy guard",
+    !/no longer read/.test(homeMsg),
+    homeMsg.slice(0, 80),
   );
 }
 
