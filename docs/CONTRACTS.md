@@ -90,6 +90,7 @@ bun run test/presence-retention.ts  # read receipts / retirement / presence / ca
 bun run test/changed-files.ts       # P0 receipt invariants (10 cases)
 bun run test/scope-conflicts.ts     # P1 glob + conflict derivation (17 cases)
 bun run test/git-count.ts           # widget git-segment pure derivations (24 cases)
+bun run test/live-sessions.ts       # widget live-segment presence window (12 cases)
 ```
 
 Coverage intent: **pure, dependency-free logic** (state.ts, git-count.ts)
