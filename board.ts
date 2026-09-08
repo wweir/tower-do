@@ -99,13 +99,22 @@ export class TowerBoard {
     return run;
   }
 
-  /** Fold the full event log into the current board view (source of truth). */
+  /** Fold the full event log into the current board view (source of truth).
+   *  A missing file is an empty board; any other read error throws — a
+   *  permission failure must not look like `tower_do tasks: []`. */
   async fold(): Promise<TowerBoardView> {
     let raw: string;
     try {
       raw = await readFile(this.file, "utf8");
-    } catch {
-      return createEmptyBoard();
+    } catch (error) {
+      if (
+        error instanceof Error &&
+        "code" in error &&
+        error.code === "ENOENT"
+      ) {
+        return createEmptyBoard();
+      }
+      throw error;
     }
     const tasks = new Map<string, TowerDoTask>();
     const messages = new Map<string, TowerDoMessage>();
@@ -204,14 +213,10 @@ export class TowerBoard {
     });
   }
 
-  /** Raw tail of the event log (newest lines last), for activity views. */
+  /** Raw tail of the event log (newest lines last), for activity views.
+   *  I/O errors throw — a missing or unreadable file is not "no activity". */
   async rawTail(lines: number = 50): Promise<string[]> {
-    let raw: string;
-    try {
-      raw = await readFile(this.file, "utf8");
-    } catch {
-      return [];
-    }
+    const raw = await readFile(this.file, "utf8");
     return raw
       .split("\n")
       .map((line) => line.trim())

@@ -959,7 +959,14 @@ export default function towerDoExtension(pi: ExtensionAPI): void {
       liveSessions = undefined;
       return;
     }
-    const tail = (await boardEntry.board.rawTail(200)).reverse();
+    let tail: string[];
+    try {
+      tail = (await boardEntry.board.rawTail(200)).reverse();
+    } catch {
+      // Empty file → [] → live 1 (self). I/O failure must not collapse
+      // to that; keep the previous count.
+      return;
+    }
     // Restore may have switched projects while this refresh was in flight;
     // a stale count from another board must not land.
     if (activeCwd !== cwd) return;
@@ -1207,7 +1214,12 @@ export default function towerDoExtension(pi: ExtensionAPI): void {
         // Presence footnote: surface owners who own unfinished tasks but have
         // no recent activity, so a coordinator sees who may be stalled.
         const now = Date.now();
-        const tail = (await board.rawTail(200)).reverse();
+        let tail: string[] = [];
+        try {
+          tail = (await board.rawTail(200)).reverse();
+        } catch {
+          // Presence footnote is best-effort; the write already landed.
+        }
         const parsed = tail
           .map((line) => parseActivityLine(line))
           .filter((entry): entry is ActivityEntry => entry !== undefined);
@@ -1727,7 +1739,12 @@ export default function towerDoExtension(pi: ExtensionAPI): void {
       const tailCount = STATUS_ACTIVITY_TAIL;
       const presenceCount = Math.max(tailCount, 200);
       const now = Date.now();
-      const rawTail = (await board.rawTail(presenceCount)).reverse();
+      let rawTail: string[] = [];
+      try {
+        rawTail = (await board.rawTail(presenceCount)).reverse();
+      } catch {
+        // Missing/unreadable log → empty activity; the folded view still renders.
+      }
       const parsedEntries = rawTail
         .map((line) => parseActivityLine(line))
         .filter((entry): entry is ActivityEntry => entry !== undefined);

@@ -42,7 +42,9 @@ semantics:
   diff both see the freshest events, eliminating read-then-write races. Appends
   are per-process serialized on a promise chain with single-write `O_APPEND`
   syscalls; cross-process writers rely on the `baseRevision` gate (last-writer
-  wins otherwise).
+  wins otherwise). `fold()` treats a missing file as an empty board; any other
+  read error throws (an unreadable file must not look like a cleared board).
+  `rawTail()` always throws on I/O error — display callers degrade.
 - The revision a write returns **exactly equals a re-fold** of the file
   (one bump per task event), so a caller can verify the write landed.
 

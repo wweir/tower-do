@@ -23,7 +23,9 @@ to the file-as-state board for one display number; rejected.
 
 Directories without a board file show no `live` segment at all — a
 meaningless `live 1` in every random directory would break the widget's
-show-something-only-when-there-is-something minimalism.
+show-something-only-when-there-is-something minimalism. A board-file read
+failure keeps the last count (an empty file is `live 1` via self; collapsing
+a failed read to that would hide a real `live N`).
 
 **Rejected.** Process/IPC probing (pi sessions are not enumerable portably);
 writing a heartbeat event on every turn (board growth + revision churn for

@@ -38,6 +38,30 @@ async function layer1(): Promise<void> {
   const file = join(dir, "board.jsonl");
   const board = new TowerBoard(file);
 
+  const missingFold = await board.fold();
+  check(
+    "missing board file folds to empty",
+    missingFold.revision === 0 && missingFold.tasks.length === 0,
+  );
+  try {
+    await board.rawTail();
+    check("rawTail on missing file throws", false, "expected throw");
+  } catch (error) {
+    const code =
+      error instanceof Error && "code" in error ? error.code : undefined;
+    check("rawTail on missing file throws", code === "ENOENT");
+  }
+  const notAFile = join(dir, "not-a-file");
+  mkdirSync(notAFile);
+  try {
+    await new TowerBoard(notAFile).fold();
+    check("fold on a directory throws", false, "expected throw");
+  } catch (error) {
+    const code =
+      error instanceof Error && "code" in error ? error.code : undefined;
+    check("fold on a directory throws", code === "EISDIR");
+  }
+
   // Planning: two missions + a dependent one (3 upsert events → revision 3).
   let view = createEmptyBoard();
   const details = writeBoardSnapshot(
