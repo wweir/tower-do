@@ -174,9 +174,13 @@ export class TowerBoard {
           // incrementally-maintained owner set stays correct across owner
           // transfers (upsert that swaps owner without a remove). Keep an
           // already-folded audience if a later re-emission (ack) lacks one.
-          const currentOwners = [...tasks.values()]
-            .map((task) => task.owner)
-            .filter((owner): owner is string => owner !== undefined);
+          const currentOwners = [
+            ...new Set(
+              [...tasks.values()]
+                .map((task) => task.owner)
+                .filter((owner): owner is string => owner !== undefined),
+            ),
+          ];
           const audience =
             foldedSoFar?.audience ??
             currentOwners.filter((owner) => owner !== message.from);

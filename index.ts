@@ -1785,15 +1785,21 @@ export default function towerDoExtension(pi: ExtensionAPI): void {
           // Snapshot the broadcast audience (owners at send time, sender
           // excluded) so full-read / retirement uses the people who were
           // actually addressed — an owner joining later never read it and
-          // must not keep the broadcast alive forever.
+          // must not keep the broadcast alive forever. Deduped: an owner
+          // holding several tasks would otherwise repeat in the persisted
+          // audience.
           const audience =
             to === "all"
-              ? fresh.tasks
-                  .map((task) => task.owner)
-                  .filter(
-                    (owner): owner is string =>
-                      owner !== undefined && owner !== caller,
-                  )
+              ? [
+                  ...new Set(
+                    fresh.tasks
+                      .map((task) => task.owner)
+                      .filter(
+                        (owner): owner is string =>
+                          owner !== undefined && owner !== caller,
+                      ),
+                  ),
+                ]
               : undefined;
           const message: TowerDoMessage = {
             ...messageBase,
