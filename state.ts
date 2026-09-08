@@ -1412,6 +1412,25 @@ export function formatActivityFeed(
 /** How long before an owner with no activity is flagged idle (ms). */
 export const PRESENCE_IDLE_MS = 10 * 60_000;
 
+/**
+ * Identities addressable via tower_do_talk send: current task owners plus
+ * anyone who appears in recent board activity. Owners alone would strand a
+ * peer whose tasks are all completed (no longer an owner) right when
+ * hand-off coordination needs to reach them — their historical bylines keep
+ * them reachable.
+ */
+export function knownIdentities(
+  view: TowerBoardView,
+  entries: readonly ActivityEntry[],
+): Set<string> {
+  const known = new Set([
+    ...currentOwners(view),
+    ...entries.map((entry) => entry.by),
+  ]);
+  known.delete(TOWER_IDENTITY);
+  return known;
+}
+
 export interface PresenceLine {
   identity: string;
   lastSeenAt?: number;

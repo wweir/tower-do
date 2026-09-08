@@ -97,6 +97,7 @@ import {
   getAllTasks,
   isCallerLine,
   isTowerDoStatus,
+  knownIdentities,
   latestActivity,
   latestBoardCheckpoint,
   LIVE_HEARTBEAT_MS,
@@ -462,6 +463,15 @@ const TalkParamsSchema = Type.Object({
 });
 
 const StatusParamsSchema = Type.Object({
+  taskKey: Type.Optional(
+    Type.String({
+      description:
+        "When set, return the FULL detail of this single task (description, scope, changedFiles, updatedAt) instead of the whole dashboard; owner/status/limit are ignored in this mode. Error if the key does not exist.",
+      minLength: 1,
+      maxLength: 40,
+      pattern: "^[a-z0-9][a-z0-9._-]*$",
+    }),
+  ),
   owner: Type.Optional(
     Type.String({
       description: "Filter tasks by owner identity (combined AND with status)",
@@ -559,18 +569,24 @@ function formatChange(
   return `TowerDo board revision ${view.revision} (${view.tasks.length} task(s)) by ${caller}:\n${lines.join("\n")}`;
 }
 
-function ensureKnown(view: TowerBoardView, recipient: string): void {
+function ensureKnown(
+  view: TowerBoardView,
+  recipient: string,
+  /** Identities from recent board activity (see knownIdentities). */
+  activity = new Set<string>(),
+): void {
   // "all" broadcasts; the orchestrator identity is always addressable.
   if (recipient === "all" || recipient === TOWER_IDENTITY) return;
-  const known = new Set(
-    view.tasks
+  const known = new Set([
+    ...view.tasks
       .filter((task) => task.owner !== undefined)
       .map((task) => task.owner),
-  );
+    ...activity,
+  ]);
   if (!known.has(recipient)) {
     const knownNames = [...known].join(", ");
     throw new TowerDoValidationError(
-      `unknown recipient "${recipient}" — address "all", ${TOWER_IDENTITY}, or a task owner on the board (known owners: ${knownNames || "(none)"})`,
+      `unknown recipient "${recipient}" — address "all", ${TOWER_IDENTITY}, a current task owner, or someone with recent board activity (known: ${knownNames || "(none)"})`,
     );
   }
 }
@@ -1560,11 +1576,11 @@ export default function towerDoExtension(pi: ExtensionAPI): void {
     name: TOWER_DO_TALK_TOOL_NAME,
     label: "TowerDo Talk",
     description:
-      'Cross-agent communication on the shared tower-do board. action=send delivers an inbox message to "all", the orchestrator identity "tower", or a task owner (self-send rejected). action=inbox lists messages addressed to you or "all", newest first. action=finding files a structured out-of-scope finding (bug|improve|vuln|idea) with severity/location/suggestedFix, or updates a finding\'s status via findingId + status. Use findings instead of silently editing other-owned tasks.',
+      'Cross-agent communication on the shared tower-do board. action=send delivers an inbox message to "all", the orchestrator identity "tower", a current task owner, or anyone with recent board activity (self-send rejected). action=inbox lists messages addressed to you or "all", newest first. action=finding files a structured out-of-scope finding (bug|improve|vuln|idea) with severity/location/suggestedFix, or updates a finding\'s status via findingId + status. Use findings instead of silently editing other-owned tasks.',
     promptSnippet:
       "Send addressed messages or file findings on the shared multi-agent board",
     promptGuidelines: [
-      'Use tower_do_talk to communicate with task owners on the shared board instead of editing owned tasks directly; the recipient must be "all", "tower", or a known task owner.',
+      'Use tower_do_talk to communicate with task owners on the shared board instead of editing owned tasks directly; the recipient must be "all", "tower", a current task owner, or someone with recent board activity (e.g. a peer whose tasks are all completed).',
       "Use action=finding (not direct edits) when you discover an out-of-scope problem — file it with kind/severity/summary/suggestedFix so the owning agent and reviewers can route it.",
       "Keep message bodies brief and reference files by path; the board persists everything, so pointer-style notes keep context lean.",
     ],
@@ -1580,7 +1596,7 @@ export default function towerDoExtension(pi: ExtensionAPI): void {
         const to = params.to?.trim();
         if (!to)
           throw new TowerDoValidationError(
-            'send requires a recipient: "all" or a task owner',
+            'send requires a recipient: "all", "tower", a task owner, or someone with recent board activity',
           );
         if (/[\r\n\u2028\u2029]/.test(to)) {
           throw new TowerDoValidationError(
@@ -1628,7 +1644,22 @@ export default function towerDoExtension(pi: ExtensionAPI): void {
           throwIfAborted(signal, "TowerDo talk");
           const fresh = await foldRetained(ctx.cwd);
           throwIfAborted(signal, "TowerDo talk");
-          ensureKnown(fresh, to);
+          // Reachable recipients: current owners PLUS anyone with recent board
+          // activity — a peer whose tasks are all completed is no longer an
+          // owner but exactly who hand-off coordination needs to reach.
+          let recentActivity = new Set<string>();
+          try {
+            const raw = await board.rawTail(200);
+            const parsed: ActivityEntry[] = [];
+            for (const line of raw) {
+              const entry = parseActivityLine(line);
+              if (entry !== undefined) parsed.push(entry);
+            }
+            recentActivity = knownIdentities(fresh, parsed);
+          } catch {
+            // No/unreadable activity log: owners only.
+          }
+          ensureKnown(fresh, to, recentActivity);
           // Snapshot the broadcast audience (owners at send time, sender
           // excluded) so full-read / retirement uses the people who were
           // actually addressed — an owner joining later never read it and
@@ -1937,7 +1968,7 @@ export default function towerDoExtension(pi: ExtensionAPI): void {
     name: TOWER_DO_STATUS_TOOL_NAME,
     label: "TowerDo Status",
     description:
-      "Read the shared tower-do board: everyone's tasks (owner, status, deps, scope, blocks), messages addressed to you, open findings, and the recent activity tail. Also prints the board file path so subagents can read state directly (file-as-state). Output is truncated to 50KB.",
+      "Read the shared tower-do board: everyone's tasks (owner, status, deps, scope, blocks), messages addressed to you, open findings, and the recent activity tail. Also prints the board file path so subagents can read state directly (file-as-state). Pass taskKey to get the FULL detail of one task instead. Output is truncated to 50KB.",
     promptSnippet:
       "Show the shared multi-agent task board: tasks, messages, findings, activity",
     promptGuidelines: [
@@ -2006,6 +2037,66 @@ export default function towerDoExtension(pi: ExtensionAPI): void {
           : tasks;
       const limit = params.limit ?? 200;
       const shown = filtered.slice(0, limit);
+
+      // Single-task detail mode: taskKey takes precedence over the dashboard
+      // filters — the caller asked for one task's full record (description is
+      // never rendered in the grouped view), not another filtered listing.
+      if (params.taskKey !== undefined) {
+        const task = tasks.find((t) => t.key === params.taskKey);
+        if (task === undefined) {
+          throw new TowerDoValidationError(
+            `no task with key "${params.taskKey}" on the board (revision ${view.revision})`,
+          );
+        }
+        const ownerNote =
+          task.owner === undefined
+            ? ""
+            : ` (owner: ${task.owner}${task.owner === caller ? ", me" : ""})`;
+        const detail: string[] = [
+          `TowerDo task ${task.key} — revision ${view.revision} (board file: ${board.file})`,
+          `- subject: ${task.subject}`,
+          `- status: ${task.status}${ownerNote}`,
+          `- updatedAt: ${relativeTime(now, task.updatedAt)} (${new Date(task.updatedAt).toISOString()})`,
+        ];
+        if (task.dependsOn.length > 0) {
+          const unresolved = findAllUnresolvedDeps(task, view);
+          detail.push(
+            `- dependsOn: ${task.dependsOn.join(", ")}${unresolved.length > 0 ? ` (unresolved: ${unresolved.join(", ")})` : " (all completed)"}`,
+          );
+        }
+        if (task.blockedBy.length > 0) {
+          detail.push(`- blockedBy: ${task.blockedBy.join(", ")}`);
+        }
+        if (taskIsBlocked(task, view)) detail.push("- blocked: yes");
+        if (task.scope !== undefined && task.scope.length > 0) {
+          detail.push(`- scope: ${task.scope.join(", ")}`);
+        }
+        if (task.changedFiles !== undefined && task.changedFiles.length > 0) {
+          detail.push(`- changedFiles: ${task.changedFiles.join(", ")}`);
+        }
+        if (task.description !== undefined) {
+          detail.push("- description:");
+          for (const row of task.description.split("\n")) {
+            detail.push(`  ${row}`);
+          }
+        } else {
+          detail.push("- description: (none)");
+        }
+        const detailText = detail.join("\n");
+        return {
+          content: [{ type: "text", text: detailText }],
+          details: {
+            caller,
+            revision: view.revision,
+            board: board.file,
+            identity: caller,
+            taskKey: task.key,
+            task: cloneBoard({ ...view, messages: [], findings: [] }).tasks.find(
+              (t) => t.key === task.key,
+            ),
+          },
+        };
+      }
 
       const lines: string[] = [];
       lines.push(

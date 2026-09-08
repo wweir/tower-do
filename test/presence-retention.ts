@@ -30,6 +30,7 @@ import {
   formatPresenceLine,
   isCallerLine,
   isMessageFullyRead,
+  knownIdentities,
   latestActivity,
   parseActivityLine,
   retainMessages,
@@ -39,6 +40,7 @@ import {
   writeBoardSnapshot,
   type TowerBoardView,
   type TowerDoMessage,
+  type ActivityEntry,
 } from "../state.ts";
 
 let failures = 0;
@@ -913,6 +915,61 @@ async function layer4(): Promise<void> {
   );
 }
 
+// --- layer 7: knownIdentities (tower_do_talk reachable recipients) ----------
+// tower_do_talk send must reach current owners PLUS identities with recent
+// board activity: a peer whose tasks are all completed is no longer an owner
+// but exactly who hand-off coordination needs to reach.
+function layer7(): void {
+  const view = {
+    ...createEmptyBoard(),
+    tasks: [
+      {
+        key: "a",
+        subject: "a",
+        status: "in_progress" as const,
+        owner: "alice",
+        updatedAt: 0,
+      },
+      {
+        key: "b",
+        subject: "b",
+        status: "completed" as const,
+        owner: "bob",
+        updatedAt: 0,
+      },
+    ],
+  } as TowerBoardView;
+  const entries: ActivityEntry[] = [
+    {
+      kind: "task",
+      by: "carol",
+      at: 10,
+      glyph: "◐",
+      detail: "c: worked earlier, owns nothing now",
+    },
+    { kind: "task", by: "alice", at: 11, glyph: "◐", detail: "a: updated" },
+  ];
+  const known = knownIdentities(view, entries);
+  check(
+    "known includes current owners (even completed-task owners)",
+    known.has("alice") && known.has("bob"),
+  );
+  check(
+    "known includes recent-activity identity (delivered peer)",
+    known.has("carol"),
+  );
+  check("known excludes strangers", !known.has("stranger"));
+  check(
+    "known excludes the reserved orchestrator identity",
+    !known.has("tower"),
+  );
+  const empty = knownIdentities(createEmptyBoard(), entries);
+  check(
+    "empty board falls back to activity bylines only",
+    empty.has("carol") && empty.has("alice") && !empty.has("bob"),
+  );
+}
+
 // --- layer 6: session-checkpoint replay (oldest-first branch) ---------------
 // Pi getBranch() is root-to-leaf. Restore must take the LAST valid custom
 // board snapshot, otherwise a later compact's cancelled todos come back.
@@ -964,6 +1021,7 @@ async function main(): Promise<void> {
   await layer4();
   layer5();
   layer6();
+  layer7();
   console.log(`\n${passed} passed, ${failures} failed`);
   if (failures > 0) process.exit(1);
 }
