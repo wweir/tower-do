@@ -82,8 +82,8 @@ session id. Recording work for a subagent: pass its id (e.g. `as: "coder-1"`).
 
 ## Configuration
 
-One optional key — `<project>/.pi/tower-do/config.json`. No environment
-variables.
+One optional key — `~/.pi/tower-do/config.json` (global, applies to every
+project). No environment variables.
 
 ```json
 { "identity": "team-orchestrator" }

@@ -60,7 +60,7 @@ pi 启动时自动发现扩展；已开会话用 `/reload` 加载。
 
 ## 配置
 
-仅一个可选键 —— `<project>/.pi/tower-do/config.json`。无环境变量。
+仅一个可选键 —— `~/.pi/tower-do/config.json`（全局，跨项目生效）。无环境变量。
 
 ```json
 { "identity": "team-orchestrator" }

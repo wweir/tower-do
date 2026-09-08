@@ -1372,6 +1372,19 @@ async function layer2(): Promise<void> {
     reminder.slice(0, 120),
   );
 
+  // Config is global ($HOME/.pi/tower-do/config.json). Point HOME at the
+  // fixture dir so the loader reads the fixture, restore before returning.
+  const realHome = process.env.HOME;
+  const withHome = async (home: string, fn: () => Promise<void>) => {
+    process.env.HOME = home;
+    try {
+      await fn();
+    } finally {
+      if (realHome === undefined) delete process.env.HOME;
+      else process.env.HOME = realHome;
+    }
+  };
+
   // Broken config.json fails loudly instead of silently resetting identity —
   // a silent default would corrupt owner matching in multi-agent sessions.
   const brokenDir = mkdtempSync(join(tmpdir(), "tower-do-badcfg-"));
@@ -1380,7 +1393,10 @@ async function layer2(): Promise<void> {
     join(brokenDir, ".pi", "tower-do", "config.json"),
     '{ "identity": "broken',
   );
-  const brokenMsg = await runThrow("tower_do_status", {}, brokenDir);
+  let brokenMsg = "";
+  await withHome(brokenDir, async () => {
+    brokenMsg = await runThrow("tower_do_status", {} as never, brokenDir);
+  });
   check(
     "broken config.json is a loud error",
     /tower-do config .*config\.json/.test(brokenMsg),
@@ -1392,11 +1408,30 @@ async function layer2(): Promise<void> {
     join(reservedDir, ".pi", "tower-do", "config.json"),
     '{ "identity": "tower" }',
   );
-  const reservedMsg = await runThrow("tower_do_status", {}, reservedDir);
+  let reservedMsg = "";
+  await withHome(reservedDir, async () => {
+    reservedMsg = await runThrow("tower_do_status", {} as never, reservedDir);
+  });
   check(
     "config identity tower is a loud error",
     /reserved orchestrator identity "tower"/.test(reservedMsg),
     reservedMsg.slice(0, 80),
+  );
+
+  // A config left at the retired per-project location fails loud with a
+  // migration hint instead of being silently ignored.
+  const legacyHome = mkdtempSync(join(tmpdir(), "tower-do-legacy-home-"));
+  const legacyDir = mkdtempSync(join(tmpdir(), "tower-do-legacy-"));
+  mkdirSync(join(legacyDir, ".pi", "tower-do"), { recursive: true });
+  writeFileSync(join(legacyDir, ".pi", "tower-do", "config.json"), "{}");
+  let legacyMsg = "";
+  await withHome(legacyHome, async () => {
+    legacyMsg = await runThrow("tower_do_status", {} as never, legacyDir);
+  });
+  check(
+    "legacy per-project config fails loud with migration hint",
+    /no longer read/.test(legacyMsg) && legacyMsg.includes("config.json"),
+    legacyMsg.slice(0, 120),
   );
 }
 

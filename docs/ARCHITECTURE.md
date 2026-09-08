@@ -53,7 +53,7 @@ semantics:
 The board is shared per **project** = nearest ancestor git work-tree root (a
 `.git` directory, or a worktree/submodule whose `.git` is a file starting with
 `gitdir:`); when no git boundary exists, the directory itself is the project.
-`config.json` anchors to the same root, so `identity` is project-level.
+`config.json` is global (`$HOME/.pi/tower-do/`), so `identity` applies across projects.
 
 ## Liveness sidecar (not board events)
 

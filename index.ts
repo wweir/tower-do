@@ -63,6 +63,7 @@ import {
   writeFile,
 } from "node:fs/promises";
 import { randomUUID } from "node:crypto";
+import { homedir } from "node:os";
 import { dirname, join } from "node:path";
 import { Type } from "typebox";
 
@@ -147,7 +148,7 @@ const STATUS_ACTIVITY_TAIL = 8; // activity feed lines in tower_do_status
 const MESSAGE_RETENTION = 50; // max fully-read messages kept in the view
 
 // ---------------------------------------------------------------------------
-// Config (project-scoped, best-effort JSON)
+// Config (global, HOME-scoped, fail-loud JSON)
 // ---------------------------------------------------------------------------
 
 interface BoardEntry {
@@ -209,8 +210,39 @@ function boardFileFor(cwd: string): string {
   return join(towerDoDir(cwd), "board.jsonl");
 }
 
-function loadConfig(dir: string): TowerDoConfig {
-  const path = join(dir, "config.json");
+/** Config is global, not per-project: a pinned identity is a personal choice
+ * that applies across every board the user touches, and keeping it out of the
+ * repo avoids leaking it through committed files and per-project drift. */
+function configHome(): string {
+  // Resolve $HOME explicitly (POSIX semantics) instead of os.homedir(): Bun's
+  // homedir() ignores the HOME override, which makes HOME-scoped tests
+  // nondeterministic and silently reads the real user config.
+  const home =
+    process.env.HOME?.trim() || process.env.USERPROFILE?.trim() || homedir();
+  return join(home, CONFIG_DIR_NAME, "tower-do");
+}
+
+function configFile(): string {
+  return join(configHome(), "config.json");
+}
+
+function loadConfig(cwd: string): TowerDoConfig {
+  const path = configFile();
+  // Loud migration guard: a config left at the retired per-project location
+  // would otherwise be silently ignored — a dropped pinned identity corrupts
+  // owner matching / message addressing in multi-agent sessions. Skipped when
+  // the two paths coincide (a project rooted at $HOME).
+  const legacy = join(
+    projectRoot(cwd),
+    CONFIG_DIR_NAME,
+    "tower-do",
+    "config.json",
+  );
+  if (path !== legacy && existsSync(legacy)) {
+    throw new Error(
+      `tower-do config ${legacy} is no longer read — move it to ${path}`,
+    );
+  }
   if (!existsSync(path)) return {};
   // Fail loud, never silently default: a broken config would drop a pinned
   // identity and corrupt owner matching / message addressing in multi-agent
@@ -234,7 +266,7 @@ class BoardCache {
     if (entry === undefined) {
       entry = {
         board: new TowerBoard(file),
-        config: loadConfig(towerDoDir(cwd)),
+        config: loadConfig(cwd),
       };
       this.entries.set(file, entry);
     }

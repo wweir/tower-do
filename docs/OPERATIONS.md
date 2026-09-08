@@ -18,10 +18,11 @@ typescript) is for typecheck/tests.
 
 ## Configuration
 
-`<project>/.pi/tower-do/config.json` is the only configuration surface — no
-environment variables. The file is optional (absent = defaults) and safe to
-commit for shared team settings: it holds no secrets. Only `board.jsonl`
-belongs in `.gitignore`.
+`~/.pi/tower-do/config.json` is the only configuration surface — no
+environment variables. The file is optional (absent = defaults), global across
+every project, and lives outside any repo — it is never committed. A leftover
+per-project config at the retired `<project>/.pi/tower-do/config.json`
+location fails loudly at session start with a migration hint.
 
 ```json
 { "identity": "team-orchestrator" }
@@ -29,7 +30,7 @@ belongs in `.gitignore`.
 
 | key | default | meaning |
 | --- | --- | --- |
-| `identity` | session name/id | pin this session's board identity (project-level); must not be the reserved orchestrator identity `tower` |
+| `identity` | session name/id | pin this session's board identity (global, applies to every project); must not be the reserved orchestrator identity `tower` |
 
 That is the whole surface. Reminder cadence, widget rows, activity tail, and
 message retention are internal tuning constants, not configuration. Unknown
