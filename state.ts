@@ -1671,8 +1671,13 @@ export function formatBoardReminder(
     const blockedBy = blockers.length
       ? ` [blocked by: ${blockers.join(",")}]`
       : "";
+    // One blocked definition everywhere: the header counts taskIsBlocked, so
+    // a pending task gated by unresolved deps is labelled [blocked] here too
+    // (the suffix still carries the WHY). Otherwise the header says
+    // "1 blocked" while the row reads [pending].
+    const label = taskIsBlocked(task, view) ? "blocked" : task.status;
     lines.push(
-      `- [${task.status}] ${task.key}: ${task.subject}${owner}${deps}${blockedBy}`,
+      `- [${label}] ${task.key}: ${task.subject}${owner}${deps}${blockedBy}`,
     );
   }
   if (unfinished.length > shown.length) {

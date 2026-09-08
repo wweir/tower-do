@@ -1983,8 +1983,22 @@ export default function towerDoExtension(pi: ExtensionAPI): void {
       throwIfAborted(signal, "TowerDo status");
       const { board, caller, view } = await prepare(ctx, undefined);
       const tasks = getAllTasks(view);
-      const byStatus = (status: TowerDoStatus) =>
-        tasks.filter((task) => task.status === status);
+      // Blocked is DERIVED (taskIsBlocked), matching the reminder header and
+      // row suffixes; raw status only feeds in_progress/pending, and
+      // derived-blocked tasks leave those buckets so the summary line and
+      // the sections below never disagree about the same task.
+      const isBlockedNow = (task: TowerDoTask): boolean =>
+        task.status !== "completed" && taskIsBlocked(task, view);
+      const inProgressCount = tasks.filter(
+        (task) => task.status === "in_progress" && !isBlockedNow(task),
+      ).length;
+      const pendingCount = tasks.filter(
+        (task) => task.status === "pending" && !isBlockedNow(task),
+      ).length;
+      const completedCount = tasks.filter(
+        (task) => task.status === "completed",
+      ).length;
+      const blockedCount = tasks.filter(isBlockedNow).length;
       // Fetch a wider tail than the rendered window: presence (who is around,
       // who went idle) needs enough history to judge inactivity, while the
       // rendered activity feed only shows the configured activity tail.
@@ -2112,7 +2126,7 @@ export default function towerDoExtension(pi: ExtensionAPI): void {
           : `last updated ${relativeTime(now, lastWrite.at)} by ${lastWrite.by}`;
       lines.push(`Activity: ${updated}`);
       lines.push(
-        `Tasks: ${tasks.length} total (${byStatus("in_progress").length} in_progress, ${byStatus("blocked").length} blocked, ${byStatus("pending").length} pending, ${byStatus("completed").length} completed)`,
+        `Tasks: ${tasks.length} total (${inProgressCount} in_progress, ${blockedCount} blocked, ${pendingCount} pending, ${completedCount} completed)`,
       );
       lines.push("");
 
@@ -2151,8 +2165,11 @@ export default function towerDoExtension(pi: ExtensionAPI): void {
       }
       lines.push("");
 
-      const renderGroup = (status: TowerDoStatus, label: string): void => {
-        const group = shown.filter((task) => task.status === status);
+      const renderGroup = (
+        label: string,
+        pick: (task: TowerDoTask) => boolean,
+      ): void => {
+        const group = shown.filter(pick);
         if (group.length === 0) return;
         lines.push(`## ${label}`);
         for (const task of group) {
@@ -2190,10 +2207,16 @@ export default function towerDoExtension(pi: ExtensionAPI): void {
         }
         lines.push("");
       };
-      renderGroup("blocked", "Blocked");
-      renderGroup("in_progress", "In progress");
-      renderGroup("pending", "Pending");
-      renderGroup("completed", "Completed");
+      renderGroup("Blocked", isBlockedNow);
+      renderGroup(
+        "In progress",
+        (task) => task.status === "in_progress" && !isBlockedNow(task),
+      );
+      renderGroup(
+        "Pending",
+        (task) => task.status === "pending" && !isBlockedNow(task),
+      );
+      renderGroup("Completed", (task) => task.status === "completed");
 
       if (shown.length === 0) lines.push("(no tasks match the filter)");
 

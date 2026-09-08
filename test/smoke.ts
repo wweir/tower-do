@@ -13,6 +13,7 @@ import { TowerBoard } from "../board.ts";
 import {
   createEmptyBoard,
   findAllUnresolvedDeps,
+  formatBoardReminder,
   taskIsBlocked,
   TOWER_DO_BOARD_TYPE,
   writeBoardSnapshot,
@@ -216,6 +217,39 @@ async function layer1(): Promise<void> {
   check(
     "non-completed task with blockedBy still blocked",
     taskIsBlocked(stillWaiting.view.tasks[0], stillWaiting.view),
+  );
+
+  // Reminder rows must agree with the header's derived blocked count: a
+  // gated task is labelled [blocked] (not its raw status), suffix carries why.
+  const reminderWaiting = formatBoardReminder(stillWaiting.view, "alice");
+  check(
+    "reminder labels blockedBy task [blocked], header agrees",
+    reminderWaiting.includes("1 task(s), 1 blocked") &&
+      reminderWaiting.includes("- [blocked] wait:"),
+    reminderWaiting.split("\n")[1],
+  );
+  const gatedDep = writeBoardSnapshot(
+    createEmptyBoard(),
+    {
+      tasks: [
+        { key: "auth", subject: "refactor auth", status: "in_progress" },
+        {
+          key: "billing",
+          subject: "wire billing",
+          status: "pending",
+          dependsOn: ["auth"],
+        },
+      ],
+    },
+    "alice",
+  );
+  const reminderDep = formatBoardReminder(gatedDep.view, "alice");
+  check(
+    "reminder labels pending-with-unresolved-dep [blocked]",
+    reminderDep.includes("1 blocked") &&
+      reminderDep.includes("- [blocked] billing:") &&
+      reminderDep.includes("[blocked by: auth]"),
+    reminderDep.split("\n").slice(0, 3).join(" | "),
   );
 
   // Talk artifacts via append/fold.
@@ -518,6 +552,24 @@ async function layer2(): Promise<void> {
     "two agents' tasks visible on one board",
     s1.text.includes("alice") && s1.text.includes("bob"),
     "owners shown",
+  );
+
+  // Blocked is DERIVED: pending billing waits on in_progress auth, so the
+  // summary count, the Blocked section, and the row suffix must all agree
+  // (and Pending must not double-count it).
+  check(
+    "status summary counts derived-blocked pending task",
+    /Tasks: 2 total \(1 in_progress, 1 blocked, 0 pending, 0 completed\)/.test(
+      s1.text,
+    ),
+    s1.text.split("\n")[4],
+  );
+  check(
+    "status groups derived-blocked task under Blocked with why",
+    s1.text.includes("## Blocked") &&
+      /Blocked[\s\S]*?billing[\s\S]*?\[blocked by: auth\]/.test(s1.text) &&
+      !/## Pending[\s\S]*billing/.test(s1.text),
+    "billing in Blocked, absent from Pending",
   );
 
   // bob (as subagent id) tries to complete alice's task → ownership error.
