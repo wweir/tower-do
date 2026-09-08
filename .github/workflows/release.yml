@@ -18,7 +18,7 @@ jobs:
 
       # bun install is fast on this repo; no cache to avoid the
       # cache-poisoning surface.
-      - uses: oven-sh/setup-bun@0c5077e51419868618aeaa5fe8019c62421857d6 # v2.2.0
+      - uses: oven-sh/setup-bun@0c5077e51419868618aeaa5fe8019c62421857d6 # v2.2.0 # zizmor: ignore[cache-poisoning] (no cache configured; comment above states intent)
         with:
           bun-version: latest
 
@@ -54,7 +54,7 @@ jobs:
 
       # npm does not read NODE_AUTH_TOKEN without a .npmrc registry mapping;
       # setup-node writes it (and publishes against the public registry).
-      - uses: actions/setup-node@820762786026740c76f36085b0efc47a31fe5020 # v7.0.0
+      - uses: actions/setup-node@820762786026740c76f36085b0efc47a31fe5020 # v7.0.0 # zizmor: ignore[cache-poisoning] (no cache configured; .npmrc write only)
         with:
           node-version: 22
           registry-url: https://registry.npmjs.org
