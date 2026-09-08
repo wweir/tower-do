@@ -27,9 +27,9 @@ export const TOWER_DO_TOOL_NAME = "tower_do";
 export const TOWER_DO_TALK_TOOL_NAME = "tower_do_talk";
 export const TOWER_DO_STATUS_TOOL_NAME = "tower_do_status";
 export const MAX_TOWER_DO_TASKS = 50;
-export const MAX_TASK_DEPENDENCIES = 20;
-export const MAX_SCOPE_GLOBS = 20;
-export const MAX_CHANGED_FILES = 100;
+const MAX_TASK_DEPENDENCIES = 20;
+const MAX_SCOPE_GLOBS = 20;
+const MAX_CHANGED_FILES = 100;
 export const DEFAULT_IDENTITY = "main";
 /** Reserved orchestrator identity that may act on any owned task (Tower). */
 export const TOWER_IDENTITY = "tower";
@@ -71,7 +71,7 @@ export function isTowerDoStatus(value: unknown): value is TowerDoStatus {
   return typeof value === "string" && TOWER_DO_STATUSES.has(value);
 }
 
-export interface TowerDoTaskInput {
+interface TowerDoTaskInput {
   key: string;
   subject?: string;
   description?: string;
@@ -141,7 +141,7 @@ export interface TowerBoardView {
   findings: TowerDoFinding[];
 }
 
-export interface TowerDoChangeSummary {
+interface TowerDoChangeSummary {
   added: string[];
   updated: string[];
   removed: string[];
@@ -506,17 +506,7 @@ function taskEquals(left: TowerDoTask, right: TowerDoTask): boolean {
 }
 
 function normalizeTask(
-  input: {
-    key: string;
-    subject: string;
-    status: TowerDoStatus;
-    description?: string;
-    owner?: string;
-    dependsOn: string[];
-    scope?: string[];
-    changedFiles?: string[];
-    blockedBy: string[];
-  },
+  input: ResolvedTowerDoTaskInput,
   index: number,
 ): ResolvedTowerDoTaskInput {
   const key = normalizeTaskKey(input.key, `tasks[${index}].key`);
@@ -1038,7 +1028,7 @@ export function readPersistedFinding(
 }
 
 /** Read a serialized board snapshot (used for session checkpoints). */
-export function readBoardSnapshot(value: unknown): TowerBoardView | undefined {
+function readBoardSnapshot(value: unknown): TowerBoardView | undefined {
   if (!isRecord(value) || value.schemaVersion !== TOWER_DO_SCHEMA_VERSION)
     return undefined;
   if (
@@ -1111,7 +1101,7 @@ export function latestBoardCheckpoint(
   return latest;
 }
 
-export const REMINDER_TASK_LINE_CAP = 12;
+const REMINDER_TASK_LINE_CAP = 12;
 
 /**
  * Owners currently on the board (task owners), used to scope broadcast
@@ -1130,7 +1120,7 @@ export function currentOwners(view: TowerBoardView): Set<string> {
  * else the owners currently on the board (sender excluded). A broadcast is
  * visible to — and retired only after being read by — this set.
  */
-export function broadcastAudience(
+function broadcastAudience(
   message: TowerDoMessage,
   view: TowerBoardView,
 ): Set<string> {
@@ -1410,7 +1400,7 @@ export function formatActivityFeed(
 }
 
 /** How long before an owner with no activity is flagged idle (ms). */
-export const PRESENCE_IDLE_MS = 10 * 60_000;
+const PRESENCE_IDLE_MS = 10 * 60_000;
 
 /**
  * Identities addressable via tower_do_talk send: current task owners plus

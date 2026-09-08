@@ -589,6 +589,21 @@ function changedFilesSuffix(task: TowerDoTask): string {
   return ` [files: ${joined}]`;
 }
 
+/** Flatten a tool result's text content into one string — the shared tail of
+ * every renderResult handler. Content items may be text or image parts; only
+ * text parts carry a usable string. */
+function toolResultText(result: {
+  content: ReadonlyArray<{ type: string; text?: string }>;
+}): string {
+  return result.content
+    .filter(
+      (item): item is { type: "text"; text: string } =>
+        item.type === "text" && typeof item.text === "string",
+    )
+    .map((item) => item.text)
+    .join("\n");
+}
+
 function formatChange(
   view: TowerBoardView,
   caller: string,
@@ -1606,13 +1621,7 @@ export default function towerDoExtension(pi: ExtensionAPI): void {
       }
       const details = (result.details ?? {}) as Record<string, unknown>;
       if (typeof details.revision !== "number") {
-        const output = result.content
-          .filter(
-            (item): item is { type: "text"; text: string } =>
-              item.type === "text",
-          )
-          .map((item) => item.text)
-          .join("\n");
+        const output = toolResultText(result);
         text.setText(
           output
             ? theme.fg(context.isError ? "error" : "toolOutput", output)
@@ -2002,13 +2011,7 @@ export default function towerDoExtension(pi: ExtensionAPI): void {
         );
         return text;
       }
-      const output = result.content
-        .filter(
-          (item): item is { type: "text"; text: string } =>
-            item.type === "text",
-        )
-        .map((item) => item.text)
-        .join("\n");
+      const output = toolResultText(result);
       text.setText(
         output
           ? theme.fg(context.isError ? "error" : "toolOutput", output)
@@ -2358,13 +2361,7 @@ export default function towerDoExtension(pi: ExtensionAPI): void {
         text.setText(theme.fg("warning", "Folding shared board..."));
         return text;
       }
-      const output = result.content
-        .filter(
-          (item): item is { type: "text"; text: string } =>
-            item.type === "text",
-        )
-        .map((item) => item.text)
-        .join("\n");
+      const output = toolResultText(result);
       if (!output) {
         if (result.details) text.setText("");
         return text;
