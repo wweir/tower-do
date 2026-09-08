@@ -47,10 +47,12 @@ import {
 import { Text, truncateToWidth, type TUI } from "@earendil-works/pi-tui";
 import { execFile } from "node:child_process";
 import {
+  cpSync,
   existsSync,
   mkdirSync,
   readFileSync,
   renameSync,
+  rmSync,
   statSync,
   watch,
   type FSWatcher,
@@ -266,9 +268,14 @@ function migrateLegacyState(cwd: string): void {
   if (existsSync(target)) return;
   try {
     mkdirSync(dirname(target), { recursive: true });
-    renameSync(legacy, target);
-  } catch {
-    return; // Unmovable (permissions/EXDEV): the conflict guard reports it.
+    moveDir(legacy, target);
+  } catch (error) {
+    // Silent abandonment would drop a pinned identity / task history — the
+    // exact silent-wrong class this extension exists to prevent. Fail loud
+    // with both paths; the user can fix the filesystem issue and retry.
+    throw new Error(
+      `tower-do state ${legacy} could not be migrated to ${target}: ${error instanceof Error ? error.message : String(error)}`,
+    );
   }
   const legacyConfig = join(target, "config.json");
   const globalConfig = configFile();
@@ -279,6 +286,18 @@ function migrateLegacyState(cwd: string): void {
     } catch {
       // Left inside the migrated dir: harmless (unread), the user can move it.
     }
+  }
+}
+
+/** Move a directory across the migration boundary. rename(2) is atomic but
+ * fails with EXDEV when the project and $HOME live on different filesystems;
+ * fall back to copy + remove so migration survives that split. */
+function moveDir(from: string, to: string): void {
+  try {
+    renameSync(from, to);
+  } catch {
+    cpSync(from, to, { recursive: true });
+    rmSync(from, { recursive: true, force: true });
   }
 }
 

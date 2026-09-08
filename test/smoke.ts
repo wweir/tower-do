@@ -471,9 +471,11 @@ async function layer2(): Promise<void> {
     events: { on: () => {}, emit: (): void => {} },
   } as never;
 
-  const { default: towerDoExtension, boardFileFor, stateDirFor } = await import(
-    "../index.ts"
-  );
+  const {
+    default: towerDoExtension,
+    boardFileFor,
+    stateDirFor,
+  } = await import("../index.ts");
   towerDoExtension(pi as never);
 
   for (const name of ["tower_do", "tower_do_talk", "tower_do_status"]) {
@@ -1442,7 +1444,10 @@ async function layer2(): Promise<void> {
     legacyMsg = await runThrow("tower_do_status", {} as never, legacyDir);
   });
   const migratedConfig = JSON.parse(
-    readFileSync(join(legacyHome, ".pi", "agent", "tower-do", "config.json"), "utf8"),
+    readFileSync(
+      join(legacyHome, ".pi", "agent", "tower-do", "config.json"),
+      "utf8",
+    ),
   );
   check(
     "legacy state auto-migrates into the global records home",
@@ -1469,6 +1474,25 @@ async function layer2(): Promise<void> {
     "legacy live-only leftover does not trip the guard",
     !/no longer read/.test(liveOnlyMsg),
     liveOnlyMsg.slice(0, 120),
+  );
+
+  // Migration failure must fail LOUD, never silently drop a pinned identity:
+  // with the state root occupied by a non-directory, the move cannot happen
+  // and every tower-do call reports both paths.
+  const blockedHome = mkdtempSync(join(tmpdir(), "tower-do-blocked-home-"));
+  const blockedDir = mkdtempSync(join(tmpdir(), "tower-do-blocked-"));
+  mkdirSync(join(blockedHome, ".pi"), { recursive: true });
+  writeFileSync(join(blockedHome, ".pi", "tower-do"), "not a dir");
+  mkdirSync(join(blockedDir, ".pi", "tower-do"), { recursive: true });
+  writeFileSync(join(blockedDir, ".pi", "tower-do", "config.json"), "{}");
+  let migrateFailMsg = "";
+  await withHome(blockedHome, async () => {
+    migrateFailMsg = await runThrow("tower_do_status", {} as never, blockedDir);
+  });
+  check(
+    "failed migration fails loud instead of dropping state",
+    /could not be migrated/.test(migrateFailMsg),
+    migrateFailMsg.slice(0, 120),
   );
 
   // A legacy board NEXT TO an already-initialized state dir is a genuine
