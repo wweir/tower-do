@@ -574,7 +574,9 @@ async function layer2(): Promise<void> {
 
   // The status filter follows the same derived contract as the rendering:
   // status:"blocked" finds gated pending tasks, status:"pending" does not.
-  const asBlocked = await run("tower_do_status", { status: "blocked" } as never);
+  const asBlocked = await run("tower_do_status", {
+    status: "blocked",
+  } as never);
   check(
     "status filter blocked finds gated pending task",
     /## Blocked[\s\S]*?billing[\s\S]*?\[blocked by: auth\]/.test(
@@ -585,7 +587,9 @@ async function layer2(): Promise<void> {
       ),
     "billing listed under Blocked",
   );
-  const asPending = await run("tower_do_status", { status: "pending" } as never);
+  const asPending = await run("tower_do_status", {
+    status: "pending",
+  } as never);
   check(
     "status filter pending excludes gated pending task",
     asPending.text.includes("(no tasks match the filter)"),
