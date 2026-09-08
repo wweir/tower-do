@@ -77,12 +77,12 @@ claims owners; hands subagents the board path from `tower_do_status`
 project.** Both read/write the same `~/.pi/tower-do/<project>/board.jsonl` — send
 a message, the peer reads it via `inbox`.
 
-Identity resolution: `as` param > project config `identity` > session name >
+Identity resolution: `as` param > config `identity` > session name >
 session id. Recording work for a subagent: pass its id (e.g. `as: "coder-1"`).
 
 ## Configuration
 
-One optional key — `~/.pi/tower-do/config.json` (global, applies to every
+One optional key — `~/.pi/agent/tower-do/config.json` (global, applies to every
 project). No environment variables.
 
 ```json
@@ -91,7 +91,7 @@ project). No environment variables.
 
 | key | default | meaning |
 | --- | --- | --- |
-| `identity` | session name/id | pin this session's board identity (project-level); must not be the reserved orchestrator identity `tower` |
+| `identity` | session name/id | pin this session's board identity (global, applies to every project); must not be the reserved orchestrator identity `tower` |
 
 ## How it works
 

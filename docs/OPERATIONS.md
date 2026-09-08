@@ -50,7 +50,7 @@ no manual `npm publish` or `gh release create`.
 
 ```bash
 # bump version in package.json, commit, then:
-git tag v0.3.0 && git push origin main --tags
+git tag vX.Y.Z && git push origin main --tags
 ```
 
 - The repo ships TypeScript sources directly (`main: ./index.ts`, no build

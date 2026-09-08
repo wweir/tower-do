@@ -79,7 +79,10 @@ jobs:
           else
             range="HEAD"
           fi
-          notes="$(git log "$range" --oneline --no-merges 2>/dev/null | sed 's/^[0-9a-f]\{7,\}//' | grep -E '^(feat|fix|chore|docs|ci|refactor|perf|test|revert)(\(|:)' | sed 's/^/ - /' || true)"
+          # --format=%s, not --oneline: stripping the hash with sed left a
+          # leading space, so the type grep never matched and notes always
+          # fell through to the "Release <tag>" placeholder.
+          notes="$(git log "$range" --format=%s --no-merges 2>/dev/null | grep -E '^(feat|fix|chore|docs|ci|refactor|perf|test|revert)(\(|:)' | sed 's/^/ - /' || true)"
           if [ -z "$notes" ]; then
             notes="Release ${GITHUB_REF_NAME}"
           fi

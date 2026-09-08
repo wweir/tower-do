@@ -56,11 +56,11 @@ pi 启动时自动发现扩展；已开会话用 `/reload` 加载。
 
 **单个 pi 会话 + 子代理（典型用法）**：父会话在板上规划并认领 owner；把 `tower_do_status` 打印的看板路径交给子代理（file-as-state）；子代理回报结果；父会话收口。**多个 pi 会话共享同一项目**：两边自动读写同一个 `~/.pi/tower-do/<project>/board.jsonl` —— 发消息、对方 `inbox` 读取，即跨 agent 通讯。
 
-身份解析：`as` 参数 > 项目配置 `identity` > 会话名 > 会话 id。代子代理记录工作时传它的 id（如 `as: "coder-1"`）。
+身份解析：`as` 参数 > 配置 `identity` > 会话名 > 会话 id。代子代理记录工作时传它的 id（如 `as: "coder-1"`）。
 
 ## 配置
 
-仅一个可选键 —— `~/.pi/tower-do/config.json`（全局，跨项目生效）。无环境变量。
+仅一个可选键 —— `~/.pi/agent/tower-do/config.json`（全局，跨项目生效）。无环境变量。
 
 ```json
 { "identity": "team-orchestrator" }
@@ -68,7 +68,7 @@ pi 启动时自动发现扩展；已开会话用 `/reload` 加载。
 
 | 键 | 默认值 | 含义 |
 | --- | --- | --- |
-| `identity` | 会话名/会话 id | 钉住本会话的看板身份（项目级）；不得使用保留的编排者身份 `tower` |
+| `identity` | 会话名/会话 id | 钉住本会话的看板身份（全局，跨项目生效）；不得使用保留的编排者身份 `tower` |
 
 ## 工作原理
 

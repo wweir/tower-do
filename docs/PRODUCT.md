@@ -58,5 +58,5 @@ TowerDo is its state/communication substrate.
 
 ## Identity
 
-`as` param > project config `identity` > session name > session id. Recording
+`as` param > config `identity` > session name > session id. Recording
 work for a subagent: pass its id (`as: "coder-1"`).
