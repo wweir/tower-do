@@ -5,7 +5,14 @@
  *  2. the real extension via a mock ExtensionAPI (tools execute end-to-end)
  * Run with: bun run test/smoke.ts
  */
-import { mkdirSync, mkdtempSync, unlinkSync, writeFileSync } from "node:fs";
+import {
+  existsSync,
+  mkdirSync,
+  mkdtempSync,
+  readFileSync,
+  unlinkSync,
+  writeFileSync,
+} from "node:fs";
 import { tmpdir } from "node:os";
 import { join } from "node:path";
 
@@ -464,7 +471,7 @@ async function layer2(): Promise<void> {
     events: { on: () => {}, emit: (): void => {} },
   } as never;
 
-  const { default: towerDoExtension, boardFileFor } = await import(
+  const { default: towerDoExtension, boardFileFor, stateDirFor } = await import(
     "../index.ts"
   );
   towerDoExtension(pi as never);
@@ -1420,19 +1427,28 @@ async function layer2(): Promise<void> {
     reservedMsg.slice(0, 80),
   );
 
-  // A config left at the retired per-project location fails loud with a
-  // migration hint instead of being silently ignored.
+  // One-time auto-migration: a legacy per-project state dir moves wholesale
+  // into the global records home, and a pinned identity rides along to the
+  // global config path when the user has none there — no warning, no loss.
   const legacyHome = mkdtempSync(join(tmpdir(), "tower-do-legacy-home-"));
   const legacyDir = mkdtempSync(join(tmpdir(), "tower-do-legacy-"));
   mkdirSync(join(legacyDir, ".pi", "tower-do"), { recursive: true });
-  writeFileSync(join(legacyDir, ".pi", "tower-do", "config.json"), "{}");
+  writeFileSync(
+    join(legacyDir, ".pi", "tower-do", "config.json"),
+    '{ "identity": "legacy-pinned" }',
+  );
   let legacyMsg = "";
   await withHome(legacyHome, async () => {
     legacyMsg = await runThrow("tower_do_status", {} as never, legacyDir);
   });
+  const migratedConfig = JSON.parse(
+    readFileSync(join(legacyHome, ".pi", "agent", "tower-do", "config.json"), "utf8"),
+  );
   check(
-    "legacy per-project config fails loud with migration hint",
-    /no longer read/.test(legacyMsg) && legacyMsg.includes("config.json"),
+    "legacy state auto-migrates into the global records home",
+    !/no longer read/.test(legacyMsg) &&
+      migratedConfig.identity === "legacy-pinned" &&
+      !existsSync(join(legacyDir, ".pi", "tower-do")),
     legacyMsg.slice(0, 120),
   );
 
@@ -1453,6 +1469,23 @@ async function layer2(): Promise<void> {
     "legacy live-only leftover does not trip the guard",
     !/no longer read/.test(liveOnlyMsg),
     liveOnlyMsg.slice(0, 120),
+  );
+
+  // A legacy board NEXT TO an already-initialized state dir is a genuine
+  // merge conflict — loud, never a silent pick between two boards.
+  const conflictDir = mkdtempSync(join(tmpdir(), "tower-do-conflict-"));
+  mkdirSync(join(conflictDir, ".pi", "tower-do"), { recursive: true });
+  writeFileSync(join(conflictDir, ".pi", "tower-do", "board.jsonl"), "");
+  mkdirSync(stateDirFor(conflictDir), { recursive: true });
+  const conflictMsg = await runThrow(
+    "tower_do_status",
+    {} as never,
+    conflictDir,
+  );
+  check(
+    "legacy board beside an initialized state dir fails loud",
+    /conflicts with/.test(conflictMsg),
+    conflictMsg.slice(0, 120),
   );
 
   // The global state root must never trip the legacy guard: a session whose

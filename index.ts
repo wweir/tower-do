@@ -50,6 +50,7 @@ import {
   existsSync,
   mkdirSync,
   readFileSync,
+  renameSync,
   statSync,
   watch,
   type FSWatcher,
@@ -206,7 +207,7 @@ export function projectRoot(cwd: string): string {
  * session records (board.jsonl, live sidecars) never ride inside a repo. The
  * slug keeps the directory readable; the path hash guarantees uniqueness
  * (`/a/b` vs `/a_b` would slug identically). */
-function stateDirFor(cwd: string): string {
+export function stateDirFor(cwd: string): string {
   const root = projectRoot(cwd);
   const slug =
     root.replace(/[^A-Za-z0-9._-]+/g, "-").replace(/^-+|-+$/g, "") || "project";
@@ -235,23 +236,8 @@ function configFile(): string {
   return join(homeDir(), ".pi", "agent", "tower-do", "config.json");
 }
 
-function loadConfig(cwd: string): TowerDoConfig {
+function loadConfig(): TowerDoConfig {
   const path = configFile();
-  // Loud migration guard: a config left at the retired per-project location
-  // would otherwise be silently ignored — a dropped pinned identity corrupts
-  // owner matching / message addressing in multi-agent sessions. Skipped when
-  // the two paths coincide (a project rooted at $HOME).
-  const legacy = join(
-    projectRoot(cwd),
-    CONFIG_DIR_NAME,
-    "tower-do",
-    "config.json",
-  );
-  if (path !== legacy && existsSync(legacy)) {
-    throw new Error(
-      `tower-do config ${legacy} is no longer read — move it to ${path}`,
-    );
-  }
   if (!existsSync(path)) return {};
   // Fail loud, never silently default: a broken config would drop a pinned
   // identity and corrupt owner matching / message addressing in multi-agent
@@ -266,20 +252,48 @@ function loadConfig(cwd: string): TowerDoConfig {
   }
 }
 
-/** Loud migration guard: a board at the retired per-project location would
- * otherwise be silently abandoned — an empty replacement board drops every
- * task and the whole activity history. The global state root itself is NOT a
- * legacy remnant: a session whose project root resolves to $HOME (no git
- * boundary above it) has legacy === the records home, and must not trip.
- * A legacy dir holding only live/ heartbeats is ignored too: they are
- * ephemeral (2-min TTL), so a pre-upgrade session still writing them must
- * not brick the next one. */
+/** One-time migration from the retired per-project layout: move the legacy
+ * state dir wholesale into the global records home so no task/history data
+ * is silently abandoned and no session gets bricked by a leftover. A pinned
+ * identity rides along to the global config path unless the user already has
+ * one there. Skipped when the target already exists — a legacy board next to
+ * a fresh one is a genuine merge conflict and fails loud below. */
+function migrateLegacyState(cwd: string): void {
+  const legacy = join(projectRoot(cwd), CONFIG_DIR_NAME, "tower-do");
+  if (resolve(legacy) === resolve(homeDir(), ".pi", "tower-do")) return;
+  if (!existsSync(legacy)) return;
+  const target = stateDirFor(cwd);
+  if (existsSync(target)) return;
+  try {
+    mkdirSync(dirname(target), { recursive: true });
+    renameSync(legacy, target);
+  } catch {
+    return; // Unmovable (permissions/EXDEV): the conflict guard reports it.
+  }
+  const legacyConfig = join(target, "config.json");
+  const globalConfig = configFile();
+  if (existsSync(legacyConfig) && !existsSync(globalConfig)) {
+    try {
+      mkdirSync(dirname(globalConfig), { recursive: true });
+      renameSync(legacyConfig, globalConfig);
+    } catch {
+      // Left inside the migrated dir: harmless (unread), the user can move it.
+    }
+  }
+}
+
+/** Merge-conflict guard: fires only when auto-migration could not run (a
+ * state dir already exists at the new location) while a legacy board still
+ * sits at the retired one — merging two boards needs a human decision.
+ * Heartbeat-only leftovers never trip this: live/ is ephemeral (2-min TTL).
+ * The global state root itself is NOT a legacy remnant: a session whose
+ * project root resolves to $HOME has legacy === the records home. */
 function assertNoLegacyState(cwd: string): void {
   const legacy = join(projectRoot(cwd), CONFIG_DIR_NAME, "tower-do");
   if (resolve(legacy) === resolve(homeDir(), ".pi", "tower-do")) return;
   if (!existsSync(join(legacy, "board.jsonl"))) return;
   throw new Error(
-    `tower-do state ${legacy} is no longer read — move board.jsonl and live/ to ${stateDirFor(cwd)}`,
+    `tower-do state ${legacy} conflicts with existing ${stateDirFor(cwd)} — merge the legacy board.jsonl into it, then delete the legacy dir`,
   );
 }
 
@@ -290,10 +304,11 @@ class BoardCache {
     const file = boardFileFor(cwd);
     let entry = this.entries.get(file);
     if (entry === undefined) {
+      migrateLegacyState(cwd);
       assertNoLegacyState(cwd);
       entry = {
         board: new TowerBoard(file),
-        config: loadConfig(cwd),
+        config: loadConfig(),
       };
       this.entries.set(file, entry);
     }

@@ -178,7 +178,9 @@ backend and the orchestrator consumes the board.
   any identity (config / `as` / owner).
 - **Config surface is `identity` only** (config.json in `$HOME/.pi/agent/tower-do/`,
   optional, global across projects — a personal pin, not a committed team
-  setting; a leftover per-project config fails loud with a migration hint). Reminder cadence, widget rows, activity tail, and message retention
+  setting; a leftover per-project state dir is auto-migrated into the global
+records home — only a legacy board beside an already-initialized one fails
+loud, because merging two boards needs a human decision). Reminder cadence, widget rows, activity tail, and message retention Reminder cadence, widget rows, activity tail, and message retention
   are internal constants — no user evidence ever justified tuning them, and
   every knob is permanent schema+docs+test surface. A malformed config fails
   loudly instead of silently defaulting: a silently-reset identity corrupts

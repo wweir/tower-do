@@ -21,8 +21,10 @@ typescript) is for typecheck/tests.
 `~/.pi/agent/tower-do/config.json` is the only configuration surface — no
 environment variables. The file is optional (absent = defaults), global across
 every project, and lives outside any repo — it is never committed. A leftover
-per-project config at the retired `<project>/.pi/tower-do/config.json`
-location fails loudly at session start with a migration hint.
+per-project state dir at the retired `<project>/.pi/tower-do/` location is
+auto-migrated into the global records home on first use (a pinned identity
+rides along to the global config path); only a legacy board next to an
+already-initialized state dir fails loud as a merge conflict.
 
 ```json
 { "identity": "team-orchestrator" }
