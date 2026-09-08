@@ -40,6 +40,7 @@ jobs:
           bun run test/scope-conflicts.ts
           bun run test/git-count.ts
           bun run test/live-sessions.ts
+          bun run test/board-progress.ts
 
       - name: Verify tag matches package version
         run: |

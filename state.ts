@@ -317,11 +317,11 @@ export function writeBoardSnapshot(
     // Receipts describe a completed delivery: do not inherit one onto a
     // reopen, or normalizeTask rejects a field the caller never sent.
     const changedFiles =
-      patch.changedFiles !== undefined
-        ? patch.changedFiles
-        : status === "completed"
+      patch.changedFiles === undefined
+        ? status === "completed"
           ? existing?.changedFiles
-          : undefined;
+          : undefined
+        : patch.changedFiles;
 
     resolved.push(
       normalizeTask(
@@ -344,7 +344,7 @@ export function writeBoardSnapshot(
           ...(patch.scope !== undefined || existing?.scope !== undefined
             ? { scope: patch.scope ?? existing!.scope }
             : {}),
-          ...(changedFiles !== undefined ? { changedFiles } : {}),
+          ...(changedFiles === undefined ? {} : { changedFiles }),
           blockedBy:
             patch.blockedBy === undefined
               ? existing
@@ -1509,6 +1509,45 @@ export function formatLiveSegment(
 ): string {
   if (count < 1) return "";
   return label("live ") + em(count);
+}
+
+export type BoardProgressCount =
+  | "title"
+  | "open"
+  | "blocked"
+  | "unread"
+  | "sep";
+
+/** Header progress segment: `TowerDo N open`, plus `· M blocked` / `· K msg`
+ * when present. Tracks remaining work only — completed tasks never count, so
+ * the glance follows the current workload instead of growing monotonically
+ * with board lifetime (the old `x/y done` counted retired-in-place completed
+ * rows pinned by the owner guard / dependsOn). The board `revision` is
+ * deliberately not shown here: it is a monotonic CAS token, not a metric.
+ * Hidden when nothing is open and no unread mail; defaults keep the
+ * empty-segment gate on plain text. */
+export function formatBoardProgress(
+  open: number,
+  blocked: number,
+  unread: number,
+  em: (n: number, which: BoardProgressCount) => string = String,
+  label: (s: string, which: BoardProgressCount) => string = (s) => s,
+): string {
+  if (open < 1 && unread < 1) return "";
+  let out = label("TowerDo", "title");
+  let hasPart = false;
+  const sep = () => (hasPart ? label(" · ", "sep") : " ");
+  if (open > 0) {
+    out += sep() + em(open, "open") + label(" open", "open");
+    hasPart = true;
+    if (blocked > 0) {
+      out += sep() + em(blocked, "blocked") + label(" blocked", "blocked");
+    }
+  }
+  if (unread > 0) {
+    out += sep() + em(unread, "unread") + label(" msg", "unread");
+  }
+  return out;
 }
 
 /** Escape a string for literal use inside a RegExp. */

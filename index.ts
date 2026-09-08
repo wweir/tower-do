@@ -74,6 +74,7 @@ import {
   FINDING_SEVERITIES,
   FINDING_STATUSES,
   formatActivityFeed,
+  formatBoardProgress,
   formatBoardReminder,
   findScopeConflicts,
   formatLiveSegment,
@@ -995,20 +996,31 @@ export default function towerDoExtension(pi: ExtensionAPI): void {
     if (!uiContext?.hasUI || uiContext.mode !== "tui") return;
     // The widget survives an empty board: the git and live segments are
     // independent of board content and should stay visible. Only when there
-    // is neither board content nor a git/live segment is there nothing to
-    // render.
-    const boardEmpty =
-      currentView.tasks.length === 0 && currentView.messages.length === 0;
-    // Gate on the rendered segment string, not just data availability: a
-    // clean repo yields counts (0, 0) and formatGitSegment(""), which would
-    // otherwise register a permanently blank widget.
+    // is nothing to render in any segment is there no widget at all.
+    // Gate every segment on its rendered string, not data availability: a
+    // completed-only board or a clean repo both yield an empty string and
+    // would otherwise register a permanently blank widget.
+    const tasks = getAllTasks(currentView);
+    const unfinished = tasks.filter((task) => task.status !== "completed");
+    const blocked = unfinished.filter((task) =>
+      taskIsBlocked(task, currentView),
+    );
+    const unread = unreadMessagesToMe(
+      currentView,
+      sessionIdentity(activeCwd, pi),
+    ).length;
+    const boardSegment = formatBoardProgress(
+      unfinished.length,
+      blocked.length,
+      unread,
+    );
     const gitSegment =
       gitCounts !== undefined && !gitCounts.disabled
         ? formatGitSegment(gitCounts.dirty, gitCounts.session)
         : "";
     const liveSegment =
       liveSessions === undefined ? "" : formatLiveSegment(liveSessions.count);
-    if (boardEmpty && gitSegment === "" && liveSegment === "") {
+    if (boardSegment === "" && gitSegment === "" && liveSegment === "") {
       clearWidget();
       return;
     }
@@ -1027,9 +1039,6 @@ export default function towerDoExtension(pi: ExtensionAPI): void {
               const blocked = tasks.filter((task) =>
                 taskIsBlocked(task, currentView),
               );
-              const boardEmpty =
-                currentView.tasks.length === 0 &&
-                currentView.messages.length === 0;
               const gitSegment =
                 gitCounts !== undefined && !gitCounts.disabled
                   ? formatGitSegment(
@@ -1056,24 +1065,27 @@ export default function towerDoExtension(pi: ExtensionAPI): void {
                 currentView,
                 identity,
               ).length;
-              let header = "";
-              if (!boardEmpty) {
-                header =
+              // Progress counts remaining work only: completed rows (often
+              // pinned by the owner guard / dependsOn) never appear in the
+              // glance, and neither does the monotonic CAS revision.
+              let header = formatBoardProgress(
+                unfinished.length,
+                blocked.length,
+                inboxForMe,
+                (n, which) =>
                   theme.fg(
-                    "accent",
-                    theme.bold(
-                      `TowerDo ${tasks.length - unfinished.length}/${tasks.length}`,
-                    ),
-                  ) +
-                  theme.fg("dim", " done · rev") +
-                  theme.fg("dim", ` ${currentView.revision}`);
-                if (blocked.length > 0) {
-                  header += theme.fg("error", ` ${blocked.length} blocked`);
-                }
-                if (inboxForMe > 0) {
-                  header += theme.fg("warning", ` ${inboxForMe} msg`);
-                }
-              }
+                    which === "blocked"
+                      ? "error"
+                      : which === "unread"
+                        ? "warning"
+                        : "accent",
+                    theme.bold(String(n)),
+                  ),
+                (s, which) =>
+                  which === "title"
+                    ? theme.fg("accent", theme.bold(s))
+                    : theme.fg("dim", s),
+              );
               if (liveSegment !== "") {
                 header +=
                   (header === "" ? "" : theme.fg("dim", " │ ")) + liveSegment;
