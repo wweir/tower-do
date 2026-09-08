@@ -2091,9 +2091,9 @@ export default function towerDoExtension(pi: ExtensionAPI): void {
             board: board.file,
             identity: caller,
             taskKey: task.key,
-            task: cloneBoard({ ...view, messages: [], findings: [] }).tasks.find(
-              (t) => t.key === task.key,
-            ),
+            // task already comes from getAllTasks (deep clone) — hand it out
+            // directly; no board-wide clone needed.
+            task,
           },
         };
       }
