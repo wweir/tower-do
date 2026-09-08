@@ -9,7 +9,7 @@
 
 [中文版说明 / Chinese README](./README.zh-CN.md)
 
-![tower-do above-editor widget: board progress (`1/4 done · rev 10`), live session count, `mine/dirty` file segments, and annotated unfinished-task rows](https://raw.githubusercontent.com/wweir/tower-do/main/docs/pi-tower-do.png)
+![tower-do above-editor widget: board progress (`TowerDo 2 open · 1 blocked`), live session count, `mine/dirty` file segments, and annotated unfinished-task rows](https://raw.githubusercontent.com/wweir/tower-do/main/docs/pi-tower-do.png)
 
 ## What it does
 
@@ -35,8 +35,8 @@ work — and the manners to talk about it.
 - **Who is around.** Presence shows which sessions are active, idle, or gone
   quiet while still owning unfinished work — so a coordinator knows whom to
   ping instead of reassigning blind.
-- **A widget that explains the room.** The above-editor line shows board
-  progress (`1/4 done · rev 10`), how many sessions are live, which dirty
+- **A widget that explains the room.** The above-editor line shows remaining
+  work (`TowerDo 2 open · 1 blocked`), how many sessions are live, which dirty
   files are yours vs. the worktree's, and the unfinished tasks with owners.
 
 Three tools:
@@ -113,7 +113,7 @@ event semantics, and read derivations:
 | [docs/OPERATIONS.md](docs/OPERATIONS.md) | Install, config, release flow (tag → CI → npm), troubleshooting |
 | [README.zh-CN.md](./README.zh-CN.md) | 中文版说明 |
 
-Quality gate: `bunx tsc --noEmit` plus eight test suites, enforced in CI on
+Quality gate: `bunx tsc --noEmit` plus nine test suites, enforced in CI on
 every release tag — the list and what each suite proves live in
 [docs/CONTRACTS.md](docs/CONTRACTS.md).
 

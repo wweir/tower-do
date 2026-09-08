@@ -31,6 +31,29 @@ a failed read to that would hide a real `live N`).
 writing a heartbeat event on every turn (board growth + revision churn for
 derived data).
 
+## 2026-09 — widget progress counts remaining work, not lifetime
+
+**Context.** The widget header showed `TowerDo x/y done · rev N`. Both numbers
+only ever grow: completed rows are routinely retired in place (the owner
+guard and `dependsOn` pin them), so the fraction tracks board *lifetime*, not
+work; and `rev` is a monotonic CAS token backing the `baseRevision` gate, not
+a metric.
+
+**Decision.** The glance counts remaining work only — `TowerDo N open`, plus
+`· M blocked` / `· K msg` when present (`formatBoardProgress` in `state.ts`,
+suite `test/board-progress.ts`). Completed tasks never appear; a board of
+only completed rows renders no progress segment (git/live segments remain).
+Unread mail alone keeps the segment alive, so hiding the progress line never
+hides the inbox signal. `rev` stays in `tower_do_status`, where the CAS
+token belongs.
+
+**Rejected.** Keeping `x/y done` with completed rows excluded from the
+denominator (the fraction still grows with board lifetime, and flipping the
+numerator's meaning while keeping the shape reads backwards to anyone who
+knew the old widget); `open N` without the `TowerDo` title (collides with
+finding counts — a reader can't tell which counter it is); showing `rev`
+next to progress (monotonic gate token, not a workload metric).
+
 ## 2026-09 — widget git segment: dirty vs session, same unit
 
 **Context.** The above-editor widget should show how dirty the worktree is and
@@ -66,12 +89,12 @@ correct while the baseline re-seeds on a later refresh.
 Display: always-labeled `mine M · dirty N` (session viewpoint first; labels
 renamed from `sess`/`git` — cryptic viewpoint shorthands violated the same
 principle that killed `ΔN`: a reader must tell which number is which without
-docs), joined to the board progress line with a dim `│` (progress carries a
-dim `done` unit word; widget task rows carry a dim `key:` prefix matching
-`tower_do_status` lines). Widget numbers are emphasized by viewpoint
-(`mine` = accent, `dirty` = warning); labels stay dim.
-Hidden only when both counts are 0, or in a non-git directory. Empty board
-still shows a non-empty git segment. Folding equal counts into a single `ΔN`
+docs), joined to the board progress line with a dim `│` (progress carries
+dim `open`/`blocked`/`msg` unit words; widget task rows carry a dim `key:`
+prefix matching `tower_do_status` lines). Widget numbers are emphasized by
+viewpoint (`mine` = accent, `dirty` = warning); labels stay dim. Hidden only
+when both counts are 0, or in a non-git directory. Empty board still shows a
+non-empty git segment. Folding equal counts into a single `ΔN`
 was rejected — it hid which viewpoint the number belonged to.
 
 **Rejected.** Counting both rename endpoints as dirty (breaks the same-unit

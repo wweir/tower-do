@@ -9,7 +9,7 @@
 
 [English README](./README.md)
 
-![tower-do 编辑器上方 widget：看板进度（`1/4 done · rev 10`）、活跃 session 数、`mine/dirty` 文件段、带标注的未完成任务行](https://raw.githubusercontent.com/wweir/tower-do/main/docs/pi-tower-do.png)
+![tower-do 编辑器上方 widget：剩余工作进度（`TowerDo 2 open · 1 blocked`）、活跃 session 数、`mine/dirty` 文件段、带标注的未完成任务行](https://raw.githubusercontent.com/wweir/tower-do/main/docs/pi-tower-do.png)
 
 ## 解决什么问题
 
@@ -20,7 +20,7 @@
 - **在工作现场沟通。** 给任务 owner 发定向消息（或广播全员），外加结构化 finding（bug / improve / vuln / idea）上报越界发现——路由到对的 agent，而不是淹没在聊天里。
 - **冲突感知。** 仪表盘会提示：你任务的 scope 范围命中了同伴刚改过的文件，或两个进行中任务的 scope 相交——只是建议性告警，靠消息协调，不做拦截门禁。
 - **谁在场。** 在场状态显示哪些 session 活跃、哪些空闲、哪些还挂着未完成任务却没了动静——协调者知道该 ping 谁，而不是盲 目重派。
-- **一个说明现状的 widget。** 编辑器上方一行展示看板进度（`1/4 done · rev 10`）、活跃 session 数、脏文件里哪些是你改的，以及带 owner 的未完成任务。
+- **一个说明现状的 widget。** 编辑器上方一行展示剩余工作（`TowerDo 2 open · 1 blocked`）、活跃 session 数、脏文件里哪些是你改的，以及带 owner 的未完成任务。
 
 三个工具：
 
@@ -85,7 +85,7 @@ pi 启动时自动发现扩展；已开会话用 `/reload` 加载。
 | [docs/OPERATIONS.md](docs/OPERATIONS.md) | 安装、配置、发布流程（tag → CI → npm）、排障 |
 | [English README](./README.md) | English version |
 
-质量门禁：`bunx tsc --noEmit` 加八个测试套件，在每次发版 tag 的 CI 上强制执行——清单与各套件证明的内容见 [docs/CONTRACTS.md](docs/CONTRACTS.md)。
+质量门禁：`bunx tsc --noEmit` 加九个测试套件，在每次发版 tag 的 CI 上强制执行——清单与各套件证明的内容见 [docs/CONTRACTS.md](docs/CONTRACTS.md)。
 
 参考：Kimi Tower 多 worker 编排设计（官方 Tower blog/docs）与参考扩展实现
 <https://github.com/99percentpeople/pi-extensions/blob/master/extensions/todo/index.ts>。
