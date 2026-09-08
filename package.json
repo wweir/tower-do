@@ -1,6 +1,6 @@
 {
   "name": "tower-do",
-  "version": "0.2.8",
+  "version": "0.3.0",
   "description": "Shared multi-agent task board for Pi coding agent — Kimi Tower style orchestration (todo-flavored)",
   "license": "MPL-2.0",
   "author": "温习江湖 <wweir@foxmail.com>",
