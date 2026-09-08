@@ -9,13 +9,18 @@
 
 [English README](./README.md)
 
-## 功能
-
-面向并行 pi agent 的共享任务看板：计划 / 认领 / 完成 / 阻塞任务（带 owner 与依赖）、跨 agent 消息与 finding、全局状态仪表盘。**冲突感知**：完成任务时带 `changedFiles`（你实际改过的文件的交付回执）+ 声明 `scope`（文件 glob 边界）后，`tower_do_status` 会派生两类**建议性告警**——**overlap**（某个进行中/待办任务的 scope 命中了刚完成任务的回执文件，"你打算动的文件别人刚改过"）与 **collision**（两个进行中任务的 scope 相交）。告警只提示不拦截，通过消息协调或调整 scope 解决。
-
 ![tower-do 编辑器上方 widget：看板进度（`1/4 done · rev 10`）、活跃 session 数、`mine/dirty` 文件段、带标注的未完成任务行](https://raw.githubusercontent.com/wweir/tower-do/main/docs/pi-tower-do.png)
 
-编辑器上方 widget 另有 `live N` 段（本项目当前同时活跃的 session 数）和 `mine M · dirty N` 段（本会话实际改过的文件数 vs 工作区 dirty 文件数），见 [docs/PRODUCT.md](docs/PRODUCT.md)。
+## 解决什么问题
+
+并行编码 agent 的瓶颈在协调而不在编码：互相覆盖文件、重做已完成的工作、不知道谁在做什么。tower-do 给项目里的每个 agent 一块共享看板来规划、认领、完成工作——并附带跨 agent 沟通的方式。
+
+- **一块看板，多个 agent。** 计划、认领、完成、阻塞任务，带 owner 与依赖。每个会话和子代理读写同一块看板——无守护进程、无数据库，装上扩展即用。
+- **完成带回执。** 任务完成时记录你实际改过的文件（`changedFiles`），接手下一个任务的人立刻知道刚动了哪些地方。
+- **在工作现场沟通。** 给任务 owner 发定向消息（或广播全员），外加结构化 finding（bug / improve / vuln / idea）上报越界发现——路由到对的 agent，而不是淹没在聊天里。
+- **冲突感知。** 仪表盘会提示：你任务的 scope 范围命中了同伴刚改过的文件，或两个进行中任务的 scope 相交——只是建议性告警，靠消息协调，不做拦截门禁。
+- **谁在场。** 在场状态显示哪些 session 活跃、哪些空闲、哪些还挂着未完成任务却没了动静——协调者知道该 ping 谁，而不是盲 目重派。
+- **一个说明现状的 widget。** 编辑器上方一行展示看板进度（`1/4 done · rev 10`）、活跃 session 数、脏文件里哪些是你改的，以及带 owner 的未完成任务。
 
 三个工具：
 
@@ -45,11 +50,7 @@ pi install git:https://github.com/wweir/tower-do.git@main
 mkdir -p ~/.pi/agent/extensions && cp -r tower-do ~/.pi/agent/extensions/
 ```
 
-pi 启动时自动发现扩展；已开会话用 `/reload` 加载。运行依赖（`typebox`、`@earendil-works/*`）由 pi 环境提供（peerDependencies，无需手动安装）。
-
-## 发布
-
-在 `main` 上打 `vX.Y.Z` 标签即触发 CI 运行编译 + 测试门禁，自动发布到 npm 并创建 GitHub Release（见 `.github/workflows/release.yml` 与 [docs/OPERATIONS.md](docs/OPERATIONS.md)）。标签须与 `package.json` 的 `version` 一致。
+pi 启动时自动发现扩展；已开会话用 `/reload` 加载。
 
 ## 快速上手
 
@@ -69,67 +70,22 @@ pi 启动时自动发现扩展；已开会话用 `/reload` 加载。运行依赖
 | --- | --- | --- |
 | `identity` | 会话名/会话 id | 钉住本会话的看板身份（项目级）；不得使用保留的编排者身份 `tower` |
 
-配置面就这些。文件缺失 = 默认值；未知键忽略（向前兼容）；文件损坏或 `identity` 非法在会话启动时大声报错——绝不静默回退，静默重置身份会破坏多 agent 场景下的 owner 匹配。该文件无 secret，可提交共享团队设置；只需 gitignore `board.jsonl`。详见 [docs/OPERATIONS.md](docs/OPERATIONS.md)。
+## 工作原理
 
-## 架构
-
-三层，依赖方向严格单向（上层依赖下层，从不反向）：
-
-```text
-Pi 会话 / 子代理（多个，同一项目）
-   │  tower_do · tower_do_talk · tower_do_status（+ widget、提醒）
-   ▼
-index.ts   扩展层 —— 工具参数与提示词契约、TUI widget、看板对账提醒、会话生命周期
-   ▼
-state.ts   纯逻辑核心 —— schema + 校验（全字段 owner 门禁、baseRevision 防覆盖门禁）、
-           事件折叠、只读派生（在场 / 阻塞 / scope 冲突 / 消息保留）；无 I/O
-   ▼
-board.ts   磁盘层 —— 追加式 JSONL 事件日志；每次读取都从磁盘重新折叠，写入方追加单行事件
-   ▼
-<project>/.pi/tower-do/board.jsonl   唯一事实源（file-as-state，所有会话共享；需 gitignore）
-```
-
-写路径：工具参数 → 校验 + revision 门禁 → 追加事件 → 折叠 → 视图。读路径：重新折叠事件得到视图，其余全部只读派生——除日志外没有可变状态文件。完整数据流与派生规则见 [docs/ARCHITECTURE.md](docs/ARCHITECTURE.md)。
+每个项目一个追加式 JSONL 文件（`<project>/.pi/tower-do/board.jsonl`）是唯一事实源——状态与通信是同一份存储。每次读取都从日志重新折叠；写入携带单调递增的 revision，同伴的并发更新会被拒绝而不是被静默覆盖。系统边界、事件语义与只读派生见 [docs/ARCHITECTURE.md](docs/ARCHITECTURE.md)。
 
 ## 文档
 
 | 文档 | 内容 |
 | --- | --- |
 | [docs/PRODUCT.md](docs/PRODUCT.md) | 产品范围与高层体验 |
-| [docs/ARCHITECTURE.md](docs/ARCHITECTURE.md) | 系统边界、事件日志与折叠、只读派生（在场 / 阻塞 / scope 冲突 / 消息保留） |
+| [docs/ARCHITECTURE.md](docs/ARCHITECTURE.md) | 系统边界、事件日志与折叠、源码布局、只读派生（在场 / 阻塞 / scope 冲突 / 消息保留） |
 | [docs/CONTRACTS.md](docs/CONTRACTS.md) | 任务模型不变量（含 `changedFiles` 回执与 scope 冲突契约）、owner 门禁、revision 门禁、测试 gate |
-| [docs/DECISIONS.md](docs/DECISIONS.md) | 关键决策：共享"边界事实"而非 diff（P0/P1）、widget git 段、file-as-state、全字段 owner 门禁、scope 仅建议 |
-| [docs/OPERATIONS.md](docs/OPERATIONS.md) | 安装、配置、运行、排障 |
+| [docs/DECISIONS.md](docs/DECISIONS.md) | 关键决策：共享"边界事实"而非 diff（P0/P1）、widget 分段、file-as-state、全字段 owner 门禁、scope 仅建议 |
+| [docs/OPERATIONS.md](docs/OPERATIONS.md) | 安装、配置、发布流程（tag → CI → npm）、排障 |
 | [English README](./README.md) | English version |
 
-## 文件结构
-
-```text
-├── index.ts     # 扩展入口：3 工具 + widget + 提醒 + 生命周期
-├── state.ts     # 纯 schema/校验/折叠/只读派生（无 I/O）
-├── board.ts     # 磁盘层：追加式 JSONL（file-as-state）+ 配置
-├── git-count.ts # widget git 段的 dirty/session 文件数纯函数派生（无 I/O）
-├── test/        # smoke + owner-guard + presence-retention + changed-files + scope-conflicts + config + git-count + live-sessions
-├── docs/        # PRODUCT / ARCHITECTURE / CONTRACTS / DECISIONS / OPERATIONS
-└── README.md
-```
-
-## 验证
-
-```bash
-bun install                          # devDeps —— 仅类型检查/测试用
-bunx tsc --noEmit -p tsconfig.json   # strict + noUnused，零错误
-bun run test/smoke.ts               # 端到端：3 工具、持久化、项目边界、changedFiles 磁盘往返
-bun run test/config.ts              # 配置 fail-loud + 保留身份（11 用例）
-bun run test/owner-guard.ts         # 全字段 owner 门禁（10 用例）
-bun run test/presence-retention.ts  # 读回执 / 消息保留 / 在场派生（34 用例）
-bun run test/changed-files.ts       # P0 交付回执不变量（10 用例）
-bun run test/scope-conflicts.ts     # P1 glob 匹配 + 冲突派生（17 用例）
-bun run test/git-count.ts           # widget git 段纯函数派生（24 用例）
-bun run test/live-sessions.ts       # widget live 段纯函数派生（12 用例）
-```
-
-各套件证明的内容见 [docs/CONTRACTS.md](docs/CONTRACTS.md)。
+质量门禁：`bunx tsc --noEmit` 加八个测试套件，在每次发版 tag 的 CI 上强制执行——清单与各套件证明的内容见 [docs/CONTRACTS.md](docs/CONTRACTS.md)。
 
 参考：Kimi Tower 多 worker 编排设计（官方 Tower blog/docs）与参考扩展实现
 <https://github.com/99percentpeople/pi-extensions/blob/master/extensions/todo/index.ts>。
