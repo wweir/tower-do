@@ -2074,13 +2074,13 @@ export default function towerDoExtension(pi: ExtensionAPI): void {
         if (task.changedFiles !== undefined && task.changedFiles.length > 0) {
           detail.push(`- changedFiles: ${task.changedFiles.join(", ")}`);
         }
-        if (task.description !== undefined) {
+        if (task.description === undefined) {
+          detail.push("- description: (none)");
+        } else {
           detail.push("- description:");
           for (const row of task.description.split("\n")) {
             detail.push(`  ${row}`);
           }
-        } else {
-          detail.push("- description: (none)");
         }
         const detailText = detail.join("\n");
         return {
