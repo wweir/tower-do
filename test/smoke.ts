@@ -1436,6 +1436,25 @@ async function layer2(): Promise<void> {
     legacyMsg.slice(0, 120),
   );
 
+  // A legacy dir holding ONLY live/ heartbeats carries no data (2-min TTL;
+  // a pre-upgrade session may still be writing them) — it must not brick
+  // the next session the way a leftover board.jsonl does.
+  const liveOnlyDir = mkdtempSync(join(tmpdir(), "tower-do-liveonly-"));
+  mkdirSync(join(liveOnlyDir, ".pi", "tower-do", "live"), {
+    recursive: true,
+  });
+  writeFileSync(join(liveOnlyDir, ".pi", "tower-do", "live", "s.json"), "{}");
+  const liveOnlyMsg = await runThrow(
+    "tower_do_status",
+    {} as never,
+    liveOnlyDir,
+  );
+  check(
+    "legacy live-only leftover does not trip the guard",
+    !/no longer read/.test(liveOnlyMsg),
+    liveOnlyMsg.slice(0, 120),
+  );
+
   // The global state root must never trip the legacy guard: a session whose
   // project root resolves to $HOME (no git boundary above it) has its legacy
   // path EQUAL to the records home, which holds real boards — throwing there
