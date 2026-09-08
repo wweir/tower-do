@@ -18,8 +18,12 @@ status dashboard. **Conflict awareness**: completing a task with `changedFiles`
 globs lets `tower_do_status` flag *overlaps* (an active task's scope matches a
 just-completed task's receipt) and *collisions* (two in-progress tasks'
 scopes intersect) — advisory warnings, resolved by messaging, not gates.
-The above-editor widget also shows a git segment (worktree dirty vs files
-this session actually changed); see [docs/PRODUCT.md](docs/PRODUCT.md).
+
+![tower-do above-editor widget: board progress (`1/4 done · rev 10`), live session count, `mine/dirty` file segments, and annotated unfinished-task rows](https://raw.githubusercontent.com/wweir/tower-do/main/docs/pi-tower-do.png)
+
+The above-editor widget shows a `live N` session count (sessions active on
+this board) and a `mine M · dirty N` git segment (files this session actually
+changed vs worktree-dirty files); see [docs/PRODUCT.md](docs/PRODUCT.md).
 
 Three tools:
 
@@ -135,7 +139,7 @@ are no mutable state files besides the log. Full data flow and derivations:
 ├── state.ts     # pure schema/validation/fold/read-derivations (no I/O)
 ├── board.ts     # disk layer: append-only JSONL (file-as-state) + config
 ├── git-count.ts # pure git dirty/session file-count derivations for the widget (no I/O)
-├── test/        # smoke + owner-guard + presence-retention + changed-files + scope-conflicts + config + git-count
+├── test/        # smoke + owner-guard + presence-retention + changed-files + scope-conflicts + config + git-count + live-sessions
 ├── docs/        # PRODUCT / ARCHITECTURE / CONTRACTS / DECISIONS / OPERATIONS
 └── README.md
 ```
@@ -152,6 +156,7 @@ bun run test/presence-retention.ts  # read receipts / retirement / presence (34)
 bun run test/changed-files.ts       # P0 delivery-receipt invariants (10 cases)
 bun run test/scope-conflicts.ts     # P1 glob matching + conflict derivation (17 cases)
 bun run test/git-count.ts           # widget git-segment derivations (24 cases)
+bun run test/live-sessions.ts       # widget live-session count derivations (12 cases)
 ```
 
 See [docs/CONTRACTS.md](docs/CONTRACTS.md) for what each suite proves.

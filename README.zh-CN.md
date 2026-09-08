@@ -11,7 +11,11 @@
 
 ## 功能
 
-面向并行 pi agent 的共享任务看板：计划 / 认领 / 完成 / 阻塞任务（带 owner 与依赖）、跨 agent 消息与 finding、全局状态仪表盘。**冲突感知**：完成任务时带 `changedFiles`（你实际改过的文件的交付回执）+ 声明 `scope`（文件 glob 边界）后，`tower_do_status` 会派生两类**建议性告警**——**overlap**（某个进行中/待办任务的 scope 命中了刚完成任务的回执文件，"你打算动的文件别人刚改过"）与 **collision**（两个进行中任务的 scope 相交）。告警只提示不拦截，通过消息协调或调整 scope 解决。编辑器上方 widget 另有 git 段（工作区 dirty vs 本会话实际改过的文件数），见 [docs/PRODUCT.md](docs/PRODUCT.md)。
+面向并行 pi agent 的共享任务看板：计划 / 认领 / 完成 / 阻塞任务（带 owner 与依赖）、跨 agent 消息与 finding、全局状态仪表盘。**冲突感知**：完成任务时带 `changedFiles`（你实际改过的文件的交付回执）+ 声明 `scope`（文件 glob 边界）后，`tower_do_status` 会派生两类**建议性告警**——**overlap**（某个进行中/待办任务的 scope 命中了刚完成任务的回执文件，"你打算动的文件别人刚改过"）与 **collision**（两个进行中任务的 scope 相交）。告警只提示不拦截，通过消息协调或调整 scope 解决。
+
+![tower-do 编辑器上方 widget：看板进度（`1/4 done · rev 10`）、活跃 session 数、`mine/dirty` 文件段、带标注的未完成任务行](https://raw.githubusercontent.com/wweir/tower-do/main/docs/pi-tower-do.png)
+
+编辑器上方 widget 另有 `live N` 段（本项目当前同时活跃的 session 数）和 `mine M · dirty N` 段（本会话实际改过的文件数 vs 工作区 dirty 文件数），见 [docs/PRODUCT.md](docs/PRODUCT.md)。
 
 三个工具：
 
@@ -105,7 +109,7 @@ board.ts   磁盘层 —— 追加式 JSONL 事件日志；每次读取都从磁
 ├── state.ts     # 纯 schema/校验/折叠/只读派生（无 I/O）
 ├── board.ts     # 磁盘层：追加式 JSONL（file-as-state）+ 配置
 ├── git-count.ts # widget git 段的 dirty/session 文件数纯函数派生（无 I/O）
-├── test/        # smoke + owner-guard + presence-retention + changed-files + scope-conflicts + config + git-count
+├── test/        # smoke + owner-guard + presence-retention + changed-files + scope-conflicts + config + git-count + live-sessions
 ├── docs/        # PRODUCT / ARCHITECTURE / CONTRACTS / DECISIONS / OPERATIONS
 └── README.md
 ```
@@ -122,6 +126,7 @@ bun run test/presence-retention.ts  # 读回执 / 消息保留 / 在场派生（
 bun run test/changed-files.ts       # P0 交付回执不变量（10 用例）
 bun run test/scope-conflicts.ts     # P1 glob 匹配 + 冲突派生（17 用例）
 bun run test/git-count.ts           # widget git 段纯函数派生（24 用例）
+bun run test/live-sessions.ts       # widget live 段纯函数派生（12 用例）
 ```
 
 各套件证明的内容见 [docs/CONTRACTS.md](docs/CONTRACTS.md)。

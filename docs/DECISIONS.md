@@ -4,6 +4,31 @@
 > / reviews live in docs/plans + docs/reviews and get folded here when they
 > become durable rules.
 
+## 2026-09 — widget `live N` segment: presence-derived, never written
+
+**Context.** The widget should show how many sessions are concurrently
+running against this project's board.
+
+**Decision.** Derive the count from the activity log (same signal as
+`tower_do_status`'s who-is-around): distinct identities with a board event in
+the last 30 minutes (aligned with `SESSION_BREAK_GAP_MS`), plus self — a
+fresh session with no board writes yet is by definition running. Any board
+interaction refreshes liveness (status/inbox append read acks), so the count
+tracks tool activity, not OS processes.
+
+Known blind spot, accepted: a session doing pure code work without touching
+the board stays invisible until its next board call — a generous window
+covers it. A true liveness signal (heartbeats) would add a second write path
+to the file-as-state board for one display number; rejected.
+
+Directories without a board file show no `live` segment at all — a
+meaningless `live 1` in every random directory would break the widget's
+show-something-only-when-there-is-something minimalism.
+
+**Rejected.** Process/IPC probing (pi sessions are not enumerable portably);
+writing a heartbeat event on every turn (board growth + revision churn for
+derived data).
+
 ## 2026-09 — widget git segment: dirty vs session, same unit
 
 **Context.** The above-editor widget should show how dirty the worktree is and
@@ -25,10 +50,10 @@ how much of that this session caused, without a second unit (lines, commits).
   blob different from the baseline, or it appears in the window with a blob
   different from the baseline — the last one catches edits that were made
   *and* committed between two refreshes. Pre-dirty files this session never
-  edits do not count. A later commit can still show `sess N · git 0`.
+  edits do not count. A later commit can still show `mine N · dirty 0`.
 
 External HEAD movement (pull / rebase / branch switch) never folds its
-roster into `sess`: a window containing a merge commit or more than 20
+roster into the session viewpoint: a window containing a merge commit or more than 20
 commits re-anchors the window at the new HEAD. A fast-forward pull of few
 commits is the accepted blind spot.
 
@@ -36,9 +61,13 @@ Cost bound: refresh hashes at most 2000 dirty paths per settle; past the
 cap (or on a hashing failure) the session viewpoint pauses — dirty stays
 correct while the baseline re-seeds on a later refresh.
 
-Display: always-labeled `sess M · git N` (session first), joined to the board
-progress line with a dim `│`. Widget numbers are emphasized by viewpoint
-(`sess` = accent, `git` = warning); labels stay dim.
+Display: always-labeled `mine M · dirty N` (session viewpoint first; labels
+renamed from `sess`/`git` — cryptic viewpoint shorthands violated the same
+principle that killed `ΔN`: a reader must tell which number is which without
+docs), joined to the board progress line with a dim `│` (progress carries a
+dim `done` unit word; widget task rows carry a dim `key:` prefix matching
+`tower_do_status` lines). Widget numbers are emphasized by viewpoint
+(`mine` = accent, `dirty` = warning); labels stay dim.
 Hidden only when both counts are 0, or in a non-git directory. Empty board
 still shows a non-empty git segment. Folding equal counts into a single `ΔN`
 was rejected — it hid which viewpoint the number belonged to.
