@@ -1008,7 +1008,7 @@ export default function towerDoExtension(pi: ExtensionAPI): void {
       typeof manager?.getSessionId === "function"
         ? (manager.getSessionId() ?? "")
         : "";
-    return id !== "" ? id : randomUUID().slice(0, 8);
+    return id === "" ? randomUUID().slice(0, 8) : id;
   };
 
   /** Rewrite this session's liveness record (temp + rename, own file at the
