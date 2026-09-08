@@ -266,17 +266,18 @@ function loadConfig(cwd: string): TowerDoConfig {
   }
 }
 
-/** Loud migration guard: state at the retired per-project location would
+/** Loud migration guard: a board at the retired per-project location would
  * otherwise be silently abandoned — an empty replacement board drops every
  * task and the whole activity history. The global state root itself is NOT a
  * legacy remnant: a session whose project root resolves to $HOME (no git
- * boundary above it) has legacy === the records home, and must not trip. */
+ * boundary above it) has legacy === the records home, and must not trip.
+ * A legacy dir holding only live/ heartbeats is ignored too: they are
+ * ephemeral (2-min TTL), so a pre-upgrade session still writing them must
+ * not brick the next one. */
 function assertNoLegacyState(cwd: string): void {
   const legacy = join(projectRoot(cwd), CONFIG_DIR_NAME, "tower-do");
   if (resolve(legacy) === resolve(homeDir(), ".pi", "tower-do")) return;
-  const hasBoard = existsSync(join(legacy, "board.jsonl"));
-  const hasLive = existsSync(join(legacy, "live"));
-  if (!hasBoard && !hasLive) return;
+  if (!existsSync(join(legacy, "board.jsonl"))) return;
   throw new Error(
     `tower-do state ${legacy} is no longer read — move board.jsonl and live/ to ${stateDirFor(cwd)}`,
   );
