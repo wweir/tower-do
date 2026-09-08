@@ -18,7 +18,7 @@ typescript) is for typecheck/tests.
 
 ## Configuration
 
-`~/.pi/tower-do/config.json` is the only configuration surface — no
+`~/.pi/agent/tower-do/config.json` is the only configuration surface — no
 environment variables. The file is optional (absent = defaults), global across
 every project, and lives outside any repo — it is never committed. A leftover
 per-project config at the retired `<project>/.pi/tower-do/config.json`
@@ -63,8 +63,9 @@ git tag v0.3.0 && git push origin main --tags
 
 ## Runtime layout
 
-- Board: `<project>/.pi/tower-do/board.jsonl` (append-only event log — the
-  single source of truth; keep it out of git via `.gitignore`).
+- Board: `~/.pi/tower-do/<project>/board.jsonl` (append-only event log — the
+  single source of truth). `<project>` is the slug-hash of the project's git
+  root; state never lives inside a repo, so nothing to gitignore.
 - Checkpoints: on session compact / agent start, the view is embedded as a
   custom context entry (fallback display when the board file is missing).
 - Widget: above-editor status line (TUI only).

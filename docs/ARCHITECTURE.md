@@ -11,7 +11,7 @@ reminders) whose only durable state is a **plain append-only JSONL file** per
 project:
 
 ```
-<project>/.pi/tower-do/board.jsonl
+~/.pi/tower-do/<project>/board.jsonl   # <project> = slug-hash of the git root
 ```
 
 - **No daemon, no DB, no lock server.** Any Pi session or subagent that can read
@@ -58,7 +58,7 @@ The board is shared per **project** = nearest ancestor git work-tree root (a
 ## Liveness sidecar (not board events)
 
 The widget's `live N` does not read the board log: each running session owns
-exactly one file `.pi/tower-do/live/<identity>.<sessionId>.json`
+exactly one file `~/.pi/tower-do/<project>/live/<identity>.<sessionId>.json`
 (`{"identity", "at"}`), rewritten on a 30s heartbeat and deleted on clean
 exit. The count is a pure read derivation (`liveSessionCount` in `state.ts`):
 distinct identities with a record fresh within 2 minutes, plus self. `fs.watch`

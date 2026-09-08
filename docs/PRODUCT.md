@@ -34,7 +34,7 @@ TowerDo is its state/communication substrate.
   their behalf with `as`). Dependencies via `dependsOn` surface as block
   reasons.
 - **Multiple sessions, one project.** Both sides read/write the same
-  `<project>/.pi/tower-do/board.jsonl`; send a message, the other reads it via
+  `~/.pi/tower-do/<project>/board.jsonl`; send a message, the other reads it via
   `inbox`.
 - **Advisory conflict signals.** Completing a task with `changedFiles` and
   declaring `scope` turns the board into an early-warning surface: a planner

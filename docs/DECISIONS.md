@@ -19,7 +19,7 @@ entry is superseded.
 
 **Decision.** Liveness is a different signal from board activity ("process
 running" vs "touched the board"), so it gets its own channel:
-`.pi/tower-do/live/<identity>.<sessionId>.json` — one file per session,
+`~/.pi/tower-do/<project>/live/<identity>.<sessionId>.json` — one file per session,
 rewritten on a 30s heartbeat (`LIVE_HEARTBEAT_MS`), deleted on clean exit.
 The count is a pure derivation (`liveSessionCount` in state.ts over the
 sidecar records): distinct identities with a record fresh within 2 minutes
@@ -176,7 +176,7 @@ backend and the orchestrator consumes the board.
   documented (unauthenticated, cooperative-trust) way for the orchestrator to
   act. Same class of collision: the broadcast keyword `"all"` is rejected as
   any identity (config / `as` / owner).
-- **Config surface is `identity` only** (config.json in `$HOME/.pi/tower-do/`,
+- **Config surface is `identity` only** (config.json in `$HOME/.pi/agent/tower-do/`,
   optional, global across projects — a personal pin, not a committed team
   setting; a leftover per-project config fails loud with a migration hint). Reminder cadence, widget rows, activity tail, and message retention
   are internal constants — no user evidence ever justified tuning them, and

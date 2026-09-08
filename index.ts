@@ -4,7 +4,7 @@
  * Fuses the coordination design of Kimi Tower's multi-worker orchestration
  * into a todo-style extension:
  *
- *  - file-as-state: the board lives in `<project>/.pi/tower-do/board.jsonl`
+ *  - file-as-state: the board lives in `~/.pi/tower-do/<project>/board.jsonl`
  *    (append-only JSONL; folding events yields the current view). Every agent
  *    session — or a subagent pointed at the board path — sees the same tasks.
  *  - ownership: tasks may carry an `owner`; only the owner or the reserved
@@ -62,7 +62,7 @@ import {
   unlink,
   writeFile,
 } from "node:fs/promises";
-import { randomUUID } from "node:crypto";
+import { createHash, randomUUID } from "node:crypto";
 import { homedir } from "node:os";
 import { dirname, join } from "node:path";
 import { Type } from "typebox";
@@ -202,28 +202,37 @@ export function projectRoot(cwd: string): string {
   return cwd;
 }
 
-function towerDoDir(cwd: string): string {
-  return join(projectRoot(cwd), CONFIG_DIR_NAME, "tower-do");
+/** Per-project state root under the global records home `~/.pi/tower-do/`:
+ * session records (board.jsonl, live sidecars) never ride inside a repo. The
+ * slug keeps the directory readable; the path hash guarantees uniqueness
+ * (`/a/b` vs `/a_b` would slug identically). */
+export function stateDirFor(cwd: string): string {
+  const root = projectRoot(cwd);
+  const slug =
+    root.replace(/[^A-Za-z0-9._-]+/g, "-").replace(/^-+|-+$/g, "") || "project";
+  const hash = createHash("sha256").update(root).digest("hex").slice(0, 8);
+  return join(homeDir(), ".pi", "tower-do", `${slug}-${hash}`);
 }
 
-function boardFileFor(cwd: string): string {
-  return join(towerDoDir(cwd), "board.jsonl");
+export function boardFileFor(cwd: string): string {
+  return join(stateDirFor(cwd), "board.jsonl");
 }
 
-/** Config is global, not per-project: a pinned identity is a personal choice
- * that applies across every board the user touches, and keeping it out of the
- * repo avoids leaking it through committed files and per-project drift. */
-function configHome(): string {
-  // Resolve $HOME explicitly (POSIX semantics) instead of os.homedir(): Bun's
-  // homedir() ignores the HOME override, which makes HOME-scoped tests
-  // nondeterministic and silently reads the real user config.
-  const home =
-    process.env.HOME?.trim() || process.env.USERPROFILE?.trim() || homedir();
-  return join(home, CONFIG_DIR_NAME, "tower-do");
+/** $HOME resolved explicitly (POSIX semantics) instead of os.homedir(): Bun's
+ * homedir() ignores the HOME override, which makes HOME-scoped tests
+ * nondeterministic and silently reads the real user config. */
+function homeDir(): string {
+  return (
+    process.env.HOME?.trim() || process.env.USERPROFILE?.trim() || homedir()
+  );
 }
 
+/** Config lives beside pi's own config under `~/.pi/agent/`: a pinned
+ * identity is a personal choice that applies across every board the user
+ * touches, and keeping it out of the repo avoids leaking it through committed
+ * files and per-project drift. */
 function configFile(): string {
-  return join(configHome(), "config.json");
+  return join(homeDir(), ".pi", "agent", "tower-do", "config.json");
 }
 
 function loadConfig(cwd: string): TowerDoConfig {
@@ -257,6 +266,19 @@ function loadConfig(cwd: string): TowerDoConfig {
   }
 }
 
+/** Loud migration guard: state at the retired per-project location would
+ * otherwise be silently abandoned — an empty replacement board drops every
+ * task and the whole activity history. */
+function assertNoLegacyState(cwd: string): void {
+  const legacy = join(projectRoot(cwd), CONFIG_DIR_NAME, "tower-do");
+  const hasBoard = existsSync(join(legacy, "board.jsonl"));
+  const hasLive = existsSync(join(legacy, "live"));
+  if (!hasBoard && !hasLive) return;
+  throw new Error(
+    `tower-do state ${legacy} is no longer read — move board.jsonl and live/ to ${stateDirFor(cwd)}`,
+  );
+}
+
 class BoardCache {
   private readonly entries = new Map<string, BoardEntry>();
 
@@ -264,6 +286,7 @@ class BoardCache {
     const file = boardFileFor(cwd);
     let entry = this.entries.get(file);
     if (entry === undefined) {
+      assertNoLegacyState(cwd);
       entry = {
         board: new TowerBoard(file),
         config: loadConfig(cwd),
@@ -1034,7 +1057,7 @@ export default function towerDoExtension(pi: ExtensionAPI): void {
   //
   // Liveness is a different signal from board activity ("process running"
   // vs "touched the board"), so it lives in its own channel: each session
-  // owns exactly one file `.pi/tower-do/live/<identity>.<sessionId>.json`
+  // owns exactly one file `~/.pi/tower-do/<project>/live/<identity>.<sessionId>.json`
   // rewritten on a heartbeat cadence and deleted on clean exit. Own-file
   // writes never contend cross-process; exit is a delete, a crash expires
   // via LIVE_WINDOW_MS. fs.watch makes peer enter/exit/write visible within

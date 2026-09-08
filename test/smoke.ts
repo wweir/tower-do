@@ -419,6 +419,9 @@ async function layer1(): Promise<void> {
 }
 
 async function layer2(): Promise<void> {
+  // HOME isolation: the extension keeps state under $HOME/.pi/{agent,tower-do};
+  // point HOME at a throwaway dir so tests never touch the real user state.
+  process.env.HOME = mkdtempSync(join(tmpdir(), "tower-do-home-"));
   const dir = mkdtempSync(join(tmpdir(), "tower-do-l2-"));
   type Handler = (...args: never[]) => unknown;
   const handlers = new Map<string, Handler>();
@@ -461,7 +464,9 @@ async function layer2(): Promise<void> {
     events: { on: () => {}, emit: (): void => {} },
   } as never;
 
-  const { default: towerDoExtension } = await import("../index.ts");
+  const { default: towerDoExtension, boardFileFor } = await import(
+    "../index.ts",
+  );
   towerDoExtension(pi as never);
 
   for (const name of ["tower_do", "tower_do_talk", "tower_do_status"]) {
@@ -1143,9 +1148,7 @@ async function layer2(): Promise<void> {
   } catch (error) {
     abortMsg = error instanceof Error ? error.message : String(error);
   }
-  const afterAbort = await new TowerBoard(
-    join(dir, ".pi", "tower-do", "board.jsonl"),
-  ).fold();
+  const afterAbort = await new TowerBoard(boardFileFor(dir)).fold();
   check(
     "aborted tower_do does not write",
     /cancelled|aborted/i.test(abortMsg) &&
@@ -1170,9 +1173,7 @@ async function layer2(): Promise<void> {
     } as never,
     ctxDir,
   );
-  const ctxGhost = new TowerBoard(
-    join(ctxDir, ".pi", "tower-do", "board.jsonl"),
-  );
+  const ctxGhost = new TowerBoard(boardFileFor(ctxDir));
   const ctxFolded = await ctxGhost.fold();
   await ctxGhost.append(
     writeBoardSnapshot(
@@ -1253,7 +1254,7 @@ async function layer2(): Promise<void> {
     } as never,
     compactDir,
   );
-  const compactFile = join(compactDir, ".pi", "tower-do", "board.jsonl");
+  const compactFile = boardFileFor(compactDir);
   const ghost = new TowerBoard(compactFile);
   const folded = await ghost.fold();
   const live = writeBoardSnapshot(
@@ -1372,25 +1373,26 @@ async function layer2(): Promise<void> {
     reminder.slice(0, 120),
   );
 
-  // Config is global ($HOME/.pi/tower-do/config.json). Point HOME at the
-  // fixture dir so the loader reads the fixture, restore before returning.
-  const realHome = process.env.HOME;
+  // Config is global ($HOME/.pi/agent/tower-do/config.json). Point HOME at
+  // the fixture dir so the loader reads the fixture, restore the previous
+  // value afterwards (nesting-safe: the outer layer2 already overrode HOME).
   const withHome = async (home: string, fn: () => Promise<void>) => {
+    const prev = process.env.HOME;
     process.env.HOME = home;
     try {
       await fn();
     } finally {
-      if (realHome === undefined) delete process.env.HOME;
-      else process.env.HOME = realHome;
+      if (prev === undefined) delete process.env.HOME;
+      else process.env.HOME = prev;
     }
   };
 
   // Broken config.json fails loudly instead of silently resetting identity —
   // a silent default would corrupt owner matching in multi-agent sessions.
   const brokenDir = mkdtempSync(join(tmpdir(), "tower-do-badcfg-"));
-  mkdirSync(join(brokenDir, ".pi", "tower-do"), { recursive: true });
+  mkdirSync(join(brokenDir, ".pi", "agent", "tower-do"), { recursive: true });
   writeFileSync(
-    join(brokenDir, ".pi", "tower-do", "config.json"),
+    join(brokenDir, ".pi", "agent", "tower-do", "config.json"),
     '{ "identity": "broken',
   );
   let brokenMsg = "";
@@ -1403,9 +1405,9 @@ async function layer2(): Promise<void> {
     brokenMsg.slice(0, 80),
   );
   const reservedDir = mkdtempSync(join(tmpdir(), "tower-do-reserved-"));
-  mkdirSync(join(reservedDir, ".pi", "tower-do"), { recursive: true });
+  mkdirSync(join(reservedDir, ".pi", "agent", "tower-do"), { recursive: true });
   writeFileSync(
-    join(reservedDir, ".pi", "tower-do", "config.json"),
+    join(reservedDir, ".pi", "agent", "tower-do", "config.json"),
     '{ "identity": "tower" }',
   );
   let reservedMsg = "";
