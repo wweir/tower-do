@@ -107,6 +107,7 @@ import {
   latestBoardCheckpoint,
   LIVE_HEARTBEAT_MS,
   LIVE_PRUNE_MS,
+  LIVE_WINDOW_MS,
   liveSessionCount,
   parseLiveRecord,
   MAX_FINDING_SUMMARY_CHARS,
@@ -118,6 +119,7 @@ import {
   parseActivityLine,
   relativeTime,
   retainMessages,
+  staleTaskOwners,
   taskIsBlocked,
   TOWER_DO_BOARD_TYPE,
   TOWER_DO_REMINDER_TYPE,
@@ -1542,7 +1544,7 @@ export default function towerDoExtension(pi: ExtensionAPI): void {
     description: `Maintain the shared multi-agent task board with one atomic update.
 - Full replacement: include every key to keep; omitting a key removes it.
 - Omitted optional fields on existing keys are preserved; new keys require subject and status.
-- Owner guard: a task with an owner can only be changed (any field) or removed by its owner or the "tower" identity.
+- Owner guard: a task with an owner can only be changed (any field) or removed by its owner or the "tower" identity. Exception: an owner idle for 30+ min (OWNER_TAKEOVER_MS) may be displaced on a non-completed task — set owner to yourself to adopt it, or remove it; completed tasks stay guarded.
 - Always pass baseRevision from tower_do_status; omitting it disables the stale-write check.
 - Up to ${MAX_TOWER_DO_TASKS} tasks. Optional per-task fields: dependsOn (must exist on the board or in this call), scope (file globs the task may touch), blockedBy (non-empty renders a non-completed task as blocked).`,
     promptSnippet:
@@ -1552,7 +1554,7 @@ export default function towerDoExtension(pi: ExtensionAPI): void {
       "When a task needs a plan of 3+ steps, define it yourself and call tower_do with subject + status before beginning substantive work.",
       "Include baseRevision (from tower_do_status) in every tower_do call; a stale revision is rejected so you never silently overwrite a peer's update.",
       "Mark a task completed only after implementation and verification succeed, attaching changedFiles (files you actually changed, repo-relative) in the same call. Use status blocked with a blockedBy note instead of leaving it hanging.",
-      "Claim shared tasks by setting owner and in_progress together. Only the owner or the orchestrator identity tower may change an owned task's fields or remove it — to remove or reassign another agent's task, message the owner via tower_do_talk instead of editing it directly.",
+      "Claim shared tasks by setting owner and in_progress together. Only the owner or the orchestrator identity tower may change an owned task's fields or remove it — to remove or reassign another agent's task, message the owner via tower_do_talk instead of editing it directly. If a task's owner has been idle for 30+ minutes, you may adopt it (set owner to yourself) or remove it while it is not completed; completed tasks stay with their owner.",
       "Reconcile actual progress with the shared board before your final response, and do not issue a no-op tower_do call only to acknowledge a reminder.",
     ],
     parameters: TowerDoParamsSchema,
@@ -1568,10 +1570,73 @@ export default function towerDoExtension(pi: ExtensionAPI): void {
         throwIfAborted(signal, "TowerDo update");
         const freshView = await foldRetained(ctx.cwd);
         throwIfAborted(signal, "TowerDo update");
+        // Stale-owner eligibility needs board-wide last-activity and is a
+        // PERMISSION gate, so it reads the FULL log (rawLines) — a bounded
+        // tail could truncate an active owner's recent events in a churny
+        // fleet and let a peer displace them. fold() already reads the whole
+        // file, so the full scan adds no asymptotic cost. A missing log
+        // disables the takeover exception (no stale owners) rather than
+        // loosening the guard.
+        let activity: ActivityEntry[] = [];
+        let activityReadOk = true;
+        try {
+          activity = (await board.rawLines())
+            .reverse()
+            .map((line) => parseActivityLine(line))
+            .filter((entry): entry is ActivityEntry => entry !== undefined);
+        } catch {
+          // Unreadable log → the owner guard stays strict (the derivation
+          // below is skipped — an empty-activity fallback would judge every
+          // owner by updatedAt alone); the write itself must still land.
+          activityReadOk = false;
+        }
+        // Liveness tiebreaker: an owner whose process still heartbeats is
+        // never stale, however quiet on the board. Read failure → treat
+        // EVERY owner as live (strict guard), mirroring the activity read
+        // above. Cheap local scan — refreshLiveSessions owns the widget's
+        // count, not the identities this gate needs.
+        let liveOwners = new Set(
+          freshView.tasks
+            .map((task) => task.owner)
+            .filter((owner): owner is string => owner !== undefined),
+        );
+        try {
+          const nowMs = Date.now();
+          const parsed = new Set<string>();
+          const dir = liveDirFor(ctx.cwd);
+          for (const name of await readdir(dir)) {
+            // Only .json counts: skips .tmp rename intermediates of peers.
+            if (!name.endsWith(".json")) continue;
+            const record = parseLiveRecord(
+              await readFile(join(dir, name), "utf8"),
+            );
+            if (record !== undefined && record.at >= nowMs - LIVE_WINDOW_MS)
+              parsed.add(record.identity);
+          }
+          // Assign only after the ENTIRE scan succeeded: a mid-scan failure
+          // (peer exit race, permission error) must keep the all-owners set —
+          // a partial set would loosen the guard exactly when data is broken.
+          liveOwners = parsed;
+        } catch {
+          // No/unreadable live dir → no liveness data → no takeover.
+        }
+        // Only derive the stale set from FULL gate data: on an activity read
+        // failure the updatedAt fallback would judge owners with no log at
+        // all, so no stale owners — strict guard — is the only safe answer.
+        const staleOwners = activityReadOk
+          ? staleTaskOwners(
+              activity,
+              freshView.tasks,
+              Date.now(),
+              undefined,
+              liveOwners,
+            )
+          : new Set<string>();
         const details = writeBoardSnapshot(
           freshView,
           { tasks: params.tasks, baseRevision: params.baseRevision },
           caller,
+          staleOwners,
         );
         throwIfAborted(signal, "TowerDo update");
         await board.append(details.taskEvents);
@@ -1579,18 +1644,12 @@ export default function towerDoExtension(pi: ExtensionAPI): void {
         llmCallsSinceReminder = 0;
         updateWidget(ctx);
         // Presence footnote: surface owners who own unfinished tasks but have
-        // no recent activity, so a coordinator sees who may be stalled.
+        // no recent activity, so a coordinator sees who may be stalled. The
+        // Same parsed activity as the takeover check above — full history
+        // makes the idle mark strictly more accurate than the old 200-line
+        // tail.
         const now = Date.now();
-        let tail: string[] = [];
-        try {
-          tail = (await board.rawTail(200)).reverse();
-        } catch {
-          // Presence footnote is best-effort; the write already landed.
-        }
-        const parsed = tail
-          .map((line) => parseActivityLine(line))
-          .filter((entry): entry is ActivityEntry => entry !== undefined);
-        const presence = derivePresence(parsed, details.view.tasks, now);
+        const presence = derivePresence(activity, details.view.tasks, now);
         const idleOwners = presence.filter(
           (line) =>
             line.idle &&
@@ -1611,7 +1670,7 @@ export default function towerDoExtension(pi: ExtensionAPI): void {
                 )
                 .join(
                   ", ",
-                )} — message them or re-claim via tower (tower_do_talk)`;
+                )} — message them (tower_do_talk), adopt their task via tower_do (set owner to yourself, 30+ min idle), or re-claim via tower`;
         return {
           content: [{ type: "text", text: base + footnote }],
           details: {

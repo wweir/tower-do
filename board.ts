@@ -227,6 +227,19 @@ export class TowerBoard {
       .filter((line) => line.length > 0)
       .slice(-lines);
   }
+
+  /** Full event log (newest lines last). The whole file is read on every
+   * fold() anyway, so callers needing a COMPLETE activity view (the
+   * stale-owner permission gate, which must never misread an active owner
+   * as idle because their events fell out of a bounded tail) pay no extra
+   * asymptotic cost. I/O errors throw like rawTail. */
+  async rawLines(): Promise<string[]> {
+    const raw = await readFile(this.file, "utf8");
+    return raw
+      .split("\n")
+      .map((line) => line.trim())
+      .filter((line) => line.length > 0);
+  }
 }
 
 export interface TowerDoConfig {

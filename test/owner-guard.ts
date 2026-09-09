@@ -14,8 +14,11 @@
  */
 import {
   createEmptyBoard,
+  staleTaskOwners,
   writeBoardSnapshot,
+  type ActivityEntry,
   type TowerDoStatus,
+  type TowerDoTask,
 } from "../state.ts";
 
 let failures = 0;
@@ -355,6 +358,320 @@ async function main(): Promise<void> {
   check(
     "unowned task content may be edited by anyone",
     wUnowned2.view.tasks[0].subject === "rewritten by bob",
+  );
+
+  // --- stale-owner takeover: an idle owner's unfinished work is adoptable ---
+
+  const NOW = 1_800_000_000_000;
+  const MIN = 60_000;
+  const activityEntry = (by: string, at: number): ActivityEntry => ({
+    kind: "task",
+    by,
+    at,
+    glyph: "○",
+    detail: "activity",
+  });
+  const handTask = (over: Partial<TowerDoTask>): TowerDoTask => ({
+    key: "t",
+    subject: "t",
+    status: "pending",
+    dependsOn: [],
+    blockedBy: [],
+    updatedAt: NOW - 40 * MIN,
+    ...over,
+  });
+
+  // Pure derivation: idle owner of an open task is stale; completed rows,
+  // fresh activity, and freshly assigned never-started work are not.
+  const tasksForDerivation = [
+    handTask({ key: "idle", subject: "i", status: "in_progress", owner: "A" }),
+    handTask({ key: "done", subject: "d", status: "completed", owner: "A" }),
+    handTask({
+      key: "fresh",
+      subject: "f",
+      status: "in_progress",
+      owner: "B",
+      updatedAt: NOW - 40 * MIN,
+    }),
+    handTask({ key: "never", subject: "n", owner: "C" }),
+    handTask({
+      key: "assigned",
+      subject: "a",
+      owner: "D",
+      updatedAt: NOW - 1 * MIN, // fresh assignment, not begun yet
+    }),
+    handTask({ key: "open", subject: "o" }),
+  ];
+  const stale = staleTaskOwners(
+    [activityEntry("A", NOW - 40 * MIN), activityEntry("B", NOW - 1 * MIN)],
+    tasksForDerivation,
+    NOW,
+  );
+  check(
+    "staleTaskOwners marks idle owner + long-assigned never-started owner",
+    stale.has("A") && stale.has("C") && !stale.has("B") && !stale.has("D"),
+    [...stale].join(","),
+  );
+
+  // Liveness tiebreaker: an owner whose process still heartbeats is never
+  // stale, however quiet it has been on the board.
+  const withLive = staleTaskOwners(
+    [activityEntry("A", NOW - 40 * MIN), activityEntry("B", NOW - 1 * MIN)],
+    tasksForDerivation,
+    NOW,
+    undefined,
+    new Set(["A", "C"]),
+  );
+  check(
+    "fresh liveness heartbeat keeps a board-quiet owner from takeover",
+    withLive.size === 0,
+    [...withLive].join(","),
+  );
+
+  // No activity data at all (unreadable/garbage log) disables the exception:
+  // the updatedAt fallback is only sound when the log exists.
+  check(
+    "empty activity log disables the takeover exception entirely",
+    staleTaskOwners([], tasksForDerivation, NOW).size === 0,
+  );
+
+  // Board: A owns an in_progress task and went quiet 40 min ago.
+  const idleBoard = writeBoardSnapshot(
+    createEmptyBoard(),
+    {
+      tasks: [
+        {
+          key: "stale-task",
+          subject: "stalled",
+          status: "in_progress",
+          owner: "A",
+        },
+        {
+          key: "stale-done",
+          subject: "delivered",
+          status: "completed",
+          owner: "A",
+          changedFiles: ["x.ts"],
+        },
+        {
+          key: "fresh-task",
+          subject: "active",
+          status: "in_progress",
+          owner: "B",
+        },
+      ],
+    },
+    "A",
+  );
+  const idleView = idleBoard.view;
+  const STALE = new Set(["A"]); // A idle; B fresh
+
+  // Takeover: C adopts the idle owner's in_progress task by claiming it.
+  const adopted = writeBoardSnapshot(
+    idleView,
+    {
+      tasks: [
+        {
+          key: "stale-task",
+          subject: "stalled",
+          status: "in_progress",
+          owner: "C", // adopt
+        },
+        {
+          key: "stale-done",
+          subject: "delivered",
+          status: "completed",
+          owner: "A",
+          changedFiles: ["x.ts"],
+        },
+        {
+          key: "fresh-task",
+          subject: "active",
+          status: "in_progress",
+          owner: "B",
+        },
+      ],
+      baseRevision: idleView.revision,
+    },
+    "C",
+    STALE,
+  );
+  check(
+    "idle owner's non-completed task may be adopted by setting owner to self",
+    adopted.view.tasks.find((t) => t.key === "stale-task")?.owner === "C",
+  );
+
+  // But the adopter cannot rewrite the stalled content WITHOUT taking over:
+  // the guard stays, only the hint changes.
+  expectThrows(
+    "idle owner's task content edit without adoption is still rejected",
+    () =>
+      writeBoardSnapshot(
+        idleView,
+        {
+          tasks: [
+            {
+              key: "stale-task",
+              subject: "HACKED",
+              status: "in_progress",
+              owner: "A",
+            },
+            {
+              key: "stale-done",
+              subject: "delivered",
+              status: "completed",
+              owner: "A",
+              changedFiles: ["x.ts"],
+            },
+            {
+              key: "fresh-task",
+              subject: "active",
+              status: "in_progress",
+              owner: "B",
+            },
+          ],
+          baseRevision: idleView.revision,
+        },
+        "C",
+        STALE,
+      ),
+    /adopt it by setting owner to yourself/,
+  );
+
+  // Removal of the idle owner's unfinished task is allowed.
+  const dropped = writeBoardSnapshot(
+    idleView,
+    {
+      tasks: [
+        {
+          key: "stale-done",
+          subject: "delivered",
+          status: "completed",
+          owner: "A",
+          changedFiles: ["x.ts"],
+        },
+        {
+          key: "fresh-task",
+          subject: "active",
+          status: "in_progress",
+          owner: "B",
+        },
+      ],
+      baseRevision: idleView.revision,
+    },
+    "C",
+    STALE,
+  );
+  check(
+    "idle owner's non-completed task may be removed by anyone",
+    !dropped.view.tasks.some((t) => t.key === "stale-task"),
+  );
+
+  // A completed task stays with its owner even when the owner is idle —
+  // a peer cannot drop or forge a delivery receipt.
+  expectThrows(
+    "idle owner's completed task cannot be removed by a peer",
+    () =>
+      writeBoardSnapshot(
+        idleView,
+        {
+          tasks: [
+            {
+              key: "stale-task",
+              subject: "stalled",
+              status: "in_progress",
+              owner: "A",
+            },
+            {
+              key: "fresh-task",
+              subject: "active",
+              status: "in_progress",
+              owner: "B",
+            },
+          ],
+          baseRevision: idleView.revision,
+        },
+        "C",
+        STALE,
+      ),
+    /completed task stays with its owner/,
+  );
+
+  // A fresh owner is not adoptable: takeover attempt is rejected, no hint.
+  try {
+    writeBoardSnapshot(
+      idleView,
+      {
+        tasks: [
+          {
+            key: "stale-task",
+            subject: "stalled",
+            status: "in_progress",
+            owner: "A",
+          },
+          {
+            key: "stale-done",
+            subject: "delivered",
+            status: "completed",
+            owner: "A",
+            changedFiles: ["x.ts"],
+          },
+          {
+            key: "fresh-task",
+            subject: "active",
+            status: "in_progress",
+            owner: "C", // B is active — this must fail
+          },
+        ],
+        baseRevision: idleView.revision,
+      },
+      "C",
+    );
+    check("fresh owner takeover rejected", false, "no error thrown");
+  } catch (error) {
+    const message = error instanceof Error ? error.message : String(error);
+    check(
+      "fresh owner takeover rejected, without takeover hint",
+      /owned by "B"/.test(message) && !message.includes("idle"),
+      message.slice(0, 140),
+    );
+  }
+
+  // Adoption is ownership-only: the adopter cannot smuggle a content edit
+  // into the same write (it may re-plan in a second write once it owns it).
+  expectThrows(
+    "adoption cannot carry a content edit in the same write",
+    () =>
+      writeBoardSnapshot(
+        idleView,
+        {
+          tasks: [
+            {
+              key: "stale-task",
+              subject: "REPLANNED-WHILE-ADOPTING",
+              status: "in_progress",
+              owner: "C",
+            },
+            {
+              key: "stale-done",
+              subject: "delivered",
+              status: "completed",
+              owner: "A",
+              changedFiles: ["x.ts"],
+            },
+            {
+              key: "fresh-task",
+              subject: "active",
+              status: "in_progress",
+              owner: "B",
+            },
+          ],
+          baseRevision: idleView.revision,
+        },
+        "C",
+        STALE,
+      ),
+    /adopt it by setting owner to yourself/,
   );
 
   // --- summary ---

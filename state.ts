@@ -269,6 +269,9 @@ export function writeBoardSnapshot(
   current: TowerBoardView,
   input: TowerDoSnapshotInput,
   caller: string,
+  /** Owners eligible for takeover (staleTaskOwners); empty keeps the guard
+   * strict — the default is what every non-board-aware caller wants. */
+  staleOwners: ReadonlySet<string> = new Set(),
 ): TowerDoWriteDetails {
   if (
     input.baseRevision !== undefined &&
@@ -362,14 +365,21 @@ export function writeBoardSnapshot(
   // Tower: workers may remove only their own (or unowned) tasks; the
   // orchestrator may remove any. Without this, a partial-list update or a
   // stray `tasks: []` would silently delete another agent's task.
+  // Stale-owner exception: an owner idle past OWNER_TAKEOVER_MS may have its
+  // unfinished work removed by anyone (adoption via update is the gentler
+  // path, but a hopeless task should not need an adopter first). Completed
+  // tasks keep the full guard — a receipt cannot be dropped by a peer.
   for (const removed of removedTasks) {
     if (
       removed.owner !== undefined &&
       caller !== removed.owner &&
       caller !== TOWER_IDENTITY
     ) {
+      if (staleOwners.has(removed.owner) && removed.status !== "completed")
+        continue;
       throw new TowerDoValidationError(
-        `task ${removed.key} is owned by "${removed.owner}" — only its owner or ${TOWER_IDENTITY} may remove it`,
+        `task ${removed.key} is owned by "${removed.owner}" — only its owner or ${TOWER_IDENTITY} may remove it` +
+          staleOwnerHint(removed, staleOwners),
       );
     }
   }
@@ -418,14 +428,34 @@ export function writeBoardSnapshot(
     // fields (removal is guarded separately above). We only reach this point
     // when taskEquals found a real field change, so a plain ownership check
     // suffices — the every-field comparison already happened.
+    // Stale-owner exception (takeover/adopt): strictly an ownership
+    // displacement — the candidate must equal the existing task except for
+    // owner === caller. Any content edit (subject/status/deps/scope/…) of a
+    // stalled task stays rejected; the adopter re-plans in a second write
+    // once it owns the task. This keeps the every-field guard's promise
+    // intact: a peer can displace a dead ownership, never silently rewrite
+    // someone's content or forge a receipt.
+    const adoptingStale =
+      existing.owner !== undefined &&
+      staleOwners.has(existing.owner) &&
+      existing.status !== "completed" &&
+      task.owner === caller &&
+      taskEquals(
+        { ...existing, owner: task.owner },
+        // taskEquals ignores updatedAt; the spread only satisfies its
+        // TowerDoTask parameter (a resolved input carries no timestamp).
+        { ...task, updatedAt: existing.updatedAt },
+      );
     if (
       existing.owner !== undefined &&
       caller !== existing.owner &&
-      caller !== TOWER_IDENTITY
+      caller !== TOWER_IDENTITY &&
+      !adoptingStale
     ) {
       throw new TowerDoValidationError(
         `task ${task.key} is owned by "${existing.owner}" — workers may update only their own tasks ` +
-          `(${TOWER_IDENTITY} may update any)`,
+          `(${TOWER_IDENTITY} may update any)` +
+          staleOwnerHint(existing, staleOwners),
       );
     }
     updated.push(task.key);
@@ -1479,6 +1509,77 @@ export function derivePresence(
   return lines;
 }
 
+/** Idle threshold after which the owner of a non-completed task becomes
+ * adoptable/removable by anyone (see staleTaskOwners). Deliberately far
+ * beyond PRESENCE_IDLE_MS (10 min, a display-only stall hint): a worker deep
+ * in a long tool call or a coding stretch may legitimately go quiet for tens
+ * of minutes without touching the board, and a takeover must not race
+ * someone who is merely heads-down. Same value as SESSION_BREAK_GAP_MS —
+ * past a session break the owner is invisible to every coordinator, and the
+ * old advice ("message them or re-claim via tower") had no working path:
+ * the owner guard rejected everyone except `tower`. */
+export const OWNER_TAKEOVER_MS = SESSION_BREAK_GAP_MS;
+
+/**
+ * Owners eligible for takeover: they own at least one non-completed task and
+ * are unreachable on the board — last board activity older than `idleMs`, or
+ * never active at all with the task itself untouched for longer than
+ * `idleMs` (a long-assigned never-started task; a fresh assignment keeps a
+ * fresh `updatedAt`, so "just assigned, not begun yet" stays protected —
+ * the same unstarted/is-idle distinction derivePresence makes). Pure read
+ * derivation; never writes to the board.
+ */
+export function staleTaskOwners(
+  entries: readonly ActivityEntry[],
+  tasks: readonly TowerDoTask[],
+  now: number,
+  idleMs: number = OWNER_TAKEOVER_MS,
+  /** Identities with a fresh liveness-sidecar record (`live/`,
+   * LIVE_WINDOW_MS): a running process is never stale, however quiet it has
+   * been on the board — the heartbeat exists precisely to separate "alive
+   * but heads-down" from "exited / crashed". Callers who cannot read the
+   * sidecar should pass EVERY owner here: no liveness data must disable
+   * the exception, not loosen it. */
+  liveOwners: ReadonlySet<string> = new Set(),
+): Set<string> {
+  const lastSeen = new Map<string, number>();
+  for (const entry of entries) {
+    const prior = lastSeen.get(entry.by);
+    if (prior === undefined || entry.at > prior)
+      lastSeen.set(entry.by, entry.at);
+  }
+  const stale = new Set<string>();
+  // No activity data at all (unreadable / garbage log) must disable the
+  // exception, not loosen it: the updatedAt fallback below is only sound
+  // when the log EXISTS but simply has no events by that owner (the
+  // unstarted rule). An empty board log cannot happen for a real board —
+  // task-creation events are always parseable.
+  if (entries.length === 0) return stale;
+  for (const task of tasks) {
+    if (
+      task.owner === undefined ||
+      task.status === "completed" ||
+      liveOwners.has(task.owner)
+    )
+      continue;
+    const quietSince = lastSeen.get(task.owner) ?? task.updatedAt;
+    if (now - quietSince > idleMs) stale.add(task.owner);
+  }
+  return stale;
+}
+
+/** Actionable hint appended to owner-guard errors when the owner is stale:
+ * the rejection stays, but the caller learns the one legal move they have. */
+function staleOwnerHint(
+  task: TowerDoTask,
+  staleOwners: ReadonlySet<string>,
+): string {
+  if (!staleOwners.has(task.owner!)) return "";
+  if (task.status === "completed")
+    return " (owner idle, but a completed task stays with its owner — receipt integrity)";
+  return ` (owner idle ${Math.round(OWNER_TAKEOVER_MS / 60_000)}+ min: adopt it by setting owner to yourself, or remove it)`;
+}
+
 /** Heartbeat cadence for the per-session liveness sidecar (`live/<sessionId>.json`, see index.ts): each session rewrites its own record on this cadence. */
 export const LIVE_HEARTBEAT_MS = 30_000;
 
@@ -1680,6 +1781,7 @@ export function formatBoardReminder(
       "If your work changed (or should change) any task's status, owner, or deps, write it via tower_do " +
       `with baseRevision ${view.revision} — attach changedFiles (files you actually changed) when completing. ` +
       "To coordinate, message the task owner or file a finding via tower_do_talk instead of silently changing tasks you don't own. " +
+      "An owner idle for 30+ minutes (OWNER_TAKEOVER_MS) may be displaced: adopt the non-completed task by setting owner to yourself, or remove it. " +
       "Do not call tower_do only to acknowledge this reminder.",
   );
   return lines.join("\n");

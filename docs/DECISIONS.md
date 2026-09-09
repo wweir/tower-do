@@ -4,6 +4,58 @@
 > / reviews live in docs/plans + docs/reviews and get folded here when they
 > become durable rules.
 
+## 2026-09 — stale-owner takeover: idle ownership is displaceable
+
+**Context.** The owner guard (every-field, worker/owner/`tower` only) pins a
+task to its owner forever — by design for content and receipts, but fatal for
+ownership itself: a session that exits (cleanly or not) leaves its non-completed
+tasks permanently stuck, and the only documented recourse ("message them or
+re-claim via tower") had no working path — a peer messaging the owner got no
+answer, and only the orchestrator identity could act. Boards accumulated
+`pending` rows pinned by owners no session could ever displace.
+
+**Decision.** Ownership itself is a claim on availability, so it gets a
+liveness rule of its own: an owner of a non-completed task whose last board
+activity is older than `OWNER_TAKEOVER_MS` (= `SESSION_BREAK_GAP_MS`, 30 min)
+— or who never started and whose task has sat untouched that long — is
+displaceable (`staleTaskOwners` in state.ts, pure derivation; `tower_do`
+feeds it the full activity log and the liveness sidecar records). A peer may **adopt** (set `owner` to
+itself, strictly nothing else — `taskEquals` against the existing task minus
+the owner swap) or **remove** the non-completed task. Completed tasks keep the
+full guard: a receipt cannot be dropped or forged by a peer, however idle its
+author. The liveness sidecar is the tiebreaker between "exited / crashed"
+and "alive but heads-down": an owner with a fresh `live/` heartbeat record
+(`LIVE_WINDOW_MS`) is never stale, however quiet on the board — and no
+liveness data (unreadable sidecar dir) disables the exception rather than
+loosening it. `tower_do` errors carry an actionable hint when they reject a
+stale-owned task ("adopt it by setting owner to yourself"), and the gate
+reads on itself: no activity log → no stale owners → strict guard. Because
+this is a permission gate, it reads the FULL board log (`TowerBoard.rawLines`,
+the same file `fold()` already reads) — a bounded tail could truncate an
+active owner's recent events in a churny fleet and let a peer displace them.
+
+Properties: the threshold is far beyond the 10-minute display-only idle mark
+(`PRESENCE_IDLE_MS`) so a heads-down worker is never raced; a fresh
+assignment is protected by its fresh `updatedAt` ("just assigned, not begun
+yet" stays unstartable — the unstarted/idle distinction derivePresence
+already makes); adoption is ownership-only, so the every-field guard's
+promise survives (a peer can displace a dead claim, never silently rewrite
+content). Unowned pending rows are deliberately NOT expired — backlog that
+nobody claimed is work, not garbage; the exit mechanism keeps cleaning only
+the liveness sidecar, and task lifecycle stays explicit.
+
+**Rejected.** Auto-clearing owners on `session_shutdown` (a clean exit says
+nothing about the work being abandoned, and the board is cross-session —
+losing the claim history would orphan legitimately unfinished work);
+releasing owned tasks after `PRESENCE_IDLE_MS` (10 min: races a worker in a
+long tool call); letting the adopter re-plan in the same write (adoption plus
+arbitrary content edits would bypass the every-field guard — the adopter can
+re-plan in a second write once it owns the task); expiring unowned pending
+tasks (backlog, not garbage); deriving staleness from board activity alone
+(the sidecar heartbeat already answers "is the process still there?" —
+ignoring it would let a peer displace a worker who is 30 minutes deep in a
+coding stretch and has not touched the board).
+
 ## 2026-09 — widget `live N`: per-session liveness sidecar, watched
 
 **Context.** The widget should show how many sessions are concurrently

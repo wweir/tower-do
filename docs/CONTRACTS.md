@@ -64,6 +64,31 @@ Unowned tasks may be edited/removed by anyone. Rationale: with full-replacement
 semantics, a worker replaying the board could otherwise silently rewrite
 another owner's content or roll back a concurrent update.
 
+### Stale-owner exception (takeover)
+
+An owner of a non-completed task whose last board activity is older than
+`OWNER_TAKEOVER_MS` (= `SESSION_BREAK_GAP_MS`, 30 min) — or who never started
+at all and whose task has sat untouched that long — is *displaceable*
+(`staleTaskOwners`, pure derivation over board activity + task timestamps):
+
+- **adopt**: a peer may set `owner` to itself — and nothing else; the write
+  must equal the existing task except for the owner swap. Content edits of a
+  stalled task stay rejected; the adopter re-plans in a second write once it
+  owns the task.
+- **remove**: the non-completed task may be dropped by anyone (a hopeless
+  task should not need an adopter first).
+- **liveness tiebreaker**: an owner whose process still heartbeats (fresh
+  `live/<id>.*.json` record within `LIVE_WINDOW_MS`) is never stale, however
+  quiet on the board — "alive but heads-down" is what the sidecar was built
+  to distinguish from "exited / crashed". No liveness data (unreadable
+  sidecar dir) disables the exception, it never loosens it.
+
+Completed tasks keep the full guard even when their owner is idle — a delivery
+receipt cannot be dropped or forged by a peer. A fresh assignment is protected
+(an owner with no activity whose task `updatedAt` is recent is "just assigned,
+not begun yet", not stalled); a missing/unreadable activity log disables the
+exception (no stale owners) rather than loosening the guard.
+
 ## Message contracts
 
 - Recipient must be a current task owner, `tower`, `all`, or an identity with
@@ -90,8 +115,8 @@ bun install            # devDeps (bun-types + typescript) — typecheck/tests on
 bunx tsc --noEmit -p tsconfig.json      # strict + noUnused, zero errors
 bun run test/smoke.ts               # end-to-end: 3 tools, persistence, scoping, changedFiles disk round-trip
 bun run test/config.ts              # config fail-loud + reserved identity (11 cases)
-bun run test/owner-guard.ts         # every-field owner guard (10 cases)
-bun run test/presence-retention.ts  # read receipts / retirement / presence / caller-line match / checkpoints (61)
+bun run test/owner-guard.ts         # every-field owner guard + stale-owner takeover (19 cases)
+bun run test/presence-retention.ts  # read receipts / retirement / presence / caller-line match / checkpoints (66)
 bun run test/changed-files.ts       # P0 receipt invariants (12 cases)
 bun run test/scope-conflicts.ts     # P1 glob + conflict derivation (17 cases)
 bun run test/git-count.ts           # widget git-segment pure derivations (24 cases)
