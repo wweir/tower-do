@@ -81,7 +81,9 @@ at all and whose task has sat untouched that long — is *displaceable*
   `live/<id>.*.json` record within `LIVE_WINDOW_MS`) is never stale, however
   quiet on the board. The record identity *and* its `aliases` (`as` labels
   that session has written as) populate `liveOwners`; `live N` still counts
-  identity only. No liveness data (unreadable sidecar dir) disables the
+  identity only. Aliases are capped at `MAX_TOWER_DO_TASKS`; a session that
+  tries to record a further distinct `as` fails loud rather than dropping
+  the label. No liveness data (unreadable sidecar dir) disables the
   exception, it never loosens it.
 
 Completed tasks keep the full guard even when their owner is idle — a delivery
@@ -121,7 +123,7 @@ bun run test/presence-retention.ts  # read receipts / retirement / presence / ca
 bun run test/changed-files.ts       # P0 receipt invariants (12 cases)
 bun run test/scope-conflicts.ts     # P1 glob + conflict derivation (17 cases)
 bun run test/git-count.ts           # widget git-segment pure derivations (24 cases)
-bun run test/live-sessions.ts       # widget live-segment liveness window + sidecar-record parsing (29 cases)
+bun run test/live-sessions.ts       # widget live-segment liveness window + sidecar-record parsing (30 cases)
 bun run test/board-progress.ts      # widget board-progress remaining-work glance (8 cases)
 bun run test/mine-first.ts          # glance/reminder mine-first order (10 cases)
 ```

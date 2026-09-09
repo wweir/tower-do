@@ -111,7 +111,6 @@ import {
   LIVE_WINDOW_MS,
   liveOwnerIdentities,
   liveSessionCount,
-  MAX_LIVE_ALIASES,
   parseLiveRecord,
   MAX_FINDING_SUMMARY_CHARS,
   MAX_FINDING_TITLE_CHARS,
@@ -1181,7 +1180,11 @@ export default function towerDoExtension(pi: ExtensionAPI): void {
     if (caller === self || caller === "" || caller === "all") return;
     const aliases = aliasesFor(cwd);
     if (aliases.has(caller)) return;
-    if (aliases.size >= MAX_LIVE_ALIASES) return;
+    if (aliases.size >= MAX_TOWER_DO_TASKS) {
+      throw new TowerDoValidationError(
+        `as identities this session can remember at most ${String(MAX_TOWER_DO_TASKS)} aliases for liveness (got "${caller}")`,
+      );
+    }
     aliases.add(caller);
     void writeSelfLive(cwd);
   };

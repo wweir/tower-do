@@ -21,6 +21,7 @@ import {
   LIVE_WINDOW_MS,
   liveOwnerIdentities,
   liveSessionCount,
+  MAX_TOWER_DO_TASKS,
   parseLiveRecord,
   type LiveRecord,
 } from "../state.ts";
@@ -177,6 +178,20 @@ eq(
   liveOwnerIdentities({ identity: "alice", at: 1 }).join(","),
   "alice",
 );
+{
+  const extras = Array.from(
+    { length: MAX_TOWER_DO_TASKS + 1 },
+    (_, i) => `as-${String(i)}`,
+  );
+  const parsed = parseLiveRecord(
+    JSON.stringify({ identity: "alice", at: 1, aliases: extras }),
+  );
+  eq(
+    "parse keeps at most MAX_TOWER_DO_TASKS aliases",
+    parsed?.aliases?.length,
+    MAX_TOWER_DO_TASKS,
+  );
+}
 
 // 4. formatLiveSegment.
 eq("zero renders empty", formatLiveSegment(0), "");

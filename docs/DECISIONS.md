@@ -89,7 +89,8 @@ and "alive but heads-down": an owner with a fresh `live/` heartbeat record
 `identity` is the session identity; `aliases` are extra owner labels this
 session has written as (`as: "coder-1"`) so a parent recording work for a
 subagent stays protected while its process heartbeats. `live N` still counts
-identity only — aliases do not inflate the widget. No liveness data
+identity only — aliases do not inflate the widget. Alias count is capped at
+`MAX_TOWER_DO_TASKS`; exceeding it on write is an error, not a silent drop. No liveness data
 (unreadable sidecar dir) disables the exception rather than loosening it. `tower_do` errors carry an actionable hint when they reject a
 stale-owned task ("adopt it by setting owner to yourself"), and the gate
 reads on itself: no activity log → no stale owners → strict guard. Because

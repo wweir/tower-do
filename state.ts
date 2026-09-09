@@ -1604,8 +1604,7 @@ export interface LiveRecord {
   aliases?: string[];
 }
 
-/** Cap on sidecar `aliases` (as-labels this session has acted as). */
-export const MAX_LIVE_ALIASES = 20;
+
 
 /** Parse the raw JSON content of a liveness sidecar file. Corrupt or
  * foreign content returns undefined (caller skips the file). */
@@ -1630,7 +1629,7 @@ function readLiveAliases(value: unknown): string[] | undefined {
   const out: string[] = [];
   const seen = new Set<string>();
   for (const item of value) {
-    if (out.length >= MAX_LIVE_ALIASES) break;
+    if (out.length >= MAX_TOWER_DO_TASKS) break;
     if (typeof item !== "string") continue;
     const id = item.trim();
     if (id === "" || id === "all" || id.length > 64) continue;
