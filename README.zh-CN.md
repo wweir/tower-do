@@ -85,7 +85,7 @@ pi 启动时自动发现扩展；已开会话用 `/reload` 加载。
 | [docs/OPERATIONS.md](docs/OPERATIONS.md) | 安装、配置、发布流程（tag → CI → npm）、排障 |
 | [English README](./README.md) | English version |
 
-质量门禁：`bunx tsc --noEmit` 加九个测试套件，在每次发版 tag 的 CI 上强制执行——清单与各套件证明的内容见 [docs/CONTRACTS.md](docs/CONTRACTS.md)。
+质量门禁：`bunx tsc --noEmit` 加十个测试套件，在每次发版 tag 的 CI 上强制执行——清单与各套件证明的内容见 [docs/CONTRACTS.md](docs/CONTRACTS.md)。
 
 参考：Kimi Tower 多 worker 编排设计（官方 Tower blog/docs）与参考扩展实现
 <https://github.com/99percentpeople/pi-extensions/blob/master/extensions/todo/index.ts>。

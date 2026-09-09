@@ -114,7 +114,7 @@ event semantics, and read derivations:
 | [docs/OPERATIONS.md](docs/OPERATIONS.md) | Install, config, release flow (tag → CI → npm), troubleshooting |
 | [README.zh-CN.md](./README.zh-CN.md) | 中文版说明 |
 
-Quality gate: `bunx tsc --noEmit` plus nine test suites, enforced in CI on
+Quality gate: `bunx tsc --noEmit` plus ten test suites, enforced in CI on
 every release tag — the list and what each suite proves live in
 [docs/CONTRACTS.md](docs/CONTRACTS.md).
 

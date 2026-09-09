@@ -85,9 +85,12 @@ the owner swap) or **remove** the non-completed task. Completed tasks keep the
 full guard: a receipt cannot be dropped or forged by a peer, however idle its
 author. The liveness sidecar is the tiebreaker between "exited / crashed"
 and "alive but heads-down": an owner with a fresh `live/` heartbeat record
-(`LIVE_WINDOW_MS`) is never stale, however quiet on the board — and no
-liveness data (unreadable sidecar dir) disables the exception rather than
-loosening it. `tower_do` errors carry an actionable hint when they reject a
+(`LIVE_WINDOW_MS`) is never stale, however quiet on the board. The record's
+`identity` is the session identity; `aliases` are extra owner labels this
+session has written as (`as: "coder-1"`) so a parent recording work for a
+subagent stays protected while its process heartbeats. `live N` still counts
+identity only — aliases do not inflate the widget. No liveness data
+(unreadable sidecar dir) disables the exception rather than loosening it. `tower_do` errors carry an actionable hint when they reject a
 stale-owned task ("adopt it by setting owner to yourself"), and the gate
 reads on itself: no activity log → no stale owners → strict guard. Because
 this is a permission gate, it reads the FULL board log (`TowerBoard.rawLines`,

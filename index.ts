@@ -109,7 +109,9 @@ import {
   LIVE_HEARTBEAT_MS,
   LIVE_PRUNE_MS,
   LIVE_WINDOW_MS,
+  liveOwnerIdentities,
   liveSessionCount,
+  MAX_LIVE_ALIASES,
   parseLiveRecord,
   MAX_FINDING_SUMMARY_CHARS,
   MAX_FINDING_TITLE_CHARS,
@@ -766,6 +768,9 @@ export default function towerDoExtension(pi: ExtensionAPI): void {
   // Set when a watcher event asked for a board re-fold during the debounce
   // window (OR-merged across sources); cleared when the refresh runs.
   let liveRefreshNeedsFold = false;
+  // Owner labels this session has written as (`as`), keyed by live dir so
+  // a cwd switch cannot leak aliases onto another board's sidecar.
+  const liveAsAliasesByDir = new Map<string, Set<string>>();
   // This session's liveness file path — computed ONCE in restore(). The
   // empty-session-id fallback is a fresh random UUID and identity can change
   // mid-session, so recomputing per call would churn the filename every
@@ -1162,6 +1167,25 @@ export default function towerDoExtension(pi: ExtensionAPI): void {
    * stable selfLivePath). Best-effort: a failed write degrades to self-only
    * counting via the liveSessionCount `self` union, never a wrong peer
    * count. */
+  const aliasesFor = (cwd: string): Set<string> => {
+    const dir = liveDirFor(cwd);
+    const existing = liveAsAliasesByDir.get(dir);
+    if (existing !== undefined) return existing;
+    const created = new Set<string>();
+    liveAsAliasesByDir.set(dir, created);
+    return created;
+  };
+
+  const rememberLiveAlias = (cwd: string, caller: string): void => {
+    const self = sessionIdentity(cwd, pi);
+    if (caller === self || caller === "" || caller === "all") return;
+    const aliases = aliasesFor(cwd);
+    if (aliases.has(caller)) return;
+    if (aliases.size >= MAX_LIVE_ALIASES) return;
+    aliases.add(caller);
+    void writeSelfLive(cwd);
+  };
+
   const writeSelfLive = async (cwd: string): Promise<void> => {
     if (selfLivePath === undefined) return;
     try {
@@ -1169,7 +1193,13 @@ export default function towerDoExtension(pi: ExtensionAPI): void {
       const tmp = `${selfLivePath}.${randomUUID()}.tmp`;
       await writeFile(
         tmp,
-        JSON.stringify({ identity: sessionIdentity(cwd, pi), at: Date.now() }),
+        JSON.stringify({
+          identity: sessionIdentity(cwd, pi),
+          at: Date.now(),
+          ...(aliasesFor(cwd).size > 0
+            ? { aliases: [...aliasesFor(cwd)] }
+            : {}),
+        }),
       );
       await rename(tmp, selfLivePath);
     } catch {
@@ -1527,6 +1557,7 @@ export default function towerDoExtension(pi: ExtensionAPI): void {
     currentView = view;
     uiContext = ctx;
     const caller = resolveCaller(as, ctx.cwd, pi);
+    rememberLiveAlias(ctx.cwd, caller);
     return { board: entry.board, caller, view };
   };
 
@@ -1616,8 +1647,9 @@ export default function towerDoExtension(pi: ExtensionAPI): void {
             const record = parseLiveRecord(
               await readFile(join(dir, name), "utf8"),
             );
-            if (record !== undefined && record.at >= nowMs - LIVE_WINDOW_MS)
-              parsed.add(record.identity);
+            if (record !== undefined && record.at >= nowMs - LIVE_WINDOW_MS) {
+              for (const id of liveOwnerIdentities(record)) parsed.add(id);
+            }
           }
           // Assign only after the ENTIRE scan succeeded: a mid-scan failure
           // (peer exit race, permission error) must keep the all-owners set —
@@ -2739,5 +2771,6 @@ export default function towerDoExtension(pi: ExtensionAPI): void {
     // mid-session). Within a session the cache is deliberately stable — moving
     // the board file mid-session would orphan earlier events (split-brain).
     projectRootCache.clear();
+    liveAsAliasesByDir.clear();
   });
 }

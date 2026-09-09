@@ -427,6 +427,23 @@ async function main(): Promise<void> {
     withLive.size === 0,
     [...withLive].join(","),
   );
+  check(
+    "liveOwners alias protects an as-label owner with stale board activity",
+    staleTaskOwners(
+      [activityEntry("coder-1", NOW - 40 * MIN)],
+      [
+        handTask({
+          key: "child",
+          subject: "c",
+          status: "in_progress",
+          owner: "coder-1",
+        }),
+      ],
+      NOW,
+      undefined,
+      new Set(["alice", "coder-1"]),
+    ).size === 0,
+  );
 
   // No activity data at all (unreadable/garbage log) disables the exception:
   // the updatedAt fallback is only sound when the log exists.
@@ -595,6 +612,40 @@ async function main(): Promise<void> {
         STALE,
       ),
     /completed task stays with its owner/,
+  );
+  expectThrows(
+    "idle owner's completed task cannot have its owner swapped by a peer",
+    () =>
+      writeBoardSnapshot(
+        idleView,
+        {
+          tasks: [
+            {
+              key: "stale-task",
+              subject: "stalled",
+              status: "in_progress",
+              owner: "A",
+            },
+            {
+              key: "stale-done",
+              subject: "delivered",
+              status: "completed",
+              owner: "C",
+              changedFiles: ["x.ts"],
+            },
+            {
+              key: "fresh-task",
+              subject: "active",
+              status: "in_progress",
+              owner: "B",
+            },
+          ],
+          baseRevision: idleView.revision,
+        },
+        "C",
+        STALE,
+      ),
+    /owned by "A"/,
   );
 
   // A fresh owner is not adoptable: takeover attempt is rejected, no hint.

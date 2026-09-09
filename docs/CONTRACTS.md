@@ -79,9 +79,10 @@ at all and whose task has sat untouched that long — is *displaceable*
   task should not need an adopter first).
 - **liveness tiebreaker**: an owner whose process still heartbeats (fresh
   `live/<id>.*.json` record within `LIVE_WINDOW_MS`) is never stale, however
-  quiet on the board — "alive but heads-down" is what the sidecar was built
-  to distinguish from "exited / crashed". No liveness data (unreadable
-  sidecar dir) disables the exception, it never loosens it.
+  quiet on the board. The record identity *and* its `aliases` (`as` labels
+  that session has written as) populate `liveOwners`; `live N` still counts
+  identity only. No liveness data (unreadable sidecar dir) disables the
+  exception, it never loosens it.
 
 Completed tasks keep the full guard even when their owner is idle — a delivery
 receipt cannot be dropped or forged by a peer. A fresh assignment is protected
@@ -115,12 +116,12 @@ bun install            # devDeps (bun-types + typescript) — typecheck/tests on
 bunx tsc --noEmit -p tsconfig.json      # strict + noUnused, zero errors
 bun run test/smoke.ts               # end-to-end: 3 tools, persistence, scoping, changedFiles disk round-trip
 bun run test/config.ts              # config fail-loud + reserved identity (11 cases)
-bun run test/owner-guard.ts         # every-field owner guard + stale-owner takeover (19 cases)
+bun run test/owner-guard.ts         # every-field owner guard + stale-owner takeover (21 cases)
 bun run test/presence-retention.ts  # read receipts / retirement / presence / caller-line match / checkpoints (66)
 bun run test/changed-files.ts       # P0 receipt invariants (12 cases)
 bun run test/scope-conflicts.ts     # P1 glob + conflict derivation (17 cases)
 bun run test/git-count.ts           # widget git-segment pure derivations (24 cases)
-bun run test/live-sessions.ts       # widget live-segment liveness window + sidecar-record parsing (24 cases)
+bun run test/live-sessions.ts       # widget live-segment liveness window + sidecar-record parsing (29 cases)
 bun run test/board-progress.ts      # widget board-progress remaining-work glance (8 cases)
 bun run test/mine-first.ts          # glance/reminder mine-first order (10 cases)
 ```

@@ -19,6 +19,7 @@ import {
   LIVE_HEARTBEAT_MS,
   LIVE_PRUNE_MS,
   LIVE_WINDOW_MS,
+  liveOwnerIdentities,
   liveSessionCount,
   parseLiveRecord,
   type LiveRecord,
@@ -145,6 +146,37 @@ eq(
   undefined,
 );
 eq("NaN at rejected", parseLiveRecord('{"identity":"a","at":NaN}'), undefined);
+eqJson(
+  "aliases parse",
+  parseLiveRecord('{"identity":"alice","at":1,"aliases":["coder-1"]}'),
+  { identity: "alice", at: 1, aliases: ["coder-1"] },
+);
+eqJson(
+  "non-array aliases ignored, record still live",
+  parseLiveRecord('{"identity":"alice","at":1,"aliases":"coder-1"}'),
+  { identity: "alice", at: 1 },
+);
+eqJson(
+  "empty/all/blank aliases dropped",
+  parseLiveRecord(
+    '{"identity":"alice","at":1,"aliases":["","  ","all","coder-1","coder-1"]}',
+  ),
+  { identity: "alice", at: 1, aliases: ["coder-1"] },
+);
+eq(
+  "liveOwnerIdentities unions identity and aliases",
+  liveOwnerIdentities({
+    identity: "alice",
+    at: 1,
+    aliases: ["coder-1", "alice"],
+  }).join(","),
+  "alice,coder-1",
+);
+eq(
+  "liveOwnerIdentities without aliases is identity only",
+  liveOwnerIdentities({ identity: "alice", at: 1 }).join(","),
+  "alice",
+);
 
 // 4. formatLiveSegment.
 eq("zero renders empty", formatLiveSegment(0), "");

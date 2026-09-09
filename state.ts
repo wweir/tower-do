@@ -1599,7 +1599,13 @@ export const LIVE_PRUNE_MS = 10 * 60_000;
 export interface LiveRecord {
   identity: string;
   at: number;
+  /** Extra owner labels this session has written as (`as`). Used by the
+   *  takeover gate; not counted by `liveSessionCount`. */
+  aliases?: string[];
 }
+
+/** Cap on sidecar `aliases` (as-labels this session has acted as). */
+export const MAX_LIVE_ALIASES = 20;
 
 /** Parse the raw JSON content of a liveness sidecar file. Corrupt or
  * foreign content returns undefined (caller skips the file). */
@@ -1615,7 +1621,40 @@ export function parseLiveRecord(raw: string): LiveRecord | undefined {
   const { identity, at } = record;
   if (typeof identity !== "string" || identity.trim() === "") return undefined;
   if (typeof at !== "number" || !Number.isFinite(at)) return undefined;
-  return { identity, at };
+  const aliases = readLiveAliases(record.aliases);
+  return aliases === undefined ? { identity, at } : { identity, at, aliases };
+}
+
+function readLiveAliases(value: unknown): string[] | undefined {
+  if (!Array.isArray(value)) return undefined;
+  const out: string[] = [];
+  const seen = new Set<string>();
+  for (const item of value) {
+    if (out.length >= MAX_LIVE_ALIASES) break;
+    if (typeof item !== "string") continue;
+    const id = item.trim();
+    if (id === "" || id === "all" || id.length > 64) continue;
+    if (seen.has(id)) continue;
+    seen.add(id);
+    out.push(id);
+  }
+  return out.length === 0 ? undefined : out;
+}
+
+/** Identities a fresh sidecar record should protect from takeover:
+ *  the session identity plus any `as` aliases. `live N` still counts
+ *  `identity` only. */
+export function liveOwnerIdentities(record: LiveRecord): string[] {
+  if (record.aliases === undefined || record.aliases.length === 0)
+    return [record.identity];
+  const ids = [record.identity];
+  const seen = new Set([record.identity]);
+  for (const alias of record.aliases) {
+    if (seen.has(alias)) continue;
+    seen.add(alias);
+    ids.push(alias);
+  }
+  return ids;
 }
 
 /**

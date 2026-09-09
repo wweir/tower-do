@@ -78,7 +78,11 @@ git tag vX.Y.Z && git push origin main --tags
   `tower_do_status`, merge your changes onto the fresh view, retry with the new
   `baseRevision`.
 - **"owned by ..."** — you touched another owner's task. Only its owner or
-  `tower` may; message the owner via `tower_do_talk`, or have `tower` do it.
+  `tower` may, unless that owner has been idle 30+ minutes with no fresh
+  `live/` heartbeat (including `as` aliases): then adopt by setting `owner`
+  to yourself, or remove the non-completed task. Completed tasks stay
+  guarded. Otherwise message the owner via `tower_do_talk`, or have `tower`
+  do it.
 - **Board file missing / empty view after cleanup** — falls back to the last
   session checkpoint for display (disk stays authoritative).
 - **Conflicting scope advisories** — advisory only: message the peer owner or
