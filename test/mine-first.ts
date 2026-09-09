@@ -57,9 +57,17 @@ function task(
 const keys = (tasks: readonly TowerDoTask[]): string[] =>
   tasks.map((item) => item.key);
 
-eq("empty input stays empty", keys(orderTasksMineFirst([], "me")).join(","), "");
+eq(
+  "empty input stays empty",
+  keys(orderTasksMineFirst([], "me")).join(","),
+  "",
+);
 
-const noMine = [task("a", "bob", 1), task("b", undefined, 2), task("c", "x", 3)];
+const noMine = [
+  task("a", "bob", 1),
+  task("b", undefined, 2),
+  task("c", "x", 3),
+];
 eq(
   "no mine keeps fold order",
   keys(orderTasksMineFirst(noMine, "me")).join(","),
@@ -119,9 +127,7 @@ const reminderView = {
   findings: [],
 };
 const reminder = formatBoardReminder(reminderView, "me");
-const taskLines = reminder
-  .split("\n")
-  .filter((line) => line.startsWith("- ["));
+const taskLines = reminder.split("\n").filter((line) => line.startsWith("- ["));
 eq(
   "reminder lists mine rows before peers",
   taskLines.map((line) => line.split(" ")[2]?.replace(":", "")).join(","),
@@ -131,6 +137,37 @@ check(
   "reminder header still counts the whole board",
   reminder.includes("5 task(s)") && reminder.includes("you are me"),
   reminder.split("\n")[0],
+);
+
+// Reminder cap is 12. Without mine-first the last fold-order row (the
+// caller's) would fall out of the window behind 12 older peers.
+const buried = [
+  ...Array.from({ length: 12 }, (_, i) =>
+    task(`peer-${String(i).padStart(2, "0")}`, "bob", i + 1),
+  ),
+  task("mine-buried", "me", 100),
+];
+const buriedReminder = formatBoardReminder(
+  {
+    schemaVersion: TOWER_DO_SCHEMA_VERSION,
+    revision: 1,
+    tasks: buried,
+    messages: [],
+    findings: [],
+  },
+  "me",
+);
+const buriedLines = buriedReminder
+  .split("\n")
+  .filter((line) => line.startsWith("- ["));
+check(
+  "reminder cap keeps a buried mine row and drops the last peer",
+  buriedLines.length === 12 &&
+    buriedLines[0]?.includes("mine-buried:") === true &&
+    buriedReminder.includes("peer-00:") &&
+    !buriedReminder.includes("peer-11:") &&
+    buriedReminder.includes("1 more unfinished"),
+  buriedLines[0] ?? buriedReminder.split("\n")[0],
 );
 
 if (failures > 0) {

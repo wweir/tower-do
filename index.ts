@@ -1394,7 +1394,7 @@ export default function towerDoExtension(pi: ExtensionAPI): void {
               const unfinished = tasks.filter(
                 (task) => task.status !== "completed",
               );
-              const blocked = tasks.filter((task) =>
+              const blocked = unfinished.filter((task) =>
                 taskIsBlocked(task, currentView),
               );
               const gitSegment =
@@ -2237,9 +2237,10 @@ export default function towerDoExtension(pi: ExtensionAPI): void {
             )
           : tasks;
       const limit = params.limit ?? 200;
-      // Mine-first inside the already-filtered list so a cap does not hide
-      // the caller's rows; owner=/status= filters still apply first.
-      const shown = orderTasksMineFirst(filtered, caller).slice(0, limit);
+      // Slice is still fold order (default 200 never binds below
+      // MAX_TOWER_DO_TASKS). Mine-first runs per status group on that
+      // already-sliced list — it must not steal the global limit budget.
+      const shown = filtered.slice(0, limit);
 
       // Single-task detail mode: taskKey takes precedence over the dashboard
       // filters — the caller asked for one task's full record (description is
@@ -2358,7 +2359,7 @@ export default function towerDoExtension(pi: ExtensionAPI): void {
         label: string,
         pick: (task: TowerDoTask) => boolean,
       ): void => {
-        const group = shown.filter(pick);
+        const group = orderTasksMineFirst(shown.filter(pick), caller);
         if (group.length === 0) return;
         lines.push(`## ${label}`);
         for (const task of group) {

@@ -15,9 +15,12 @@ or a shortcut toggle would hide the room the glance is supposed to show.
 preserving relative order inside each group (`orderTasksMineFirst` in
 `state.ts`). Identity match is exact (`alice` ≠ `alice-2`); unowned is not
 mine. Header `N open`, blocked/unread counts, and overflow `+N more` stay
-board-wide — only which rows win the cap changes. Widget, reminder, and the
-`tower_do_status` grouped listing share the same order. `owner=` on status
-still filters; this is not a second filter.
+board-wide — only which rows win the cap changes. Widget and reminder apply
+this *before* their caps. `tower_do_status` applies it *inside* each status
+group after the dashboard slice (default `limit` 200 never binds below
+`MAX_TOWER_DO_TASKS`). An explicit small `limit` still truncates by fold
+order, same as before; mine-first does not steal that budget. `owner=` on
+status still filters; this is not a second filter.
 
 **Rejected.** Default or togglable mine-only on the widget (a shared board
 that hides peers is not a shared board; status already has `owner=`); ranking

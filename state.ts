@@ -1745,7 +1745,7 @@ export function orderTasksMineFirst(
     if (identity !== "" && task.owner === identity) mine.push(task);
     else rest.push(task);
   }
-  return mine.length === 0 ? [...tasks] : [...mine, ...rest];
+  return [...mine, ...rest];
 }
 
 /** Compact status-line rendering of the whole board for reminders. */
