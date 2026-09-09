@@ -4,6 +4,43 @@
 > / reviews live in docs/plans + docs/reviews and get folded here when they
 > become durable rules.
 
+## 2026-09 — 0.3.x backlog cull: prune / keybinds / scope-split / gif
+
+**Context.** Four pending rows (`board-prune`, `widget-keybinds`, `dirty-scope`,
+`demo-gif`) sat as 0.3.x/0.4 planning. A code-and-contract review showed each
+is a category error, not deferred work. This project's `board.jsonl` was 51
+lines / 22KB at the time of the cull.
+
+**Decision.** Drop them. Do not re-open as specified:
+
+1. **`board-prune`** (omit completed older than N days on a `tower_do`
+   full-replacement) does **not** bound `board.jsonl`. The file is an
+   append-only event log (`TowerBoard.append`); omitting a key emits
+   `op:remove` and grows the file. It also collides with the completed
+   owner-guard/receipts, `dependsOn` (targets must remain in the batch),
+   folded `changedFiles` overlap, and `revision` = task-event count. View-layer
+   retirement already exists for messages (`retainMessages`); it does not
+   rewrite the log. If a board ever needs a byte bound, the design is
+   last-wins compaction under the mutation queue — revisit only at 10k+
+   lines or when `fold`/`rawLines` show up in a profile.
+2. **`widget-keybinds`** (expand completed rows in the above-editor widget)
+   fights the glance contract: remaining-work only, cap 3 unfinished,
+   completed never appear. Completed already live in `tower_do_status`
+   (plus tool-result expand). `pi.registerShortcut` can refresh the widget;
+   that is not permission to put completed rows there. See widget-progress
+   decision below.
+3. **`dirty-scope`** (per-task `mine`/`dirty`) mixes two units. Widget git
+   counts are worktree/session global; mission boundary is
+   `findScopeConflicts` (scope × receipts, no git). Live git × glob is
+   orchestrator territory. See git-segment and P0/P1 decisions below.
+4. **`demo-gif`** is marketing, not a product gate. README's PNG already
+   matches the documented glance. A CAS/widget-refresh capture needs a human
+   two-session TUI recording; do not block a release on an agent-scripted GIF.
+
+**Rejected.** Implementing prune-as-specified "to keep the file bounded"; a
+widget toggle that lists completed under the 3-open cap; per-task git counters
+in the header; treating a GIF as a version requirement.
+
 ## 2026-09 — stale-owner takeover: idle ownership is displaceable
 
 **Context.** The owner guard (every-field, worker/owner/`tower` only) pins a
