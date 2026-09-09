@@ -37,7 +37,8 @@ work — and the manners to talk about it.
   ping instead of reassigning blind.
 - **A widget that explains the room.** The above-editor line shows remaining
   work (`TowerDo 2 open · 1 blocked`), how many sessions are live, which dirty
-  files are yours vs. the worktree's, and the unfinished tasks with owners.
+  files are yours vs. the worktree's, and the unfinished tasks with owners
+  (yours first; the open count is still the whole board).
 
 Three tools:
 

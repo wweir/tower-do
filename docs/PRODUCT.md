@@ -54,7 +54,8 @@ TowerDo is its state/communication substrate.
   instead of counting pulled files; later commits can leave `mine N · dirty 0`).
   Same unit, two labeled viewpoints; the git segment hides when both counts
   are 0 or the directory is not git; on an empty board the live segment alone
-  still shows.
+  still shows. Unfinished-task rows (capped) list the caller's owned tasks
+  first; open/blocked/unread counts and the overflow note stay board-wide.
 
 ## Identity
 

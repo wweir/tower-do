@@ -4,6 +4,26 @@
 > / reviews live in docs/plans + docs/reviews and get folded here when they
 > become durable rules.
 
+## 2026-09 — glance rows are mine-first, counts stay board-wide
+
+**Context.** Widget (cap 3) and reminder (cap 12) listed unfinished tasks in
+fold order (`updatedAt` ascending). On a busy board the caller's own work
+fell into `… +N more` behind older peer or unowned rows. A mine-only filter
+or a shortcut toggle would hide the room the glance is supposed to show.
+
+**Decision.** Partition display lists so `owner === identity` rows come first,
+preserving relative order inside each group (`orderTasksMineFirst` in
+`state.ts`). Identity match is exact (`alice` ≠ `alice-2`); unowned is not
+mine. Header `N open`, blocked/unread counts, and overflow `+N more` stay
+board-wide — only which rows win the cap changes. Widget, reminder, and the
+`tower_do_status` grouped listing share the same order. `owner=` on status
+still filters; this is not a second filter.
+
+**Rejected.** Default or togglable mine-only on the widget (a shared board
+that hides peers is not a shared board; status already has `owner=`); ranking
+by session UUID instead of identity (owner is identity, same as `live N`);
+putting unowned backlog in the mine group (anyone may claim it).
+
 ## 2026-09 — 0.3.x backlog cull: prune / keybinds / scope-split / gif
 
 **Context.** Four pending rows (`board-prune`, `widget-keybinds`, `dirty-scope`,

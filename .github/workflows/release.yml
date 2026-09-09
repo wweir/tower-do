@@ -46,6 +46,7 @@ jobs:
           bun run test/git-count.ts
           bun run test/live-sessions.ts
           bun run test/board-progress.ts
+          bun run test/mine-first.ts
 
       - name: Verify tag matches package version
         run: |

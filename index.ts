@@ -97,6 +97,7 @@ import {
   formatBoardProgress,
   formatBoardReminder,
   findScopeConflicts,
+  orderTasksMineFirst,
   formatLiveSegment,
   formatPresenceLine,
   getAllTasks,
@@ -1454,9 +1455,14 @@ export default function towerDoExtension(pi: ExtensionAPI): void {
               const lines = [header];
               // WIDGET_TASK_LIMIT caps how many unfinished tasks the
               // above-editor line shows; the rest fold into an overflow note.
+              // Rows are mine-first so the cap does not hide the caller's
+              // work behind older peer/unowned tasks. Counts stay board-wide.
               const cap =
                 activeCwd === undefined ? unfinished.length : WIDGET_TASK_LIMIT;
-              const shown = unfinished.slice(0, cap);
+              const shown = orderTasksMineFirst(unfinished, identity).slice(
+                0,
+                cap,
+              );
               for (const task of shown) {
                 const glyph = STATUS_GLYPH[task.status];
                 const color = statusColor(task.status);
@@ -2231,7 +2237,9 @@ export default function towerDoExtension(pi: ExtensionAPI): void {
             )
           : tasks;
       const limit = params.limit ?? 200;
-      const shown = filtered.slice(0, limit);
+      // Mine-first inside the already-filtered list so a cap does not hide
+      // the caller's rows; owner=/status= filters still apply first.
+      const shown = orderTasksMineFirst(filtered, caller).slice(0, limit);
 
       // Single-task detail mode: taskKey takes precedence over the dashboard
       // filters — the caller asked for one task's full record (description is

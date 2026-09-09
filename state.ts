@@ -1730,6 +1730,24 @@ export function formatPresenceLine(line: PresenceLine, now: number): string {
   return `${line.identity} — ${seen}${owned}${state}`;
 }
 
+/** Stable partition: caller's owned tasks first, everyone else after.
+ *  Relative order inside each group is preserved (fold order is updatedAt).
+ *  Unowned is not mine. Identity match is exact — `alice` ≠ `alice-2`.
+ *  Does not mutate `tasks`. Glance counts / overflow stay board-wide; this
+ *  only changes which rows win the cap. */
+export function orderTasksMineFirst(
+  tasks: readonly TowerDoTask[],
+  identity: string,
+): TowerDoTask[] {
+  const mine: TowerDoTask[] = [];
+  const rest: TowerDoTask[] = [];
+  for (const task of tasks) {
+    if (identity !== "" && task.owner === identity) mine.push(task);
+    else rest.push(task);
+  }
+  return mine.length === 0 ? [...tasks] : [...mine, ...rest];
+}
+
 /** Compact status-line rendering of the whole board for reminders. */
 export function formatBoardReminder(
   view: TowerBoardView,
@@ -1745,7 +1763,10 @@ export function formatBoardReminder(
   const lines = [
     `TowerDo shared board — you are ${identity} (revision ${view.revision}; ${tasks.length} task(s)${completed > 0 ? `, ${completed} completed hidden` : ""}, ${blocked.length} blocked, ${unread} unread message(s) for you).`,
   ];
-  const shown = unfinished.slice(0, REMINDER_TASK_LINE_CAP);
+  const shown = orderTasksMineFirst(unfinished, identity).slice(
+    0,
+    REMINDER_TASK_LINE_CAP,
+  );
   for (const task of shown) {
     const owner =
       task.owner === undefined
