@@ -452,6 +452,31 @@ async function main(): Promise<void> {
     staleTaskOwners([], tasksForDerivation, NOW).size === 0,
   );
 
+  // An owner WITH prior activity is judged by that activity alone: a task
+  // freshly assigned to an already-quiet owner does not re-protect the row.
+  // (The fresh-updatedAt protection is for never-active owners only.)
+  check(
+    "a quiet owner stays stale for a freshly assigned row too",
+    staleTaskOwners(
+      [activityEntry("E", NOW - 40 * MIN)],
+      [
+        handTask({
+          key: "e-old",
+          subject: "o",
+          status: "in_progress",
+          owner: "E",
+        }),
+        handTask({
+          key: "e-new",
+          subject: "n",
+          owner: "E",
+          updatedAt: NOW - 1 * MIN,
+        }),
+      ],
+      NOW,
+    ).has("E"),
+  );
+
   // Board: A owns an in_progress task and went quiet 40 min ago.
   const idleBoard = writeBoardSnapshot(
     createEmptyBoard(),
