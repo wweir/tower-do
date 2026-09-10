@@ -74,39 +74,26 @@ re-claim via tower") had no working path — a peer messaging the owner got no
 answer, and only the orchestrator identity could act. Boards accumulated
 `pending` rows pinned by owners no session could ever displace.
 
-**Decision.** Ownership itself is a claim on availability, so it gets a
-liveness rule of its own: an owner of a non-completed task whose last board
-activity is older than `OWNER_TAKEOVER_MS` (= `SESSION_BREAK_GAP_MS`, 30 min)
-— or who never started and whose task has sat untouched that long — is
-displaceable (`staleTaskOwners` in state.ts, pure derivation; `tower_do`
-feeds it the full activity log and the liveness sidecar records). A peer may **adopt** (set `owner` to
-itself, strictly nothing else — `taskEquals` against the existing task minus
-the owner swap) or **remove** the non-completed task. Completed tasks keep the
-full guard: a receipt cannot be dropped or forged by a peer, however idle its
-author. The liveness sidecar is the tiebreaker between "exited / crashed"
-and "alive but heads-down": an owner with a fresh `live/` heartbeat record
-(`LIVE_WINDOW_MS`) is never stale, however quiet on the board. The record's
-`identity` is the session identity; `aliases` are extra owner labels this
-session has written as (`as: "coder-1"`) so a parent recording work for a
-subagent stays protected while its process heartbeats. `live N` still counts
-identity only — aliases do not inflate the widget. Alias count is capped at
-`MAX_TOWER_DO_TASKS`; exceeding it on write is an error, not a silent drop. No liveness data
-(unreadable sidecar dir) disables the exception rather than loosening it. `tower_do` errors carry an actionable hint when they reject a
-stale-owned task ("adopt it by setting owner to yourself"), and the gate
-reads on itself: no activity log → no stale owners → strict guard. Because
-this is a permission gate, it reads the FULL board log (`TowerBoard.rawLines`,
-the same file `fold()` already reads) — a bounded tail could truncate an
-active owner's recent events in a churny fleet and let a peer displace them.
+**Decision.** Ownership is a claim on availability, so it gets a liveness
+rule of its own: an owner idle past `OWNER_TAKEOVER_MS` (= 30 min,
+`SESSION_BREAK_GAP_MS`) may be displaced on a non-completed task — **adopt**
+it (set `owner` to yourself, strictly nothing else) or **remove** it.
+Completed tasks keep the full guard (a receipt cannot be dropped or forged by
+a peer), and the sidecar heartbeat (session identity plus `as` aliases)
+keeps an alive-but-heads-down owner from being raced. The exact mechanism,
+failure modes, and inert-on-bad-data rules are the contract in CONTRACTS.md
+§ Stale-owner exception.
 
 Properties: the threshold is far beyond the 10-minute display-only idle mark
-(`PRESENCE_IDLE_MS`) so a heads-down worker is never raced; a fresh
-assignment is protected by its fresh `updatedAt` ("just assigned, not begun
-yet" stays unstartable — the unstarted/idle distinction derivePresence
-already makes); adoption is ownership-only, so the every-field guard's
-promise survives (a peer can displace a dead claim, never silently rewrite
-content). Unowned pending rows are deliberately NOT expired — backlog that
-nobody claimed is work, not garbage; the exit mechanism keeps cleaning only
-the liveness sidecar, and task lifecycle stays explicit.
+(`PRESENCE_IDLE_MS`) so a heads-down worker is never raced; a task assigned
+to a never-active owner is protected by its fresh `updatedAt` ("just
+assigned, not begun yet" stays unstarted — the unstarted/idle distinction
+derivePresence already makes), while an owner with prior activity is judged
+by that activity alone; adoption is ownership-only, so the every-field
+guard's promise survives (a peer can displace a dead claim, never silently
+rewrite content). Unowned pending rows are deliberately NOT expired —
+backlog that nobody claimed is work, not garbage; the exit mechanism keeps
+cleaning only the liveness sidecar, and task lifecycle stays explicit.
 
 **Rejected.** Auto-clearing owners on `session_shutdown` (a clean exit says
 nothing about the work being abandoned, and the board is cross-session —

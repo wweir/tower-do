@@ -44,7 +44,9 @@ semantics:
   syscalls; cross-process writers rely on the `baseRevision` gate (last-writer
   wins otherwise). `fold()` treats a missing file as an empty board; any other
   read error throws (an unreadable file must not look like a cleared board).
-  `rawTail()` always throws on I/O error — display callers degrade.
+  `rawLines()` / `rawTail()` always throw on I/O error — display callers
+  degrade; the stale-owner gate reads `rawLines()` (full log) so a bounded
+  tail can never misreport an active owner as idle.
 - The revision a write returns **exactly equals a re-fold** of the file
   (one bump per task event), so a caller can verify the write landed.
 
@@ -59,9 +61,14 @@ The board is shared per **project** = nearest ancestor git work-tree root (a
 
 The widget's `live N` does not read the board log: each running session owns
 exactly one file `~/.pi/tower-do/<project>/live/<identity>.<sessionId>.json`
-(`{"identity", "at"}`), rewritten on a 30s heartbeat and deleted on clean
-exit. The count is a pure read derivation (`liveSessionCount` in `state.ts`):
-distinct identities with a record fresh within 2 minutes, plus self. `fs.watch`
+(`{"identity", "at", "aliases"?}`), rewritten on a 30s heartbeat and deleted
+on clean exit. The count is a pure read derivation (`liveSessionCount` in
+`state.ts`): distinct identities with a record fresh within 2 minutes, plus
+self. Optional `aliases` are extra owner labels the session has written as
+(`as: "coder-1"`): they populate the stale-owner gate's liveness set (a
+parent still heartbeating protects its subagent's claim) but never inflate
+`live N`. Own-file snapshots are serialized per session, so an older write
+cannot land after a newer one and drop an alias. `fs.watch`
 on the sidecar dir and `board.jsonl` (debounced ~250ms, session-scoped) makes
 peer enter/exit — and peer board writes, which also re-fold the view — visible
 within one tick. The board log keeps exactly task/message/finding events:
@@ -76,6 +83,12 @@ activity tail — they never mutate the file, and callers cannot "write" them:
 - **Presence** (`Who is around`): per-identity last-seen from parsed activity
   lines; three states — active / `⚠ idle` (>10 min quiet) / (not started).
   Real idle owners of unfinished tasks are footnoted on `tower_do` receipts.
+- **Stale owners** (`staleTaskOwners`): owner labels whose last board activity
+  (or, for a never-active owner, the task's `updatedAt`) is older than
+  `OWNER_TAKEOVER_MS` and who have no fresh sidecar heartbeat/alias. Feeds the
+  owner-guard's takeover exception (contract in CONTRACTS.md) — a permission
+  gate, not a display: `tower_do` reads the full activity log and the sidecar
+  dir, and any read failure yields no stale owners (strict guard).
 - **Block reasons**: `taskIsBlocked` is a read derivation over explicit
   `status: "blocked"`, the persisted `blockedBy` field, and unresolved
   `dependsOn`. `findAllUnresolvedDeps` only lists the dependency reason.

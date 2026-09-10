@@ -118,11 +118,11 @@ bun install            # devDeps (bun-types + typescript) — typecheck/tests on
 bunx tsc --noEmit -p tsconfig.json      # strict + noUnused, zero errors
 bun run test/smoke.ts               # end-to-end: 3 tools, persistence, scoping, changedFiles disk round-trip
 bun run test/config.ts              # config fail-loud + reserved identity (11 cases)
-bun run test/owner-guard.ts         # every-field owner guard + stale-owner takeover (21 cases)
+bun run test/owner-guard.ts         # every-field owner guard + stale-owner takeover (22 cases)
 bun run test/presence-retention.ts  # read receipts / retirement / presence / caller-line match / checkpoints (66)
 bun run test/changed-files.ts       # P0 receipt invariants (12 cases)
 bun run test/scope-conflicts.ts     # P1 glob + conflict derivation (17 cases)
-bun run test/git-count.ts           # widget git-segment pure derivations (24 cases)
+bun run test/git-count.ts           # widget git-segment pure derivations (31 cases)
 bun run test/live-sessions.ts       # widget live-segment liveness window + sidecar-record parsing (30 cases)
 bun run test/board-progress.ts      # widget board-progress remaining-work glance (8 cases)
 bun run test/mine-first.ts          # glance/reminder mine-first order (10 cases)
