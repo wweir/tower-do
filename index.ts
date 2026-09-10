@@ -767,9 +767,10 @@ export default function towerDoExtension(pi: ExtensionAPI): void {
   // Set when a watcher event asked for a board re-fold during the debounce
   // window (OR-merged across sources); cleared when the refresh runs.
   let liveRefreshNeedsFold = false;
-  // Owner labels this session has written as (`as`), keyed by live dir so
-  // a cwd switch cannot leak aliases onto another board's sidecar.
-  const liveAsAliasesByDir = new Map<string, Set<string>>();
+  // Owner labels this session has written as (`as`). Session-scoped, like
+  // the single sidecar file the session owns (selfLivePath is fixed once
+  // live wiring starts).
+  const liveAliases = new Set<string>();
   // This session's liveness file path — computed ONCE in restore(). The
   // empty-session-id fallback is a fresh random UUID and identity can change
   // mid-session, so recomputing per call would churn the filename every
@@ -1165,31 +1166,11 @@ export default function towerDoExtension(pi: ExtensionAPI): void {
   /** Rewrite this session's liveness record (temp + rename, own file at the
    * stable selfLivePath). Best-effort: a failed write degrades to self-only
    * counting via the liveSessionCount `self` union, never a wrong peer
-   * count. */
-  const aliasesFor = (cwd: string): Set<string> => {
-    const dir = liveDirFor(cwd);
-    const existing = liveAsAliasesByDir.get(dir);
-    if (existing !== undefined) return existing;
-    const created = new Set<string>();
-    liveAsAliasesByDir.set(dir, created);
-    return created;
-  };
-
-  const rememberLiveAlias = (cwd: string, caller: string): void => {
-    const self = sessionIdentity(cwd, pi);
-    if (caller === self || caller === "" || caller === "all") return;
-    const aliases = aliasesFor(cwd);
-    if (aliases.has(caller)) return;
-    if (aliases.size >= MAX_TOWER_DO_TASKS) {
-      throw new TowerDoValidationError(
-        `as identities this session can remember at most ${String(MAX_TOWER_DO_TASKS)} aliases for liveness (got "${caller}")`,
-      );
-    }
-    aliases.add(caller);
-    void writeSelfLive(cwd);
-  };
-
-  const writeSelfLive = async (cwd: string): Promise<void> => {
+   * count. Serialized below: the heartbeat and a fresh `as` alias write can
+   * be in flight together, and an older snapshot's rename landing last would
+   * silently drop the alias — an alive owner could then look stale to the
+   * takeover gate. */
+  const writeSelfLiveOnce = async (cwd: string): Promise<void> => {
     if (selfLivePath === undefined) return;
     try {
       await mkdir(dirname(selfLivePath), { recursive: true });
@@ -1199,15 +1180,35 @@ export default function towerDoExtension(pi: ExtensionAPI): void {
         JSON.stringify({
           identity: sessionIdentity(cwd, pi),
           at: Date.now(),
-          ...(aliasesFor(cwd).size > 0
-            ? { aliases: [...aliasesFor(cwd)] }
-            : {}),
+          ...(liveAliases.size > 0 ? { aliases: [...liveAliases] } : {}),
         }),
       );
       await rename(tmp, selfLivePath);
     } catch {
       // Best-effort by design (see above).
     }
+  };
+
+  // One promise chain per session: own-file writes never overlap, so the
+  // last queued snapshot (the newest alias set) is the one that lands.
+  let liveWriteChain: Promise<void> = Promise.resolve();
+  const writeSelfLive = (cwd: string): void => {
+    liveWriteChain = liveWriteChain
+      .then(() => writeSelfLiveOnce(cwd))
+      .catch(() => {});
+  };
+
+  const rememberLiveAlias = (cwd: string, caller: string): void => {
+    const self = sessionIdentity(cwd, pi);
+    if (caller === self || caller === "" || caller === "all") return;
+    if (liveAliases.has(caller)) return;
+    if (liveAliases.size >= MAX_TOWER_DO_TASKS) {
+      throw new TowerDoValidationError(
+        `as identities this session can remember at most ${String(MAX_TOWER_DO_TASKS)} aliases for liveness (got "${caller}")`,
+      );
+    }
+    liveAliases.add(caller);
+    writeSelfLive(cwd);
   };
 
   /** Live-session count from the liveness sidecar: distinct identities with
@@ -1335,11 +1336,11 @@ export default function towerDoExtension(pi: ExtensionAPI): void {
   };
 
   const startLiveHeartbeat = (cwd: string): void => {
-    void writeSelfLive(cwd);
+    writeSelfLive(cwd);
     if (liveHeartbeat !== undefined) clearInterval(liveHeartbeat);
     liveHeartbeat = setInterval(() => {
       if (activeCwd === undefined) return;
-      void writeSelfLive(activeCwd);
+      writeSelfLive(activeCwd);
     }, LIVE_HEARTBEAT_MS);
     liveHeartbeat.unref?.();
   };
@@ -2774,6 +2775,6 @@ export default function towerDoExtension(pi: ExtensionAPI): void {
     // mid-session). Within a session the cache is deliberately stable — moving
     // the board file mid-session would orphan earlier events (split-brain).
     projectRootCache.clear();
-    liveAsAliasesByDir.clear();
+    liveAliases.clear();
   });
 }
