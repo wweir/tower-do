@@ -1521,13 +1521,14 @@ export function derivePresence(
 export const OWNER_TAKEOVER_MS = SESSION_BREAK_GAP_MS;
 
 /**
- * Owners eligible for takeover: they own at least one non-completed task and
- * are unreachable on the board — last board activity older than `idleMs`, or
- * never active at all with the task itself untouched for longer than
- * `idleMs` (a long-assigned never-started task; a fresh assignment keeps a
- * fresh `updatedAt`, so "just assigned, not begun yet" stays protected —
- * the same unstarted/is-idle distinction derivePresence makes). Pure read
- * derivation; never writes to the board.
+ * Owners eligible for takeover: an owner of at least one non-completed task
+ * whose own board activity is older than `idleMs`. An owner who was never
+ * active at all is judged by the task's `updatedAt` instead, so a task just
+ * assigned to a never-seen owner stays protected ("just assigned, not begun
+ * yet" — the unstarted/is-idle distinction derivePresence makes). An owner
+ * WITH prior activity is stale by that activity alone, so every one of their
+ * non-completed tasks becomes displaceable, however recently assigned. Pure
+ * read derivation; never writes to the board.
  */
 export function staleTaskOwners(
   entries: readonly ActivityEntry[],
@@ -1574,7 +1575,7 @@ function staleOwnerHint(
   task: TowerDoTask,
   staleOwners: ReadonlySet<string>,
 ): string {
-  if (!staleOwners.has(task.owner!)) return "";
+  if (task.owner === undefined || !staleOwners.has(task.owner)) return "";
   if (task.status === "completed")
     return " (owner idle, but a completed task stays with its owner — receipt integrity)";
   return ` (owner idle ${Math.round(OWNER_TAKEOVER_MS / 60_000)}+ min: adopt it by setting owner to yourself, or remove it)`;
@@ -1595,7 +1596,7 @@ export const LIVE_WINDOW_MS = 2 * 60_000;
  * heartbeat or modest clock skew cannot get a live session's file pruned. */
 export const LIVE_PRUNE_MS = 10 * 60_000;
 
-/** One per-session liveness sidecar record: `live/<sessionId>.json`. */
+/** One per-session liveness sidecar record: `live/<identity>.<sessionId>.json`. */
 export interface LiveRecord {
   identity: string;
   at: number;
@@ -1603,8 +1604,6 @@ export interface LiveRecord {
    *  takeover gate; not counted by `liveSessionCount`. */
   aliases?: string[];
 }
-
-
 
 /** Parse the raw JSON content of a liveness sidecar file. Corrupt or
  * foreign content returns undefined (caller skips the file). */
