@@ -1619,17 +1619,14 @@ export default function towerDoExtension(pi: ExtensionAPI): void {
         // disables the takeover exception (no stale owners) rather than
         // loosening the guard.
         let activity: ActivityEntry[] = [];
-        let activityReadOk = true;
         try {
           activity = (await board.rawLines())
             .reverse()
             .map((line) => parseActivityLine(line))
             .filter((entry): entry is ActivityEntry => entry !== undefined);
         } catch {
-          // Unreadable log → the owner guard stays strict (the derivation
-          // below is skipped — an empty-activity fallback would judge every
-          // owner by updatedAt alone); the write itself must still land.
-          activityReadOk = false;
+          // Unreadable log → empty activity, which `staleTaskOwners` maps to
+          // "no stale owners" (strict guard); the write must still land.
         }
         // Liveness tiebreaker: an owner whose process still heartbeats is
         // never stale, however quiet on the board. Read failure → treat
@@ -1662,18 +1659,15 @@ export default function towerDoExtension(pi: ExtensionAPI): void {
         } catch {
           // No/unreadable live dir → no liveness data → no takeover.
         }
-        // Only derive the stale set from FULL gate data: on an activity read
-        // failure the updatedAt fallback would judge owners with no log at
-        // all, so no stale owners — strict guard — is the only safe answer.
-        const staleOwners = activityReadOk
-          ? staleTaskOwners(
-              activity,
-              freshView.tasks,
-              Date.now(),
-              undefined,
-              liveOwners,
-            )
-          : new Set<string>();
+        // An empty activity list (unreadable / empty log) already means "no
+        // stale owners" inside the derivation — strict guard, never loosened.
+        const staleOwners = staleTaskOwners(
+          activity,
+          freshView.tasks,
+          Date.now(),
+          undefined,
+          liveOwners,
+        );
         const details = writeBoardSnapshot(
           freshView,
           { tasks: params.tasks, baseRevision: params.baseRevision },
