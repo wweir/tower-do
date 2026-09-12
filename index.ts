@@ -415,7 +415,7 @@ const TowerDoTaskSchema = Type.Object({
   status: Type.Optional(
     StringEnum(["pending", "in_progress", "completed", "blocked"] as const, {
       description:
-        "Current task status; required for a new key, omitted to preserve. Use blocked when waiting on a dependency or a peer.",
+        "Current task status; required for a new key, omitted to preserve. Use blocked when waiting on a dependency or a peer — blocked is exempt from the dependsOn gate, while in_progress/completed require every dependsOn entry to be completed.",
     }),
   ),
   owner: Type.Optional(
@@ -428,7 +428,7 @@ const TowerDoTaskSchema = Type.Object({
   dependsOn: Type.Optional(
     Type.Array(Type.String(), {
       description:
-        "Dependency keys; must exist on the shared board or in this call. Omitted to preserve, empty array to clear.",
+        "Dependency keys; each must exist on the shared board or in this call, and the graph must stay acyclic. Omitted to preserve, empty array to clear. in_progress/completed require every dependency to be completed first (blocked is exempt).",
       maxItems: 20,
     }),
   ),
@@ -442,7 +442,7 @@ const TowerDoTaskSchema = Type.Object({
   changedFiles: Type.Optional(
     Type.Array(Type.String(), {
       description:
-        'Delivery receipt: files the owner actually changed. Only settable when status is "completed" (set it in the same call that completes the task). A worker may set it once; its owner or "tower" may amend later (the owner guard rejects other workers). Paths are repo-relative.',
+        'Delivery receipt: files the owner actually changed, repo-relative. Only settable when status is "completed" — pass it in the same call that completes the task. Reopening the task (status back to pending/in_progress/blocked) without an explicit changedFiles voids the inherited receipt; changedFiles: [] clears it while staying completed. A worker may set it once; its owner or "tower" may amend later (the owner guard rejects other workers).',
       maxItems: 100,
     }),
   ),
@@ -458,46 +458,57 @@ const TowerDoTaskSchema = Type.Object({
 const TowerDoParamsSchema = Type.Object({
   tasks: Type.Array(TowerDoTaskSchema, {
     description:
-      "Complete authoritative task list to retain; omitted current keys are removed. Existing tasks may omit unchanged fields; new keys require subject and status.",
+      "Complete authoritative task list to retain: every key you want kept must appear here, because any current key omitted from the list is removed. An omitted task owned by another agent (and not stale) makes the write fail rather than dropping it; replay peers' and unowned tasks you did not mean to remove. Existing keys may omit unchanged fields (they are preserved per field); new keys require subject and status.",
     maxItems: MAX_TOWER_DO_TASKS,
   }),
   baseRevision: Type.Optional(
     Type.Integer({
       description:
-        "Board revision you last observed (from tower_do_status). Rejects stale writes when a peer changed the board since; omitting it disables the stale-write check.",
+        "Board revision you last observed (from tower_do_status, or the revision printed by your previous tower_do write). Rejects stale writes when a peer changed the board since; omitting it disables the stale-write check.",
       minimum: 0,
     }),
   ),
   as: Type.Optional(
     Type.String({
       description:
-        "Identity to act as (default: your session identity). Pass a subagent id when recording work on its behalf.",
+        'Identity to act as (default: your session identity); the call is then owner-guarded as that identity. Pass a subagent id to record work on its behalf. Must be a single line, at most 64 characters, and not the reserved broadcast recipient "all".',
       maxLength: 64,
     }),
   ),
 });
 
 const TalkParamsSchema = Type.Object({
-  action: StringEnum(["send", "inbox", "finding"] as const),
+  action: StringEnum(["send", "inbox", "finding"] as const, {
+    description:
+      "send delivers a message (requires to + subject + body); inbox lists AND acknowledges your messages (optional limit); finding files a structured finding (requires kind + title + summary) or updates one (requires findingId + status).",
+  }),
   to: Type.Optional(
     Type.String({
       description:
-        'send: recipient identity — "all" or a task owner on the board. Self-send is rejected.',
+        'send: recipient identity — "all" (broadcast), "tower" (orchestrator), a current task owner, or anyone with recent board activity. Self-send is rejected.',
       maxLength: 64,
     }),
   ),
   subject: Type.Optional(
     Type.String({
-      description: "send: short subject",
+      description: "send: short single-line subject (required for send)",
       maxLength: MAX_MESSAGE_SUBJECT_CHARS,
     }),
   ),
   body: Type.Optional(
     Type.String({
-      description: `send or finding: the message body or finding summary (send: max ${Math.round(MAX_MESSAGE_BYTES / 1024)} KiB — split oversized content into multiple messages)`,
+      description: `send or finding: the message body (required for send) or finding summary (required when filing a finding); send body max ${Math.round(MAX_MESSAGE_BYTES / 1024)} KiB — split oversized content into multiple messages`,
     }),
   ),
-  taskKey: Type.Optional(TaskKeySchema),
+  taskKey: Type.Optional(
+    Type.String({
+      description:
+        "send only: task key this message threads under (must exist on the board). Passing it with inbox/finding is an error — findings are board-level and carry no task link.",
+      minLength: 1,
+      maxLength: 40,
+      pattern: "^[a-z0-9][a-z0-9._-]*$",
+    }),
+  ),
   kind: Type.Optional(
     StringEnum(["bug", "improve", "vuln", "idea"] as const, {
       description: "finding: kind (required when filing a new finding)",
@@ -540,7 +551,7 @@ const TalkParamsSchema = Type.Object({
   ),
   limit: Type.Optional(
     Type.Integer({
-      description: "inbox: max messages to return",
+      description: "inbox: max messages to return (default 20)",
       minimum: 1,
       maximum: 100,
     }),
@@ -548,7 +559,7 @@ const TalkParamsSchema = Type.Object({
   as: Type.Optional(
     Type.String({
       description:
-        "Identity to act as (default: your session identity). Pass a subagent id when recording work on its behalf.",
+        'Identity to act as (default: your session identity); the call is then attributed to that identity. Pass a subagent id to send or file as it. Must be a single line, at most 64 characters, and not the reserved broadcast recipient "all".',
       maxLength: 64,
     }),
   ),
@@ -1583,19 +1594,21 @@ export default function towerDoExtension(pi: ExtensionAPI): void {
     name: TOWER_DO_TOOL_NAME,
     label: "TowerDo",
     description: `Maintain the shared multi-agent task board with one atomic update.
-- Full replacement: include every key to keep; omitting a key removes it.
-- Omitted optional fields on existing keys are preserved; new keys require subject and status.
-- Owner guard: a task with an owner can only be changed (any field) or removed by its owner or the "tower" identity. Exception: an owner idle for 30+ min (OWNER_TAKEOVER_MS) may be displaced on a non-completed task — set owner to yourself to adopt it, or remove it; completed tasks stay guarded.
+- Full replacement at the task level: include every key to keep; any current key omitted from the list is removed (an omitted task owned by another agent is rejected instead of dropped — replay peers' and unowned tasks you did not mean to lose). Fields are per-field: omitted optional fields on an existing key are preserved, and new keys require subject and status.
+- Owner guard: a task with an owner can only be changed (any field) or removed by its owner or the "tower" identity. Exception: an owner idle for 30+ min (OWNER_TAKEOVER_MS) may be displaced on a non-completed task — adopt it by setting owner to yourself and changing nothing else in that write (any content edit in the same write is rejected; re-plan in a second write), or remove it; completed tasks stay guarded.
+- Dependencies gate status: in_progress/completed require every dependsOn entry to be completed, dependsOn keys must exist on the board or in this call, and cycles are rejected (blocked is exempt).
+- Set changedFiles only in the same write that completes a task; reopening a task without changedFiles voids the inherited receipt.
 - Always pass baseRevision from tower_do_status; omitting it disables the stale-write check.
-- Up to ${MAX_TOWER_DO_TASKS} tasks. Optional per-task fields: dependsOn (must exist on the board or in this call), scope (file globs the task may touch), blockedBy (non-empty renders a non-completed task as blocked).`,
+- Up to ${MAX_TOWER_DO_TASKS} tasks. Optional per-task fields: dependsOn (see above), scope (file globs the task may touch), blockedBy (free-form ids — non-empty renders a non-completed task as blocked).`,
     promptSnippet:
       "Maintain the shared multi-agent task board with one atomic update",
     promptGuidelines: [
       "Use tower_do for the task plan instead of direct file edits when multiple agents or sessions share the work; it is the shared board, not a private todo list.",
+      "tower_do replaces the entire task list: read tower_do_status first and replay every key you want to keep, changing only the tasks you mean to change.",
       "When a task needs a plan of 3+ steps, define it yourself and call tower_do with subject + status before beginning substantive work.",
       "Include baseRevision (from tower_do_status) in every tower_do call; a stale revision is rejected so you never silently overwrite a peer's update.",
       "Mark a task completed only after implementation and verification succeed, attaching changedFiles (files you actually changed, repo-relative) in the same call. Use status blocked with a blockedBy note instead of leaving it hanging.",
-      "Claim shared tasks by setting owner and in_progress together. Only the owner or the orchestrator identity tower may change an owned task's fields or remove it — to remove or reassign another agent's task, message the owner via tower_do_talk instead of editing it directly. If a task's owner has been idle for 30+ minutes, you may adopt it (set owner to yourself) or remove it while it is not completed; completed tasks stay with their owner.",
+      "Claim shared tasks by setting owner and in_progress together. Only the owner or the orchestrator identity tower may change an owned task's fields or remove it — to remove or reassign another agent's task, message the owner via tower_do_talk instead of editing it directly. If a task's owner has been idle for 30+ minutes, you may adopt it (set owner to yourself and change nothing else in that write) or remove it while it is not completed; completed tasks stay with their owner.",
       "Reconcile actual progress with the shared board before your final response, and do not issue a no-op tower_do call only to acknowledge a reminder.",
     ],
     parameters: TowerDoParamsSchema,
@@ -1793,13 +1806,14 @@ export default function towerDoExtension(pi: ExtensionAPI): void {
     name: TOWER_DO_TALK_TOOL_NAME,
     label: "TowerDo Talk",
     description:
-      'Cross-agent communication on the shared tower-do board. action=send delivers an inbox message to "all", the orchestrator identity "tower", a current task owner, or anyone with recent board activity (self-send rejected). action=inbox lists messages addressed to you or "all", newest first. action=finding files a structured out-of-scope finding (bug|improve|vuln|idea) with severity/location/suggestedFix, or updates a finding\'s status via findingId + status. Use findings instead of silently editing other-owned tasks.',
+      'Cross-agent communication on the shared tower-do board. action=send delivers an inbox message to "all", the orchestrator identity "tower", a current task owner, or anyone with recent board activity (self-send rejected); taskKey optionally threads it under a task. action=inbox lists messages addressed to you or "all", newest first, and ACKS the ones it shows (marks them read; acked messages can be retired) — use tower_do_status to read messages without acking. action=finding files a structured out-of-scope finding (bug|improve|vuln|idea) with severity/location/suggestedFix, or updates a finding\'s status via findingId + status. Use findings instead of silently editing other-owned tasks.',
     promptSnippet:
       "Send addressed messages or file findings on the shared multi-agent board",
     promptGuidelines: [
       'Use tower_do_talk to communicate with task owners on the shared board instead of editing owned tasks directly; the recipient must be "all", "tower", a current task owner, or someone with recent board activity (e.g. a peer whose tasks are all completed).',
       "Use action=finding (not direct edits) when you discover an out-of-scope problem — file it with kind/severity/summary/suggestedFix so the owning agent and reviewers can route it.",
       "Keep message bodies brief and reference files by path; the board persists everything, so pointer-style notes keep context lean.",
+      "Prefer tower_do_status over action=inbox when you only need to read messages: inbox acknowledges what it shows, status does not.",
     ],
     parameters: TalkParamsSchema,
     executionMode: "sequential",
@@ -1808,6 +1822,12 @@ export default function towerDoExtension(pi: ExtensionAPI): void {
       throwIfAborted(signal, "TowerDo talk");
       const { board, caller, view } = await prepare(ctx, params.as);
       const now = Date.now();
+
+      if (params.action !== "send" && params.taskKey !== undefined) {
+        throw new TowerDoValidationError(
+          `taskKey applies to action=send only (got action=${params.action})`,
+        );
+      }
 
       if (params.action === "send") {
         const to = params.to?.trim();
@@ -2184,8 +2204,7 @@ export default function towerDoExtension(pi: ExtensionAPI): void {
   pi.registerTool({
     name: TOWER_DO_STATUS_TOOL_NAME,
     label: "TowerDo Status",
-    description:
-      "Read the shared tower-do board: everyone's tasks (owner, status, deps, scope, blocks), messages addressed to you, open findings, and the recent activity tail. Also prints the board file path so subagents can read state directly (file-as-state). Pass taskKey to get the FULL detail of one task instead. Output is truncated to 50KB.",
+    description: `Read the shared tower-do board: everyone's tasks (owner, status, deps, scope, blocks), messages addressed to you, open findings, and the recent activity tail. Also prints the board file path and the current revision (pass it back as baseRevision) so subagents can read state directly (file-as-state). Reading here does NOT ack messages (tower_do_talk action=inbox does). Pass taskKey to get the FULL detail of one task instead. Output is truncated to ${Math.round(DEFAULT_MAX_BYTES / 1024)}KB.`,
     promptSnippet:
       "Show the shared multi-agent task board: tasks, messages, findings, activity",
     promptGuidelines: [

@@ -670,6 +670,21 @@ async function layer2(): Promise<void> {
     selfMsg.slice(0, 60),
   );
 
+  // taskKey is a send-only thread: inbox/finding must reject it loudly rather
+  // than accept it and silently drop the link.
+  const taskKeyOnFinding = await runThrow("tower_do_talk", {
+    action: "finding",
+    kind: "bug",
+    title: "x",
+    summary: "y",
+    taskKey: "auth",
+  } as never);
+  check(
+    "taskKey rejected on non-send action",
+    /taskKey applies to action=send only/.test(taskKeyOnFinding),
+    taskKeyOnFinding.slice(0, 60),
+  );
+
   // A node's own broadcast must not appear in its own inbox / status message
   // list (it already knows what it wrote); only OTHER nodes see it.
   await run("tower_do_talk", {

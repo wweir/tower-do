@@ -98,6 +98,9 @@ exception (no stale owners) rather than loosening the guard.
   recent board activity (a peer whose tasks are all completed stays reachable
   via its historical bylines); **self-send banned**; subject/recipient
   single-line; body ≤ 32 KiB (pointer-style references for long reports).
+- `taskKey` (optional thread under an existing task) is **send-only**: passing
+  it with `inbox`/`finding` is rejected — findings are board-level records and
+  carry no task link.
 - `inbox` **acks** what it shows (LWW `readBy` update). Sender never counts as a
   reader of its own broadcast; a broadcast's send-time owner list is snapshotted
   as `audience` — late joiners aren't part of it and can't pin retirement.
