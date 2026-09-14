@@ -73,6 +73,7 @@ jobs:
         run: |
           npm install -g npm@latest
           v="$(npm --version)"
+          v="${v#v}"
           echo "npm ${v}"
           if [ "$(printf '%s\n%s\n' "11.5.1" "$v" | sort -V | head -n1)" != "11.5.1" ]; then
             echo "::error::npm >= 11.5.1 required for trusted publishing, got ${v}"

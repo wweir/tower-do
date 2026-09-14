@@ -69,6 +69,13 @@ git tag vX.Y.Z && git push origin main --tags
   (connections created after 2026-09-03 default to stage-only).
   `package.json` `repository.url` must keep matching the GitHub repo, or npm
   refuses the exchange. The old `NPM_TOKEN` secret is no longer used.
+- **Until that npm-side connection exists, a tag push fails at `Publish to
+  npm` with `ENEEDAUTH`.** Other causes of the same error: the workflow
+  filename / repository / owner not matching npmjs.com exactly (those fields
+  are case-sensitive and the filename must include `.yml`), a self-hosted
+  runner, or `package.json` `repository.url` not matching the GitHub
+  repository. npm does not validate a connection when it is saved, so a typo
+  only surfaces on the next publish.
 - The GitHub Release notes are generated from conventional commits since the
   previous `v*` tag; the job needs `contents: write` for `gh release create`.
 
