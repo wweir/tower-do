@@ -67,13 +67,17 @@ jobs:
           registry-url: https://registry.npmjs.org
 
       # Trusted publishing needs npm >= 11.5.1; Node 22 ships an older npm.
-      # Fail loud here instead of at the OIDC exchange.
+      # Fail loud here instead of at the OIDC exchange. Version-sorted, so
+      # 11.5.0 is rejected and 11.5.1+ passes.
       - name: Upgrade npm for trusted publishing
         run: |
           npm install -g npm@latest
           v="$(npm --version)"
           echo "npm ${v}"
-          node -e 'const [a, b] = process.argv[1].split(".").map(Number); if (a < 11 || (a === 11 && b < 5)) { console.error("npm >= 11.5.1 required for trusted publishing, got " + process.argv[1]); process.exit(1); }' "$v"
+          if [ "$(printf '%s\n%s\n' "11.5.1" "$v" | sort -V | head -n1)" != "11.5.1" ]; then
+            echo "::error::npm >= 11.5.1 required for trusted publishing, got ${v}"
+            exit 1
+          fi
 
       # No NODE_AUTH_TOKEN: the npm CLI detects the OIDC environment and
       # exchanges the id-token for a short-lived publish token. The npm-side
