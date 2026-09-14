@@ -4,6 +4,32 @@
 > / reviews live in docs/plans + docs/reviews and get folded here when they
 > become durable rules.
 
+## 2026-09 — reminder cadence is independent of snapshot strip
+
+**Context.** `session_compact` / `before_agent_start` persist a
+`TOWER_DO_BOARD_TYPE` custom message in the transcript. The `context` hook
+strips those (and `TOWER_DO_REMINDER_TYPE`) so a peer cancel cannot linger
+in the LLM window. The same `hadBoardContext` flag also skipped
+`REMINDER_INTERVAL`: once a snapshot was in the window, every subsequent
+LLM call re-injected a fresh reminder.
+
+**Decision.** Strip is unconditional; cadence always counts the call. A
+leftover snapshot is removed even on the 1st/2nd call of the interval, and
+a replacement reminder is injected only when the counter hits
+`REMINDER_INTERVAL` (3). Because the strip also removes the snapshot a
+forced checkpoint just injected, `session_compact` (willRetry / pending
+messages) and `before_agent_start` arm the counter
+(`REMINDER_ARMED = REMINDER_INTERVAL - 1`) so the immediately following
+context event replaces it with a fresh one; the every-3 cadence then
+resumes. An all-done board still strips and never re-injects.
+
+**Rejected.** Refreshing the snapshot every call (keeps the LLM current,
+but the periodic reminder is then a standing prompt). Counting only calls
+that had no leftover snapshot (cadence would stall for the rest of a
+session after the first compact). Resetting the forced-checkpoint counter
+to 0 (the checkpoint's own snapshot is stripped before the LLM sees it, so
+its board context would never arrive).
+
 ## 2026-09 — glance rows are mine-first, counts stay board-wide
 
 **Context.** Widget (cap 3) and reminder (cap 12) listed unfinished tasks in

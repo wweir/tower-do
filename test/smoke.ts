@@ -23,6 +23,7 @@ import {
   formatBoardReminder,
   taskIsBlocked,
   TOWER_DO_BOARD_TYPE,
+  TOWER_DO_REMINDER_TYPE,
   writeBoardSnapshot,
 } from "../state.ts";
 
@@ -1232,32 +1233,60 @@ async function layer2(): Promise<void> {
     ctxReminder.includes("live-todo") && !ctxReminder.includes("stale-todo"),
     ctxReminder.slice(0, 120),
   );
-  const replaced = ctxHandler
-    ? ((await ctxHandler(
-        {
-          messages: [
-            {
-              role: "custom",
-              customType: TOWER_DO_BOARD_TYPE,
-              content:
-                "TowerDo shared board (revision 1; 1 task(s), 0 blocked, 0 unread message(s) for you).\n- [in_progress] stale-todo: old",
-            },
-          ],
-        } as never,
+  // A leftover compact snapshot must be stripped every call, but must not
+  // skip the 3-call cadence (the old hadBoardContext short-circuit re-injected
+  // every turn). After the loop above the counter is 0; the next four events
+  // with a stale snapshot inject only on the 3rd.
+  const staleSnapshot = {
+    role: "custom",
+    customType: TOWER_DO_BOARD_TYPE,
+    content:
+      "TowerDo shared board (revision 1; 1 task(s), 0 blocked, 0 unread message(s) for you).\n- [in_progress] stale-todo: old",
+  };
+  const cadenceHits: Array<{
+    injected: boolean;
+    stripped: boolean;
+    text: string;
+  }> = [];
+  if (ctxHandler !== undefined) {
+    for (let i = 0; i < 4; i += 1) {
+      const injected = (await ctxHandler(
+        { messages: [staleSnapshot] } as never,
         { ...ctxBase, cwd: ctxDir } as never,
-      )) as { messages?: Array<{ customType?: string; content?: string }> })
-    : undefined;
-  const replacedText = (replaced?.messages ?? [])
-    .map((message) => message.content ?? "")
-    .join("\n");
+      )) as
+        | {
+            messages?: Array<{ customType?: string; content?: string }>;
+          }
+        | undefined;
+      const msgs = injected?.messages ?? [];
+      cadenceHits.push({
+        injected: msgs.some(
+          (message) => message.customType === TOWER_DO_REMINDER_TYPE,
+        ),
+        stripped: !msgs.some(
+          (message) => message.customType === TOWER_DO_BOARD_TYPE,
+        ),
+        text: msgs.map((message) => message.content ?? "").join("\n"),
+      });
+    }
+  }
   check(
     "context strips compact snapshots so cancelled todos leave the LLM",
-    replacedText.includes("live-todo") &&
-      !replacedText.includes("stale-todo") &&
-      !(replaced?.messages ?? []).some(
-        (message) => message.customType === TOWER_DO_BOARD_TYPE,
+    cadenceHits.length === 4 &&
+      cadenceHits.every(
+        (hit) => hit.stripped && !hit.text.includes("stale-todo"),
       ),
-    replacedText.slice(0, 160),
+    cadenceHits.map((hit) => hit.text.slice(0, 40)).join(" | ") || "(no hits)",
+  );
+  check(
+    "context reminder cadence is every 3 LLM calls even with a leftover snapshot",
+    cadenceHits.length === 4 &&
+      cadenceHits[0]?.injected === false &&
+      cadenceHits[1]?.injected === false &&
+      cadenceHits[2]?.injected === true &&
+      cadenceHits[3]?.injected === false &&
+      (cadenceHits[2]?.text.includes("live-todo") ?? false),
+    cadenceHits.map((hit) => (hit.injected ? "inject" : "strip")).join(","),
   );
 
   // Compact must re-fold disk so a later session's cancel is what gets
@@ -1396,6 +1425,98 @@ async function layer2(): Promise<void> {
     reminder.includes("live-todo") && !reminder.includes("stale-todo"),
     reminder.slice(0, 120),
   );
+
+  // A forced checkpoint (compact steer / before_agent_start) injects its own
+  // BOARD_TYPE snapshot, but the context hook strips that snapshot before the
+  // LLM sees it. The checkpoint must therefore arm the next context event;
+  // otherwise throttling silently drops the board context it was meant to
+  // deliver.
+  const armCtx = ctxHandler;
+  const armCompact = compactHandler;
+  const armStart = agentStart;
+  if (
+    armCtx !== undefined &&
+    armCompact !== undefined &&
+    armStart !== undefined
+  ) {
+    const armDir = mkdtempSync(join(tmpdir(), "tower-do-arm-"));
+    await run(
+      "tower_do",
+      {
+        tasks: [{ key: "arm-todo", subject: "open", status: "in_progress" }],
+        as: "tower",
+      } as never,
+      armDir,
+    );
+    // A completed-only board file (not a missing one) makes the reset
+    // deterministic: the handler only re-folds when the file exists.
+    const doneDir = mkdtempSync(join(tmpdir(), "tower-do-arm-done-"));
+    await run(
+      "tower_do",
+      {
+        tasks: [{ key: "done-todo", subject: "closed", status: "completed" }],
+        as: "tower",
+      } as never,
+      doneDir,
+    );
+    const resetCadence = async (): Promise<void> => {
+      await armCtx(
+        { messages: [] } as never,
+        {
+          ...ctxBase,
+          cwd: doneDir,
+        } as never,
+      );
+    };
+    const injectsNow = async (cwd: string): Promise<boolean> => {
+      const injected = (await armCtx(
+        { messages: [] } as never,
+        {
+          ...ctxBase,
+          cwd,
+        } as never,
+      )) as { messages?: Array<{ customType?: string }> } | undefined;
+      return (injected?.messages ?? []).some(
+        (message) => message.customType === TOWER_DO_REMINDER_TYPE,
+      );
+    };
+
+    await resetCadence();
+    await armCompact(
+      { willRetry: true } as never,
+      {
+        ...ctxBase,
+        cwd: armDir,
+        hasPendingMessages: () => false,
+      } as never,
+    );
+    check(
+      "compact steer arms the next context event with a fresh reminder",
+      await injectsNow(armDir),
+      "compact-steer",
+    );
+
+    await resetCadence();
+    await armCompact(
+      { willRetry: false } as never,
+      {
+        ...ctxBase,
+        cwd: armDir,
+        hasPendingMessages: () => false,
+      } as never,
+    );
+    await armStart({} as never, { ...ctxBase, cwd: armDir } as never);
+    check(
+      "before_agent_start arms the next context event with a fresh reminder",
+      await injectsNow(armDir),
+      "before-agent-start",
+    );
+    check(
+      "an armed checkpoint reminder does not become a per-call reminder",
+      !(await injectsNow(armDir)),
+      "post-arm-call",
+    );
+  }
 
   // Config is global ($HOME/.pi/agent/tower-do/config.json). Point HOME at
   // the fixture dir so the loader reads the fixture, restore the previous

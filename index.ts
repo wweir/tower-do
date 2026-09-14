@@ -151,6 +151,13 @@ const WIDGET_KEY = "pi-tower-do-widget";
 // no user evidence ever justified tuning them, and every knob is permanent
 // schema+docs+test surface).
 const REMINDER_INTERVAL = 3; // inject a board reminder every N LLM calls
+// A forced checkpoint (compact steer / before_agent_start) injects its own
+// board snapshot, but the context hook strips that snapshot before the LLM
+// sees it (it is a persisted custom message). Arm the counter so the next
+// context event replaces it immediately; the steady-state cadence resumes
+// from there. Without this arming the checkpoint's snapshot never reaches
+// the LLM. See DECISIONS.md (reminder cadence vs snapshot strip).
+const REMINDER_ARMED = REMINDER_INTERVAL - 1;
 const WIDGET_TASK_LIMIT = 3; // unfinished tasks shown in the above-editor line
 const STATUS_ACTIVITY_TAIL = 8; // activity feed lines in tower_do_status
 const MESSAGE_RETENTION = 50; // max fully-read messages kept in the view
@@ -2659,7 +2666,9 @@ export default function towerDoExtension(pi: ExtensionAPI): void {
   pi.on("context", async (event, ctx) => {
     // Compact / before_agent_start inject TOWER_DO_BOARD_TYPE snapshots that
     // persist in the session transcript. They must not keep cancelled todos
-    // in the LLM context after a peer writes; strip and replace from disk.
+    // in the LLM context after a peer writes; always strip them. Replacing
+    // with a fresh reminder is a separate cadence (REMINDER_INTERVAL) — a
+    // leftover snapshot must not skip the counter and re-inject every call.
     const isBoardContext = (message: {
       role?: string;
       customType?: string;
@@ -2667,15 +2676,13 @@ export default function towerDoExtension(pi: ExtensionAPI): void {
       message.role === "custom" &&
       (message.customType === TOWER_DO_REMINDER_TYPE ||
         message.customType === TOWER_DO_BOARD_TYPE);
-    const hadBoardContext = event.messages.some(isBoardContext);
     const messages = event.messages.filter(
       (message) => !isBoardContext(message),
     );
+    const stripped = messages.length !== event.messages.length;
     const cwd = ctx?.cwd ?? activeCwd;
     if (cwd === undefined) {
-      return hadBoardContext || messages.length !== event.messages.length
-        ? { messages }
-        : undefined;
+      return stripped ? { messages } : undefined;
     }
     const contextEntry = boards.entryFor(cwd);
     if (existsSync(contextEntry.board.file)) {
@@ -2687,17 +2694,11 @@ export default function towerDoExtension(pi: ExtensionAPI): void {
     const hasInbox = unreadMessagesToMe(currentView, identity).length > 0;
     if (!hasUnfinished && !hasInbox) {
       llmCallsSinceReminder = 0;
-      return hadBoardContext || messages.length !== event.messages.length
-        ? { messages }
-        : undefined;
+      return stripped ? { messages } : undefined;
     }
-    if (!hadBoardContext) {
-      llmCallsSinceReminder += 1;
-      if (llmCallsSinceReminder < REMINDER_INTERVAL) {
-        return messages.length === event.messages.length
-          ? undefined
-          : { messages };
-      }
+    llmCallsSinceReminder += 1;
+    if (llmCallsSinceReminder < REMINDER_INTERVAL) {
+      return stripped ? { messages } : undefined;
     }
     llmCallsSinceReminder = 0;
     return {
@@ -2730,7 +2731,7 @@ export default function towerDoExtension(pi: ExtensionAPI): void {
     }
     if (event.willRetry || ctx.hasPendingMessages()) {
       contextCheckpointNeeded = false;
-      llmCallsSinceReminder = 0;
+      llmCallsSinceReminder = REMINDER_ARMED;
       pi.sendMessage(
         {
           customType: TOWER_DO_BOARD_TYPE,
@@ -2748,7 +2749,7 @@ export default function towerDoExtension(pi: ExtensionAPI): void {
   pi.on("before_agent_start", async (_event, ctx) => {
     if (!contextCheckpointNeeded) return;
     contextCheckpointNeeded = false;
-    llmCallsSinceReminder = 0;
+    llmCallsSinceReminder = REMINDER_ARMED;
     const cwd = ctx?.cwd ?? activeCwd;
     if (cwd !== undefined) {
       const entry = boards.entryFor(cwd);

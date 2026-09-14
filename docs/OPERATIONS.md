@@ -89,5 +89,11 @@ git tag vX.Y.Z && git push origin main --tags
   re-scope. They never block writes.
 - **Peer edits invisible** — every read path re-folds from disk. Widget and
   context reminders also re-fold on `agent_settled` / each LLM `context` event,
-  so a peer's cancel shows up without waiting for a tool call. Cross-process
-  writers are last-writer-wins past the revision gate (single-tower assumption).
+  so a peer's cancel shows up without waiting for a tool call. Stale compact
+  snapshots are stripped on every `context` event; a replacement reminder is
+  injected every 3 LLM calls (`REMINDER_INTERVAL`), not on every call just
+  because a leftover snapshot was present. A forced checkpoint
+  (`session_compact` retry / `before_agent_start`) arms the next event so its
+  own snapshot is immediately replaced instead of being stripped and lost.
+  Cross-process writers are last-writer-wins past the revision gate
+  (single-tower assumption).
