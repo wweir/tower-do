@@ -57,9 +57,18 @@ git tag vX.Y.Z && git push origin main --tags
   step), so the "compile" gate is `bunx tsc --noEmit -p tsconfig.json`.
 - Tag must equal `package.json` version (`v` stripped); a mismatched tag
   fails the job before publish.
-- Publish uses npm provenance (`--provenance`) with the `id-token` permission;
-  auth comes from the `NPM_TOKEN` repository secret. Requires a GitHub-hosted
-  runner (provenance is unavailable on self-hosted runners).
+- Publish uses **npm trusted publishing (OIDC)** — no repository secret. The
+  workflow's `id-token: write` permission lets the npm CLI exchange a
+  short-lived publish token, and provenance is generated automatically.
+  Requires a GitHub-hosted runner (OIDC/trusted publishing is unavailable on
+  self-hosted runners) and npm >= 11.5.1 — the job upgrades npm and fails
+  loud below that version.
+- One-time npmjs.com setup: package `tower-do` → Settings → Trusted Publisher
+  → GitHub Actions, with Organization or user `wweir`, Repository `tower-do`,
+  Workflow filename `release.yml`, and **Allow `npm publish`** enabled
+  (connections created after 2026-09-03 default to stage-only).
+  `package.json` `repository.url` must keep matching the GitHub repo, or npm
+  refuses the exchange. The old `NPM_TOKEN` secret is no longer used.
 - The GitHub Release notes are generated from conventional commits since the
   previous `v*` tag; the job needs `contents: write` for `gh release create`.
 

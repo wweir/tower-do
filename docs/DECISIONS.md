@@ -4,6 +4,31 @@
 > / reviews live in docs/plans + docs/reviews and get folded here when they
 > become durable rules.
 
+## 2026-09 — publish auth moves to trusted publishing (OIDC), no token
+
+**Context.** `release.yml` published with `NODE_AUTH_TOKEN:
+${{ secrets.NPM_TOKEN }}`. The token expired (npm defaults new tokens to 7
+days), which failed the v0.3.5 release with `E404`; a token without bypass
+2FA fails with `E403`, and npm removes bypass-2FA direct-publish tokens in
+January 2027. A long-lived publish token is a standing secret to rotate and
+leak.
+
+**Decision.** Publish with npm **trusted publishing**: keep `id-token: write`,
+drop `NODE_AUTH_TOKEN`, upgrade npm (needs >= 11.5.1; Node 22 ships older) and
+fail loud below that version. Authentication is a short-lived OIDC exchange
+scoped to this workflow, and provenance is automatic. The npm-side connection
+is package `tower-do` → Settings → Trusted Publisher → GitHub Actions
+(`wweir` / `tower-do` / `release.yml`) with **Allow `npm publish`** explicitly
+enabled — connections created after 2026-09-03 default to stage-only.
+`package.json` `repository.url` must keep matching the GitHub repository, or
+npm refuses the exchange.
+
+**Rejected.** Keeping the token as a fallback in the same job: it would mask an
+OIDC misconfiguration (the publish would succeed via the token, so the switch
+would be unverified). Staged publishing (`npm stage publish` + manual 2FA
+approval) is the stronger posture, but this repo releases on tag push and a
+manual approval per release was not wanted.
+
 ## 2026-09 — reminder cadence is independent of snapshot strip
 
 **Context.** `session_compact` / `before_agent_start` persist a

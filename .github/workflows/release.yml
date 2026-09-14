@@ -12,7 +12,7 @@ jobs:
     runs-on: ubuntu-latest
     permissions:
       contents: write # create the GitHub Release
-      id-token: write # for npm provenance (public registry)
+      id-token: write # OIDC: trusted-publishing auth + provenance
     steps:
       # fetch-depth 0: the release notes below walk back to the previous v* tag,
       # which a default depth-1 checkout cannot see — it silently degraded the
@@ -58,17 +58,28 @@ jobs:
           fi
           echo "tag ${GITHUB_REF_NAME} matches package version ${pkg}"
 
-      # npm does not read NODE_AUTH_TOKEN without a .npmrc registry mapping;
-      # setup-node writes it (and publishes against the public registry).
+      # Trusted publishing: authentication comes from the workflow's id-token,
+      # not a repository secret. setup-node still maps the public registry
+      # (.npmrc write only, no token).
       - uses: actions/setup-node@820762786026740c76f36085b0efc47a31fe5020 # v7.0.0 # zizmor: ignore[cache-poisoning] (no cache configured; .npmrc write only)
         with:
           node-version: 22
           registry-url: https://registry.npmjs.org
 
+      # Trusted publishing needs npm >= 11.5.1; Node 22 ships an older npm.
+      # Fail loud here instead of at the OIDC exchange.
+      - name: Upgrade npm for trusted publishing
+        run: |
+          npm install -g npm@latest
+          v="$(npm --version)"
+          echo "npm ${v}"
+          node -e 'const [a, b] = process.argv[1].split(".").map(Number); if (a < 11 || (a === 11 && b < 5)) { console.error("npm >= 11.5.1 required for trusted publishing, got " + process.argv[1]); process.exit(1); }' "$v"
+
+      # No NODE_AUTH_TOKEN: the npm CLI detects the OIDC environment and
+      # exchanges the id-token for a short-lived publish token. The npm-side
+      # connection must allow direct `npm publish` (see docs/OPERATIONS.md).
       - name: Publish to npm
         run: npm publish --provenance --access public
-        env:
-          NODE_AUTH_TOKEN: ${{ secrets.NPM_TOKEN }}
 
       # Create the GitHub Release from the version tag (npm publish done).
       # Notes cover commits since the previous v* tag — no third-party action.
