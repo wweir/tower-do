@@ -611,6 +611,101 @@ async function layer2(): Promise<void> {
     "pending filter empty",
   );
 
+  // The explicit-limit branch of the hidden-rows note (the default-budget
+  // branch is unit-tested in test/mine-first.ts): the dashboard must SAY what
+  // it dropped.
+  const capped = await run("tower_do_status", { limit: 1 } as never);
+  check(
+    "dashboard reports rows hidden beyond an explicit limit",
+    capped.text.includes("more row(s) hidden by the 1-row budget") &&
+      capped.text.includes("pass a larger limit"),
+    capped.text.split("\n").slice(-3).join(" / "),
+  );
+
+  // A dashboard past the host byte cap must SAY it dropped its head: the head
+  // carries the revision, the board file path and (open-first) the unfinished
+  // work, so an unmarked cut would hand the caller a silently incomplete board
+  // to replay. Fat receipts are the cheapest way to grow the render.
+  const fatDir = mkdtempSync(join(tmpdir(), "tower-do-trunc-"));
+  const fatFiles = Array.from(
+    { length: 4 },
+    (_, i) => `src/some/long/path/segment-${String(i)}/${"x".repeat(200)}.ts`,
+  );
+  const fatBatch = (round: number): Array<Record<string, unknown>> =>
+    Array.from({ length: 50 }, (_, i) => ({
+      key: `fat-${String(round * 50 + i)}`,
+      subject: `delivered artifact ${String(round * 50 + i)}`,
+      status: "completed",
+      changedFiles: fatFiles,
+    }));
+  await run("tower_do", { tasks: fatBatch(0) } as never, fatDir);
+  await run(
+    "tower_do",
+    {
+      tasks: [
+        ...fatBatch(0).map((task) => ({ key: task.key })),
+        ...fatBatch(1),
+      ],
+    } as never,
+    fatDir,
+  );
+  const fatStatus = await run("tower_do_status", {} as never, fatDir);
+  check(
+    "dashboard past the byte cap discloses the dropped head",
+    fatStatus.text.includes("… dashboard truncated:") &&
+      fatStatus.text.includes("Revision ") &&
+      fatStatus.text.includes("board file ") &&
+      !fatStatus.text.includes("TowerDo shared board — identity"),
+    fatStatus.text.split("\n").slice(-1)[0]?.slice(0, 140),
+  );
+  // The disclosure must not itself break the promised bound: the body is cut
+  // with the footer's bytes reserved.
+  check(
+    "truncated dashboard still fits the declared byte cap",
+    Buffer.byteLength(fatStatus.text, "utf8") <= 50 * 1024,
+    `${String(Buffer.byteLength(fatStatus.text, "utf8"))} bytes`,
+  );
+
+  // The LINE bound is reachable in its own right: raise `limit` above it with
+  // tiny rows and it binds before the byte cap. The disclosure must survive
+  // this cut too (its line is reserved), so the result never reports a cut by
+  // exceeding the line budget it just applied.
+  const lineDir = mkdtempSync(join(tmpdir(), "tower-do-lines-"));
+  const lineEvents: ReturnType<typeof writeBoardSnapshot>["taskEvents"] = [];
+  let lineView = createEmptyBoard();
+  for (let round = 0; round < 45; round += 1) {
+    const details = writeBoardSnapshot(
+      lineView,
+      {
+        tasks: [
+          ...lineView.tasks.map((item) => ({ key: item.key })),
+          ...Array.from({ length: 50 }, (_, i) => ({
+            key: `l${String(round)}-${String(i)}`,
+            subject: "x",
+            status: "completed" as const,
+          })),
+        ],
+      },
+      "seed",
+    );
+    lineView = details.view;
+    lineEvents.push(...details.taskEvents);
+  }
+  await new TowerBoard(boardFileFor(lineDir)).append(lineEvents);
+  const lineStatus = await run(
+    "tower_do_status",
+    { limit: 5000 } as never,
+    lineDir,
+  );
+  const lineCount = lineStatus.text.split("\n").length;
+  check(
+    "line-bound cut keeps the disclosure and the line budget",
+    lineStatus.text.includes("… dashboard truncated:") &&
+      lineCount <= 2000 &&
+      !lineStatus.text.includes("TowerDo shared board — identity"),
+    `rows=${String(lineView.tasks.length)} lines=${String(lineCount)}`,
+  );
+
   // bob (as subagent id) tries to complete alice's task → ownership error.
   const blockedMsg = await runThrow("tower_do", {
     tasks: [

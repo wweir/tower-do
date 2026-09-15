@@ -1824,6 +1824,52 @@ export function orderTasksMineFirst(
   return [...mine, ...rest];
 }
 
+/** Default `tower_do_status` dashboard budget (rows rendered per call). The
+ * open-task quota is 50, so this can only ever bind on a long completed
+ * history or an explicit smaller `limit`. */
+export const DASHBOARD_ROW_BUDGET = 200;
+
+/** Slice the dashboard listing, reporting how many rows it had to hide.
+ *
+ * `limit` explicit = the caller asked for fold order, honoured verbatim.
+ * Default budget = open (non-completed) rows win it: a completed history
+ * longer than the budget must never hide unfinished work, and boards now
+ * outgrow the budget (the row cap became an open budget — see DECISIONS.md
+ * "open-task budget"). Stable partition, so every status group keeps fold
+ * order. Does not mutate `tasks`. */
+export function sliceTaskDashboard(
+  tasks: readonly TowerDoTask[],
+  limit: number | undefined,
+): { shown: TowerDoTask[]; hidden: number } {
+  const ordered =
+    limit === undefined
+      ? [
+          ...tasks.filter((task) => task.status !== "completed"),
+          ...tasks.filter((task) => task.status === "completed"),
+        ]
+      : tasks;
+  const budget = limit ?? DASHBOARD_ROW_BUDGET;
+  const shown = ordered.slice(0, budget);
+  return { shown: [...shown], hidden: ordered.length - shown.length };
+}
+
+/** Footer note naming what the dashboard budget hid and how to see it. The
+ * default budget and an explicit `limit` hide rows for different reasons, so
+ * they carry different remedies. `undefined` when nothing was hidden. */
+export function formatDashboardHiddenNote(
+  hidden: number,
+  limit: number | undefined,
+): string | undefined {
+  if (hidden <= 0) return undefined;
+  const budget = limit ?? DASHBOARD_ROW_BUDGET;
+  return (
+    `… +${String(hidden)} more row(s) hidden by the ${String(budget)}-row budget` +
+    (limit === undefined
+      ? " (open rows win the default budget — pass limit to widen, or narrow with owner=/status=)"
+      : " (pass a larger limit, or narrow with owner=/status=)")
+  );
+}
+
 /** Compact status-line rendering of the whole board for reminders. */
 export function formatBoardReminder(
   view: TowerBoardView,

@@ -37,6 +37,7 @@ import { StringEnum } from "@earendil-works/pi-ai";
 import {
   CONFIG_DIR_NAME,
   DEFAULT_MAX_BYTES,
+  DEFAULT_MAX_LINES,
   keyHint,
   truncateTail,
   withFileMutationQueue,
@@ -96,6 +97,7 @@ import {
   formatActivityFeed,
   formatBoardProgress,
   formatBoardReminder,
+  formatDashboardHiddenNote,
   findScopeConflicts,
   orderTasksMineFirst,
   formatLiveSegment,
@@ -122,6 +124,7 @@ import {
   parseActivityLine,
   relativeTime,
   retainMessages,
+  sliceTaskDashboard,
   staleTaskOwners,
   taskIsBlocked,
   TOWER_DO_BOARD_TYPE,
@@ -595,9 +598,9 @@ const StatusParamsSchema = Type.Object({
   ),
   limit: Type.Optional(
     Type.Integer({
-      description: "Max task lines (default 200)",
+      description:
+        "Max task lines (default 200). The default budget is won by open (non-completed) rows, so a long completed history can never hide unfinished work; an explicit limit is honoured in fold order. Hidden rows are reported in the output.",
       minimum: 1,
-      maximum: 200,
     }),
   ),
 });
@@ -2211,7 +2214,7 @@ export default function towerDoExtension(pi: ExtensionAPI): void {
   pi.registerTool({
     name: TOWER_DO_STATUS_TOOL_NAME,
     label: "TowerDo Status",
-    description: `Read the shared tower-do board: everyone's tasks (owner, status, deps, scope, blocks), messages addressed to you, open findings, and the recent activity tail. Also prints the board file path and the current revision (pass it back as baseRevision) so subagents can read state directly (file-as-state). Reading here does NOT ack messages (tower_do_talk action=inbox does). Pass taskKey to get the FULL detail of one task instead. Output is truncated to ${Math.round(DEFAULT_MAX_BYTES / 1024)}KB.`,
+    description: `Read the shared tower-do board: everyone's tasks (owner, status, deps, scope, blocks), messages addressed to you, open findings, and the recent activity tail. Also prints the board file path and the current revision (pass it back as baseRevision) so subagents can read state directly (file-as-state). Reading here does NOT ack messages (tower_do_talk action=inbox does). Pass taskKey to get the FULL detail of one task instead. Output is bounded to ${Math.round(DEFAULT_MAX_BYTES / 1024)}KB / ${String(DEFAULT_MAX_LINES)} lines from the TAIL (the head — header, revision, board file path and open-task rows — is dropped first) and says so in a footer when that happens.`,
     promptSnippet:
       "Show the shared multi-agent task board: tasks, messages, findings, activity",
     promptGuidelines: [
@@ -2241,6 +2244,9 @@ export default function towerDoExtension(pi: ExtensionAPI): void {
       const pendingCount = statusCount("pending");
       const completedCount = statusCount("completed");
       const blockedCount = statusCount("blocked");
+      // Write-side capacity is stored status, not display status (a gated
+      // pending row still occupies an open slot): open = non-completed.
+      const openCount = tasks.length - completedCount;
       // Fetch a wider tail than the rendered window: presence (who is around,
       // who went idle) needs enough history to judge inactivity, while the
       // rendered activity feed only shows the configured activity tail.
@@ -2292,11 +2298,12 @@ export default function towerDoExtension(pi: ExtensionAPI): void {
                   displayStatus(task) === params.status),
             )
           : tasks;
-      const limit = params.limit ?? 200;
-      // Slice is still fold order (default 200 never binds below
-      // MAX_TOWER_DO_TASKS). Mine-first runs per status group on that
-      // already-sliced list — it must not steal the global limit budget.
-      const shown = filtered.slice(0, limit);
+      const limit = params.limit;
+      // Open rows win the default budget (stable partition, so groups keep fold
+      // order); an explicit `limit` is honoured in fold order verbatim. Mine-first
+      // runs per status group on this already-sliced list — it must not steal the
+      // global limit budget.
+      const { shown, hidden } = sliceTaskDashboard(filtered, limit);
 
       // Single-task detail mode: taskKey takes precedence over the dashboard
       // filters — the caller asked for one task's full record (description is
@@ -2372,8 +2379,13 @@ export default function towerDoExtension(pi: ExtensionAPI): void {
           : `last updated ${relativeTime(now, lastWrite.at)} by ${lastWrite.by}`;
       lines.push(`Activity: ${updated}`);
       lines.push(
-        `Tasks: ${tasks.length} total (${inProgressCount} in_progress, ${blockedCount} blocked, ${pendingCount} pending, ${completedCount} completed)`,
+        `Tasks: ${tasks.length} total (${inProgressCount} in_progress, ${blockedCount} blocked, ${pendingCount} pending, ${completedCount} completed) · open ${openCount}/${MAX_TOWER_DO_OPEN_TASKS}`,
       );
+      if (openCount >= MAX_TOWER_DO_OPEN_TASKS) {
+        lines.push(
+          `Open-task budget full: completed rows do not count — omit your own or an unowned task, or compact a finished board with an as: "tower" write replaying just the rows to keep.`,
+        );
+      }
       lines.push("");
 
       // Presence head: surface owners of unfinished work (active / idle /
@@ -2462,6 +2474,8 @@ export default function towerDoExtension(pi: ExtensionAPI): void {
       renderGroup("Completed", (task) => displayStatus(task) === "completed");
 
       if (shown.length === 0) lines.push("(no tasks match the filter)");
+      const hiddenNote = formatDashboardHiddenNote(hidden, limit);
+      if (hiddenNote !== undefined) lines.push(hiddenNote);
 
       if (scopeConflicts.length > 0) {
         lines.push(`## Scope conflicts (${scopeConflicts.length}) — advisory`);
@@ -2514,10 +2528,29 @@ export default function towerDoExtension(pi: ExtensionAPI): void {
       }
       if (recentEntries.length === 0) lines.push("(no recent activity)");
 
-      const truncated = truncateTail(`${lines.join("\n")}\n`, {
-        maxBytes: DEFAULT_MAX_BYTES,
-      });
-      const text = truncated.content;
+      const full = `${lines.join("\n")}\n`;
+      const cut = truncateTail(full, { maxBytes: DEFAULT_MAX_BYTES });
+      // truncateTail keeps the TAIL and drops the head — which is exactly where
+      // the revision, the board file path and the open-task rows live (open
+      // groups render first). An unmarked cut would silently cost the caller
+      // rows it must name in its next full-replacement write, so the surviving
+      // tail carries the essentials plus an explicit warning. The warning is
+      // part of the same budget: the body is re-cut with room reserved for it
+      // in BOTH bounds (bytes and one line), so the note can never be the row
+      // that pushes the result past what this call promised.
+      const truncationNote = (shown: number, total: number): string =>
+        `… dashboard truncated: showing the last ${String(shown)} of ${String(total)} lines (the head was dropped — the open-task listing and the header may be missing). Revision ${String(view.revision)} · board file ${board.file} — read that file for the full fold, or narrow this call with limit/owner=/status=.`;
+      let text = cut.content;
+      if (cut.truncated) {
+        const reserved = truncationNote(cut.outputLines, cut.totalLines);
+        const head = truncateTail(full, {
+          maxBytes: DEFAULT_MAX_BYTES - Buffer.byteLength(reserved) - 1,
+          maxLines: DEFAULT_MAX_LINES - 1,
+        });
+        // The re-cut can only show fewer lines than `cut`, and the line totals
+        // it reports are the same, so the final note cannot outgrow `reserved`.
+        text = `${head.content}\n${truncationNote(head.outputLines, head.totalLines)}`;
+      }
       return {
         content: [{ type: "text", text }],
         details: {
