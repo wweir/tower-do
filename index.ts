@@ -116,7 +116,8 @@ import {
   MAX_FINDING_TITLE_CHARS,
   MAX_MESSAGE_BYTES,
   MAX_MESSAGE_SUBJECT_CHARS,
-  MAX_TOWER_DO_TASKS,
+  MAX_TOWER_DO_ALIASES,
+  MAX_TOWER_DO_OPEN_TASKS,
   messagesToMe,
   parseActivityLine,
   relativeTime,
@@ -465,8 +466,7 @@ const TowerDoTaskSchema = Type.Object({
 const TowerDoParamsSchema = Type.Object({
   tasks: Type.Array(TowerDoTaskSchema, {
     description:
-      "Complete authoritative task list to retain: every key you want kept must appear here, because any current key omitted from the list is removed. An omitted task owned by another agent (and not stale) makes the write fail rather than dropping it; replay peers' and unowned tasks you did not mean to remove. Existing keys may omit unchanged fields (they are preserved per field); new keys require subject and status.",
-    maxItems: MAX_TOWER_DO_TASKS,
+      `Complete authoritative task list to retain: every key you want kept must appear here, because any current key omitted from the list is removed. An omitted task owned by another agent (and not stale) makes the write fail rather than dropping it; replay peers' and unowned tasks you did not mean to remove. Existing keys may omit unchanged fields (they are preserved per field); new keys require subject and status. Capacity: at most ${MAX_TOWER_DO_OPEN_TASKS} non-completed tasks — completed rows are receipts, they replay free and never block a new plan; one write may introduce at most ${MAX_TOWER_DO_OPEN_TASKS} NEW completed rows (replaying an existing receipt is free, split larger batches across successive writes).`,
   }),
   baseRevision: Type.Optional(
     Type.Integer({
@@ -1220,9 +1220,9 @@ export default function towerDoExtension(pi: ExtensionAPI): void {
     const self = sessionIdentity(cwd, pi);
     if (caller === self || caller === "" || caller === "all") return;
     if (liveAliases.has(caller)) return;
-    if (liveAliases.size >= MAX_TOWER_DO_TASKS) {
+    if (liveAliases.size >= MAX_TOWER_DO_ALIASES) {
       throw new TowerDoValidationError(
-        `as identities this session can remember at most ${String(MAX_TOWER_DO_TASKS)} aliases for liveness (got "${caller}")`,
+        `as identities this session can remember at most ${String(MAX_TOWER_DO_ALIASES)} aliases for liveness (got "${caller}")`,
       );
     }
     liveAliases.add(caller);
@@ -1606,7 +1606,7 @@ export default function towerDoExtension(pi: ExtensionAPI): void {
 - Dependencies gate status: in_progress/completed require every dependsOn entry to be completed, dependsOn keys must exist on the board or in this call, and cycles are rejected (blocked is exempt).
 - Set changedFiles only in the same write that completes a task; reopening a task without changedFiles voids the inherited receipt.
 - Always pass baseRevision from tower_do_status; omitting it disables the stale-write check.
-- Up to ${MAX_TOWER_DO_TASKS} tasks. Optional per-task fields: dependsOn (see above), scope (file globs the task may touch), blockedBy (free-form ids — non-empty renders a non-completed task as blocked).`,
+- Capacity: up to ${MAX_TOWER_DO_OPEN_TASKS} non-completed tasks. Completed rows are receipts — they replay free, do not count, and can only be dropped by their owner or "tower", so a board of finished work never blocks a new plan. One write may introduce at most ${MAX_TOWER_DO_OPEN_TASKS} NEW completed rows (replaying an existing receipt is free; split a larger batch of deliveries across successive writes). When the open budget is full, omit your own or an unowned task; a board holding only completed rows is compacted by an as: "tower" write replaying just the rows to keep. Optional per-task fields: dependsOn (see above), scope (file globs the task may touch), blockedBy (free-form ids — non-empty renders a non-completed task as blocked).`,
     promptSnippet:
       "Maintain the shared multi-agent task board with one atomic update",
     promptGuidelines: [

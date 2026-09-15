@@ -26,7 +26,16 @@ export const TOWER_DO_REMINDER_TYPE = "pi-tower-do-reminder";
 export const TOWER_DO_TOOL_NAME = "tower_do";
 export const TOWER_DO_TALK_TOOL_NAME = "tower_do_talk";
 export const TOWER_DO_STATUS_TOOL_NAME = "tower_do_status";
-export const MAX_TOWER_DO_TASKS = 50;
+/** Open-task budget: how many NON-completed tasks a board may hold. Completed
+ * rows are receipts/history, not work: they replay free and never consume the
+ * budget, otherwise a board whose rows are all completed becomes unwritable
+ * for every session that is not an owner or `tower` (the guard pins completed
+ * rows to their owner forever). See DECISIONS.md "open-task budget". */
+export const MAX_TOWER_DO_OPEN_TASKS = 50;
+/** Live-alias memory cap: distinct `as` labels one session records in its own
+ * liveness sidecar. Unrelated to the task budget (identities, not work); they
+ * were one constant before and silently changed together. */
+export const MAX_TOWER_DO_ALIASES = 50;
 const MAX_TASK_DEPENDENCIES = 20;
 const MAX_SCOPE_GLOBS = 20;
 const MAX_CHANGED_FILES = 100;
@@ -282,12 +291,6 @@ export function writeBoardSnapshot(
         "call tower_do_status to re-read the shared board, then merge your changes",
     );
   }
-  if (input.tasks.length > MAX_TOWER_DO_TASKS) {
-    throw new TowerDoValidationError(
-      `tasks supports at most ${MAX_TOWER_DO_TASKS} items`,
-    );
-  }
-
   const existingByKey = new Map(current.tasks.map((task) => [task.key, task]));
   const resolved: ResolvedTowerDoTaskInput[] = [];
   const keys = new Set<string>();
@@ -357,6 +360,36 @@ export function writeBoardSnapshot(
         },
         index,
       ),
+    );
+  }
+
+  // Capacity is charged to open work, not to history: completed rows stay
+  // replayable without limit. Both checks run after normalization on purpose —
+  // the open quota is the common overflow and carries the remediation hint, so
+  // it must be the error the caller sees.
+  const openTaskCount = resolved.filter(
+    (task) => task.status !== "completed",
+  ).length;
+  if (openTaskCount > MAX_TOWER_DO_OPEN_TASKS) {
+    throw new TowerDoValidationError(
+      `open tasks support at most ${MAX_TOWER_DO_OPEN_TASKS} items (got ${openTaskCount}; completed rows do not count)` +
+        OPEN_TASK_BUDGET_HINT,
+    );
+  }
+  // What the budget bounds is fabricated history, not batch length: a delivered
+  // task is one the board already carries (replaying it is free), so this caps
+  // only the NEW completed rows a single write introduces. A length ceiling
+  // would reject an honest full replay as soon as the board outgrew any fixed
+  // number — the deadlock this budget exists to remove. The quota is
+  // deliberately the same constant as the open budget (one number, two
+  // readings: work a board carries / history one write may invent) — not a
+  // second knob whose value could drift from the first.
+  const newCompleted = resolved.filter(
+    (task) => task.status === "completed" && !existingByKey.has(task.key),
+  ).length;
+  if (newCompleted > MAX_TOWER_DO_OPEN_TASKS) {
+    throw new TowerDoValidationError(
+      `a write may introduce at most ${MAX_TOWER_DO_OPEN_TASKS} new completed tasks (got ${newCompleted}; replaying a completed row the board already holds is free — do not fabricate receipts, split deliveries across successive writes)`,
     );
   }
 
@@ -1569,6 +1602,12 @@ export function staleTaskOwners(
   return stale;
 }
 
+/** Remediation hint attached to a full open-task budget (see writeBoardSnapshot):
+ * what the caller can free, and how a board holding nothing but completed rows
+ * is compacted. */
+const OPEN_TASK_BUDGET_HINT =
+  ' — free a slot by omitting your own or an unowned task, or compact a finished board with an as: "tower" write that replays only the rows to keep';
+
 /** Actionable hint appended to owner-guard errors when the owner is stale:
  * the rejection stays, but the caller learns the one legal move they have. */
 function staleOwnerHint(
@@ -1628,7 +1667,7 @@ function readLiveAliases(value: unknown): string[] | undefined {
   const out: string[] = [];
   const seen = new Set<string>();
   for (const item of value) {
-    if (out.length >= MAX_TOWER_DO_TASKS) break;
+    if (out.length >= MAX_TOWER_DO_ALIASES) break;
     if (typeof item !== "string") continue;
     const id = item.trim();
     if (id === "" || id === "all" || id.length > 64) continue;
