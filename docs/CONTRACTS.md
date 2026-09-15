@@ -11,6 +11,47 @@
 upserted, every key on the board omitted from the call is **removed**. A caller
 who wants to keep an existing task must replay it (usually unchanged).
 
+### capacity — the budget is charged to open work
+
+- At most `MAX_TOWER_DO_OPEN_TASKS` (50) rows of a board may be
+  **non-completed**.
+- `completed` rows are history/receipts: they consume no budget and replay
+  free, so a board whose rows are all completed still accepts a new plan. (It
+  did not before: the cap counted every row, and the guard forbids dropping a
+  peer's completed row, so a finished board was write-blocked by its own
+  history — finding f-902d6eb6-4ab.)
+- **Batch length is never a budget**: a full replay is always legal, however
+  many completed rows the board carries. What is bounded is *fabricated
+  history* — one write may introduce at most `MAX_TOWER_DO_OPEN_TASKS` NEW
+  completed keys (replaying an existing completed row is free). Any length
+  ceiling reintroduces the deadlock at a higher threshold, because replaying
+  peers' completed rows is mandatory, not optional. One constant, two readings
+  on purpose: tuning `MAX_TOWER_DO_OPEN_TASKS` moves both the work a board
+  carries and the history one write may invent.
+- Remediation when the open budget is full: omit your own or an unowned row, or
+  compact a finished board with an `as: "tower"` write replaying only the rows
+  to keep. The cap error names both; `tower_do_status` renders `open N/50` and
+  warns at the cap.
+- `dependsOn` is unaffected: a dependency must still be completed and still
+  live in the batch, completed rows included.
+- **Status rendering**: the dashboard is bounded (`DASHBOARD_ROW_BUDGET` = 200
+  rows). Under the default budget, open rows win the slice (stable partition,
+  so every status group keeps fold order) — a completed history longer than
+  the budget can never hide unfinished work; an explicit `limit` is honoured in
+  fold order verbatim and may be raised past the default to widen. Whenever
+  rows are hidden, the output names the count and the remedies (`limit`,
+  `owner=`/`status=` narrowing).
+- **Byte and line caps**: the rendered text is additionally bounded by the host
+  caps (50KB, 2000 lines, **tail kept**), so a cut removes the *head* — the
+  header, the revision, the board file path, and the open rows that render
+  first. A cut is never silent: a footer states how many of how many lines
+  survived and repeats the revision and board file path, so the caller can
+  re-read the fold instead of replaying a silently incomplete board. The
+  footer's bytes *and* its single line are reserved out of those bounds, so the
+  disclosure can never be what breaks them (the line cap is reachable on its
+  own once a caller raises `limit` past it with tiny rows).
+- Test gate: `test/task-cap.ts`.
+
 | field | semantics |
 | --- | --- |
 | `key` | stable id, 1-40 lowercase `[a-z0-9._-]` |
@@ -81,7 +122,7 @@ at all and whose task has sat untouched that long — is *displaceable*
   `live/<id>.*.json` record within `LIVE_WINDOW_MS`) is never stale, however
   quiet on the board. The record identity *and* its `aliases` (`as` labels
   that session has written as) populate `liveOwners`; `live N` still counts
-  identity only. Aliases are capped at `MAX_TOWER_DO_TASKS`; a session that
+  identity only. Aliases are capped at `MAX_TOWER_DO_ALIASES`; a session that
   tries to record a further distinct `as` fails loud rather than dropping
   the label. No liveness data (unreadable sidecar dir) disables the
   exception, it never loosens it.
@@ -119,7 +160,7 @@ event count, tool-read from the file (never self-reported).
 ```bash
 bun install            # devDeps (bun-types + typescript) — typecheck/tests only
 bunx tsc --noEmit -p tsconfig.json      # strict + noUnused, zero errors
-bun run test/smoke.ts               # end-to-end: 3 tools, persistence, scoping, changedFiles disk round-trip, reminder cadence vs snapshot strip
+bun run test/smoke.ts               # end-to-end: 3 tools, persistence, scoping, changedFiles disk round-trip, reminder cadence vs snapshot strip, dashboard truncation footer
 bun run test/config.ts              # config fail-loud + reserved identity (11 cases)
 bun run test/owner-guard.ts         # every-field owner guard + stale-owner takeover (22 cases)
 bun run test/presence-retention.ts  # read receipts / retirement / presence / caller-line match / checkpoints (66)
@@ -128,7 +169,8 @@ bun run test/scope-conflicts.ts     # P1 glob + conflict derivation (17 cases)
 bun run test/git-count.ts           # widget git-segment pure derivations (31 cases)
 bun run test/live-sessions.ts       # widget live-segment liveness window + sidecar-record parsing (30 cases)
 bun run test/board-progress.ts      # widget board-progress remaining-work glance (8 cases)
-bun run test/mine-first.ts          # glance/reminder mine-first order (10 cases)
+bun run test/task-cap.ts            # open-task budget + fabricated-receipt bound (19 cases)
+bun run test/mine-first.ts          # glance/reminder mine-first order + dashboard budget slice/note (23 cases)
 ```
 
 Coverage intent: **pure, dependency-free logic** (state.ts, git-count.ts)

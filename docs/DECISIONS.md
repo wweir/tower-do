@@ -4,6 +4,71 @@
 > / reviews live in docs/plans + docs/reviews and get folded here when they
 > become durable rules.
 
+## 2026-09 — open-task budget: completed rows never block a new plan
+
+**Context.** The batch cap (`MAX_TOWER_DO_TASKS` = 50) was checked against the
+whole write batch, and `tower_do` is a full replacement, so it was a
+*board-size* cap that charged completed rows. A real project board reached 50
+rows with every one `completed` (43 owned by six departed sessions, 7 unowned):
+adding a task needed a 51st row, and dropping a peer's completed row is
+rejected by the owner guard (receipt integrity). Only `as: "tower"` could
+compact, no remediation was documented, and ordinary sessions stopped planning
+on that board (finding f-902d6eb6-4ab) — the board was write-blocked by its own
+finished history.
+
+**Decision.** The budget is charged to **open (non-completed) work**:
+`MAX_TOWER_DO_OPEN_TASKS` = 50 bounds non-completed rows, while completed rows
+are receipts/history and replay free — **batch length is not a budget at all**,
+so a full replay is legal however long the history gets (replay is mandatory,
+and any length ceiling just recreates this deadlock at a higher threshold).
+What stays bounded is *fabricated history*: one write may introduce at most
+`MAX_TOWER_DO_OPEN_TASKS` new completed keys. The completed-row owner guard is
+unchanged. The cap errors and the status header state the capacity and the
+remediation (omit your own or an unowned row, or compact a finished board with
+an `as: "tower"` write).
+
+**Rejected.** Raising the fixed cap (moves the wall, never removes it); any
+batch-length ceiling, fixed or board-relative (same deadlock at a higher
+threshold); archive/prune of completed rows into a separate file (reopens the
+`board-prune` rejection — removal only appends `op:remove` to the same log, and
+the folded view already has display budgets); auto-dropping completed rows of
+idle owners (destroys the audit trail the guard exists to protect);
+sticky-completed omission ("omitting a completed row keeps it") — then nothing
+could ever remove one, and the board would grow without bound in the folded
+view.
+
+**Also.** `MAX_TOWER_DO_TASKS` was doing double duty as the live-alias cap; it
+is split into `MAX_TOWER_DO_ALIASES` (identities a session remembers) and
+`MAX_TOWER_DO_OPEN_TASKS` (work a board carries). The alias side is a rename
+only: same value, same behaviour. `MAX_TOWER_DO_OPEN_TASKS` itself carries two
+readings on purpose — work the board carries, and history one write may invent
+(both derive from the one constant, so a retune moves them together instead of
+letting them drift); CONTRACTS.md *capacity* is the authority for both.
+
+**Consequence — the dashboard can now outgrow its budget.** Boards were
+previously capped at 50 rows, so `tower_do_status`'s 200-row dashboard slice
+could never bind. It can now, so the slice became a rule instead of an
+accident: under the default budget open rows win it (stable partition, groups
+keep fold order — the same "unfinished work wins the glance" principle as
+mine-first), an explicit `limit` still means fold order verbatim, and any
+hidden rows are reported (`… +N more row(s) hidden by the budget`, with the
+remedies: a larger `limit`, or `owner=`/`status=` narrowing). Without that, a
+long completed history would silently hide the one open row the caller needed
+to see.
+
+**Known limit.** Completed history is unbounded now, and every write must name
+the rows it keeps — so the practical ceiling is what a caller can *read*, and
+the dashboard binds long before the log does: 200 rows, plus the host's caps —
+50KB **and** 2000 lines — whose **tail-kept cut removes the head** (header,
+revision, board file path, and the open rows, which render first). The line cap
+is reachable on its own once a caller raises `limit` past it with tiny rows.
+The cut is therefore disclosed in a footer that repeats the revision and the
+board path (its bytes and its one line are reserved out of both caps), and
+paged reads of `board.jsonl` stay the complete path. The `board-prune` entry's
+~10k log lines remain the trigger for row-level log compaction (last-wins under
+the mutation queue, receipts folded, never silently deleted) — not for row
+deletion.
+
 ## 2026-09 — publish auth moves to trusted publishing (OIDC), no token
 
 **Context.** `release.yml` published with `NODE_AUTH_TOKEN:
@@ -68,8 +133,9 @@ preserving relative order inside each group (`orderTasksMineFirst` in
 mine. Header `N open`, blocked/unread counts, and overflow `+N more` stay
 board-wide — only which rows win the cap changes. Widget and reminder apply
 this *before* their caps. `tower_do_status` applies it *inside* each status
-group after the dashboard slice (default `limit` 200 never binds below
-`MAX_TOWER_DO_TASKS`). An explicit small `limit` still truncates by fold
+group after the dashboard slice, and the slice itself is open-first now that a
+board can outgrow it — see the open-task budget entry for what it hides and how
+that is reported. An explicit small `limit` still truncates by fold
 order, same as before; mine-first does not steal that budget. `owner=` on
 status still filters; this is not a second filter.
 

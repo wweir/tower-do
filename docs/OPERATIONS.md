@@ -88,6 +88,53 @@ git tag vX.Y.Z && git push origin main --tags
   custom context entry (fallback display when the board file is missing).
 - Widget: above-editor status line (TUI only).
 
+## Board capacity and compaction
+
+`tower_do` is a full replacement, so every write names the rows to keep. The
+budget therefore has to leave room for a replay:
+
+- Only **non-completed** rows count against `MAX_TOWER_DO_OPEN_TASKS` (50).
+  `completed` rows are receipts, replay free, and can never block a new plan.
+- Batch length is never a budget: replaying the whole board (completed rows
+  included) is always legal. One write may introduce at most `MAX_TOWER_DO_OPEN_TASKS`
+  (50) NEW completed rows — replaying an existing receipt is free.
+- `tower_do_status` prints `open N/50` on the `Tasks:` line and adds a warning
+  line at the cap.
+- The dashboard renders at most `DASHBOARD_ROW_BUDGET` (200) rows. Open work
+  always wins that default budget, and anything hidden is reported
+  (`… +N more row(s) hidden by the budget`) — widen with `limit`, or narrow with
+  `owner=`/`status=`. A task that "disappeared" from a long board is a
+  filter/limit question, not data loss: the fold is the board.
+- A very large dashboard is also cut at the host caps (50KB and 2000 lines,
+  tail kept), and the cut takes the HEAD (header, revision, board file path,
+  open rows). The footer says so and repeats the revision + board file path
+  (its own bytes and line are reserved, so it survives the cut); page that file
+  when you need every row for a full-replacement write. Raising `limit` past
+  2000 with small rows is what makes the line cap bind: it is a real bound,
+  not just the byte cap's shadow.
+
+When the open budget is full (`open 50/50`):
+
+1. **Free a slot** — omit your own rows (your completed ones too — a receipt you
+   own is yours to drop) or an unowned task. Never another owner's row, unless
+   that owner is stale and the row is not completed.
+2. **Compact a finished board** — when rows are all completed and owned by
+departed sessions, replay only the rows worth keeping under an explicit
+orchestrator identity: `tower_do` with `as: "tower"`. `tower` owns every task,
+so it may drop them; the dropped receipts survive in the JSONL history
+(`board.jsonl` is append-only), only the folded view shrinks. This is the
+documented, cooperative-trust escape hatch — it is unauthenticated, so treat a
+board compaction like any other shared-state maintenance and record it in a
+message (`tower_do_talk`) when peers are live.
+
+Completed rows are never garbage-collected automatically: the owner guard
+exists to keep delivery receipts trustworthy, and the folded view already has
+display budgets (status slices at `limit`, widget shows remaining work only).
+Because a write must name the rows it keeps, the practical ceiling on history
+is what a reader can see: once a board stops fitting the status output (~10k
+log lines), the answer is log compaction (last-wins under the mutation queue,
+receipts folded, not deleted) — never silent row deletion. See DECISIONS.md.
+
 ## Troubleshooting
 
 - **"stale tower-do revision"** — a peer wrote since your read. Call
@@ -99,6 +146,10 @@ git tag vX.Y.Z && git push origin main --tags
   to yourself, or remove the non-completed task. Completed tasks stay
   guarded. Otherwise message the owner via `tower_do_talk`, or have `tower`
   do it.
+- **"open tasks support at most 50 items"** — the board's open budget is full.
+  Omit your own or an unowned task, or compact a finished board with
+  `as: "tower"` (see *Board capacity and compaction*). Completed rows do not
+  consume the budget, so a board of finished work is never the cause.
 - **Board file missing / empty view after cleanup** — falls back to the last
   session checkpoint for display (disk stays authoritative).
 - **Conflicting scope advisories** — advisory only: message the peer owner or
