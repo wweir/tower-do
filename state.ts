@@ -218,6 +218,11 @@ export interface TowerBoardView {
   tasks: TowerDoTask[];
   messages: TowerDoMessage[];
   findings: TowerDoFinding[];
+  /** Non-empty log lines the fold could not turn into an event (corrupt JSON,
+   * foreign shapes, a task payload that no longer validates). Data the board
+   * still holds but cannot show — never silent: the dashboard discloses it.
+   * Not part of `revision` (which counts folded task events only). */
+  skipped: number;
 }
 
 interface TowerDoChangeSummary {
@@ -252,6 +257,7 @@ export function createEmptyBoard(): TowerBoardView {
     tasks: [],
     messages: [],
     findings: [],
+    skipped: 0,
   };
 }
 
@@ -273,6 +279,7 @@ export function cloneBoard(view: TowerBoardView): TowerBoardView {
   return {
     schemaVersion: TOWER_DO_SCHEMA_VERSION,
     revision: view.revision,
+    skipped: view.skipped,
     tasks: view.tasks.map(cloneTask),
     messages: view.messages.map((message) => ({
       ...message,
@@ -597,6 +604,7 @@ export function writeBoardSnapshot(
     tasks: nextTasks,
     messages: current.messages,
     findings: current.findings,
+    skipped: current.skipped,
   };
 
   return {
@@ -1241,6 +1249,7 @@ function readBoardSnapshot(value: unknown): TowerBoardView | undefined {
   return {
     schemaVersion: TOWER_DO_SCHEMA_VERSION,
     revision: value.revision,
+    skipped: typeof value.skipped === "number" ? value.skipped : 0,
     tasks,
     messages,
     findings,

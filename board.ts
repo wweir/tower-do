@@ -120,6 +120,7 @@ export class TowerBoard {
     const messages = new Map<string, TowerDoMessage>();
     const findings = new Map<string, TowerDoFinding>();
     let revision = 0;
+    let skipped = 0;
     let index = 0;
     for (const line of raw.split("\n")) {
       const trimmed = line.trim();
@@ -128,15 +129,25 @@ export class TowerBoard {
       try {
         candidate = JSON.parse(trimmed);
       } catch {
-        continue; // tolerate foreign/corrupt lines; they never bump the revision
+        // Tolerate foreign/corrupt lines (they never bump the revision), but
+        // COUNT them: a silently skipped line is data the board holds and no
+        // participant can see, which is the silent-wrong class this extension
+        // exists to prevent. `skipped` is disclosed by tower_do_status.
+        skipped += 1;
+        continue;
       }
       const event = readEvent(candidate);
-      if (event === undefined) continue;
+      if (event === undefined) {
+        skipped += 1;
+        continue;
+      }
       if (event.kind === "task") {
         if (event.op === "remove") {
           if (event.key !== undefined) {
             tasks.delete(event.key);
             revision += 1;
+          } else {
+            skipped += 1;
           }
           continue;
         }
@@ -146,10 +157,18 @@ export class TowerBoard {
           event.key === undefined ||
           !isRecord(candidate) ||
           !isRecord(candidate.task)
-        )
+        ) {
+          skipped += 1;
           continue;
+        }
         const plain = readPersistedTask(candidate.task, index);
-        if (plain === undefined) continue;
+        if (plain === undefined) {
+          // A payload that no longer validates under the CURRENT limits (a
+          // retuned cap, a schema change, a torn append) must not vanish
+          // silently: the row stays in the log and is reported as skipped.
+          skipped += 1;
+          continue;
+        }
         revision += 1;
         const updatedAt =
           isRecord(candidate.task) &&
@@ -204,6 +223,7 @@ export class TowerBoard {
       tasks: orderedTasks,
       messages: orderedMessages,
       findings: [...findings.values()],
+      skipped,
     };
   }
 
@@ -231,8 +251,11 @@ export class TowerBoard {
       .filter((line) => line.length > 0);
   }
 
-  /** Raw tail of the event log (newest lines last), for activity views. */
+  /** Raw tail of the event log (newest lines last). */
   async rawTail(lines: number = 50): Promise<string[]> {
+    // slice(-0) is slice(0) — the whole log — so a non-positive request must
+    // be an empty tail, not a full read that looks bounded.
+    if (lines <= 0) return [];
     return (await this.rawLines()).slice(-lines);
   }
 }

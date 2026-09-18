@@ -71,6 +71,43 @@ async function layer1(): Promise<void> {
     check("fold on a directory throws", code === "EISDIR");
   }
 
+  // Fold discloses lines it cannot turn into events (a corrupt line, a foreign
+  // shape, or a payload that no longer validates): the board still holds them
+  // and no participant may lose sight of that silently. rawTail(0) must be an
+  // empty tail, because slice(-0) is slice(0) — the whole log.
+  const logFile = join(dir, "logs", "board.jsonl");
+  const logWriter = new TowerBoard(logFile);
+  await logWriter.append([
+    {
+      kind: "task",
+      op: "upsert",
+      key: "ok",
+      task: {
+        key: "ok",
+        subject: "ok",
+        status: "pending",
+        dependsOn: [],
+        blockedBy: [],
+      } as never,
+      by: "a",
+      at: 1,
+    },
+  ]);
+  writeFileSync(
+    logFile,
+    `${readFileSync(logFile, "utf8")}not json at all\n`,
+  );
+  const corruptView = await new TowerBoard(logFile).fold();
+  check(
+    "fold counts a line it cannot fold instead of dropping it silently",
+    corruptView.skipped === 1 && corruptView.tasks.length === 1,
+    `skipped=${String(corruptView.skipped)} tasks=${String(corruptView.tasks.length)}`,
+  );
+  check(
+    "rawTail(0) is an empty tail, not the whole log",
+    (await new TowerBoard(logFile).rawTail(0)).length === 0,
+  );
+
   // Planning: two missions + a dependent one (3 upsert events → revision 3).
   let view = createEmptyBoard();
   const details = writeBoardSnapshot(

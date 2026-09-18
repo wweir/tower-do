@@ -55,6 +55,13 @@ who wants to keep an existing task must replay it (usually unchanged).
   deduped before the cap is applied, so 101 `changedFiles` entries with one
   duplicate is the legal 100 paths (not a rejection), and 21 references to one
   dependency is one dependency.
+- **Unfolded log lines are disclosed, never silent**: a non-empty line the fold
+  cannot turn into an event (corrupt JSON, a foreign shape, or a task payload
+  that no longer validates under the current limits — e.g. a cap retuned
+  downward after the row was written) is counted in `view.skipped` and
+  `tower_do_status` reports the count with the board file path, because the
+  board still holds that data and a full-replacement write from a peer who
+  cannot see it would otherwise drop it from the folded view.
 - Test gate: `test/task-cap.ts`.
 
 | field | semantics |
@@ -157,8 +164,10 @@ exception (no stale owners) rather than loosening the guard.
 ## Revision gate
 
 `baseRevision` (from `tower_do_status`) must equal the board revision or the
-write is rejected — never silently overwrite a peer. Revision = cumulative task
-event count, tool-read from the file (never self-reported).
+write is rejected — never silently overwrite a peer. Revision = cumulative
+count of *folded* task events, tool-read from the file (never self-reported): a
+log line the fold cannot turn into an event does not bump it and is reported as
+`skipped` instead of vanishing (see below).
 
 ## arg schema vs the fold — who enforces what
 
@@ -233,14 +242,17 @@ bun run test/board-progress.ts      # widget board-progress remaining-work glanc
 bun run test/task-cap.ts            # open-task budget + fabricated-receipt bound (19 cases)
 bun run test/mine-first.ts          # glance/reminder mine-first order + dashboard budget slice/note (23 cases)
 bun run test/limits.ts              # arg schema vs fold: derived bounds, transport guard, key-bearing errors, list-cap ordering, code-point metric (60 cases)
+bun run test/identity-scope.ts      # session scoping: a nested in-process session never re-labels its parent (reminder + status identity) (5 cases)
 ```
 
 Coverage intent: **pure, dependency-free logic** (state.ts, git-count.ts)
 carries regression suites; I/O-touching layers (board.ts / index.ts) are
 covered by the smoke test exercising all three tools end-to-end against a
-temp board, and by `test/limits.ts`, which drives the *registered* tool schemas
+temp board, by `test/limits.ts`, which drives the *registered* tool schemas
 through the same TypeBox checker the host uses and then asserts the fold's
-answer for each boundary it lets through.
+answer for each boundary it lets through, and by `test/identity-scope.ts`,
+which loads two extension instances into one process the way pi runs a session
+and its subagent task sessions.
 
 The same gate runs in CI on every `v*` tag push before the npm publish step
 (`.github/workflows/release.yml`) — a tag that fails the gate never ships.

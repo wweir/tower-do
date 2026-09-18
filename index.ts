@@ -177,6 +177,9 @@ const REMINDER_INTERVAL = 3; // inject a board reminder every N LLM calls
 const REMINDER_ARMED = REMINDER_INTERVAL - 1;
 const WIDGET_TASK_LIMIT = 3; // unfinished tasks shown in the above-editor line
 const STATUS_ACTIVITY_TAIL = 8; // activity feed lines in tower_do_status
+/** Rows the dashboard renders per message/finding section. The section headers
+ * state the total when the page is smaller, so this is never a silent cap. */
+const DASHBOARD_LIST_LIMIT = 20;
 const MESSAGE_RETENTION = 50; // max fully-read messages kept in the view
 /** Default `tower_do_talk inbox` page size: the schema description and the
  * handler must agree, so the number lives once. */
@@ -782,6 +785,7 @@ export default function towerDoExtension(pi: ExtensionAPI): void {
     tasks: [],
     messages: [],
     findings: [],
+    skipped: 0,
   };
   let contextCheckpointNeeded = false;
   let llmCallsSinceReminder = 0;
@@ -1882,7 +1886,7 @@ export default function towerDoExtension(pi: ExtensionAPI): void {
 
     async execute(_toolCallId, params, signal, _onUpdate, ctx) {
       throwIfAborted(signal, "TowerDo talk");
-      const { board, caller, view } = await prepare(ctx, params.as);
+      const { board, caller } = await prepare(ctx, params.as);
       const now = Date.now();
 
       if (params.action !== "send" && params.taskKey !== undefined) {
@@ -1921,14 +1925,6 @@ export default function towerDoExtension(pi: ExtensionAPI): void {
             `message body too large (${(Buffer.byteLength(body, "utf8") / 1024).toFixed(0)} KiB > ${(MAX_MESSAGE_BYTES / 1024).toFixed(0)} KiB) — split it into multiple messages`,
           );
         }
-        if (
-          params.taskKey !== undefined &&
-          !view.tasks.some((task) => task.key === params.taskKey)
-        ) {
-          throw new TowerDoValidationError(
-            `taskKey references unknown task ${params.taskKey}`,
-          );
-        }
         const messageId = `m-${randomUUID().slice(0, 12)}`;
         const messageBase = {
           id: messageId,
@@ -1943,6 +1939,17 @@ export default function towerDoExtension(pi: ExtensionAPI): void {
           throwIfAborted(signal, "TowerDo talk");
           const fresh = await foldRetained(ctx.cwd);
           throwIfAborted(signal, "TowerDo talk");
+          // Existence is checked against THIS fold, not the pre-queue view:
+          // the task can be removed in between, and the persisted message must
+          // not carry a dangling taskKey.
+          if (
+            params.taskKey !== undefined &&
+            !fresh.tasks.some((task) => task.key === params.taskKey)
+          ) {
+            throw new TowerDoValidationError(
+              `taskKey references unknown task ${params.taskKey}`,
+            );
+          }
           // Reachable recipients: current owners PLUS anyone with recent board
           // activity — a peer whose tasks are all completed is no longer an
           // owner but exactly who hand-off coordination needs to reach.
@@ -2323,17 +2330,19 @@ export default function towerDoExtension(pi: ExtensionAPI): void {
       const presence = derivePresence(parsedEntries, tasks, now);
       const lastWrite = latestActivity(parsedEntries);
 
-      const myMessages = messagesToMe(view, caller)
-        .sort((a, b) => b.at - a.at)
-        .slice(0, 20);
+      // Totals BEFORE the page slice: the section headers must not report a
+      // silently capped count as if it were the whole list (the task rows get
+      // a hidden-rows note for exactly this reason).
+      const allMyMessages = messagesToMe(view, caller).sort((a, b) => b.at - a.at);
+      const myMessages = allMyMessages.slice(0, DASHBOARD_LIST_LIMIT);
       const myUnread = unreadMessagesToMe(view, caller).length;
-      const openFindings = view.findings
+      const allOpenFindings = view.findings
         .filter(
           (finding) =>
             finding.status === "open" || finding.status === "accepted",
         )
-        .sort((a, b) => b.at - a.at)
-        .slice(0, 20);
+        .sort((a, b) => b.at - a.at);
+      const openFindings = allOpenFindings.slice(0, DASHBOARD_LIST_LIMIT);
       // P1: derived scope × changedFiles advisory. Pure read, rendered as a
       // dedicated section (not per-row suffix) so long scope lists don't
       // explode every task line.
@@ -2436,6 +2445,11 @@ export default function towerDoExtension(pi: ExtensionAPI): void {
       lines.push(
         `Tasks: ${tasks.length} total (${inProgressCount} in_progress, ${blockedCount} blocked, ${pendingCount} pending, ${completedCount} completed) · open ${openCount}/${MAX_TOWER_DO_OPEN_TASKS}`,
       );
+      if (view.skipped > 0) {
+        lines.push(
+          `⚠ ${view.skipped} board log line(s) could not be folded (corrupt, foreign, or no longer valid under the current limits) — the board still holds them; read ${board.file} to recover them.`,
+        );
+      }
       if (openCount >= MAX_TOWER_DO_OPEN_TASKS) {
         lines.push(
           `Open-task budget full: completed rows do not count — omit your own or an unowned task, or compact a finished board with an as: "tower" write replaying just the rows to keep.`,
@@ -2549,7 +2563,11 @@ export default function towerDoExtension(pi: ExtensionAPI): void {
       }
 
       lines.push(
-        `## Messages for ${caller} (${myMessages.length}; ${myUnread} unread)`,
+        `## Messages for ${caller} (${myMessages.length}${
+          allMyMessages.length > myMessages.length
+            ? ` of ${allMyMessages.length}`
+            : ""
+        }; ${myUnread} unread)`,
       );
       for (const message of myMessages) {
         const readMark = (message.readBy ?? []).includes(caller)
@@ -2562,7 +2580,13 @@ export default function towerDoExtension(pi: ExtensionAPI): void {
       if (myMessages.length === 0) lines.push("(none)");
 
       lines.push("");
-      lines.push(`## Open findings (${openFindings.length})`);
+      lines.push(
+        `## Open findings (${openFindings.length}${
+          allOpenFindings.length > openFindings.length
+            ? ` of ${allOpenFindings.length}`
+            : ""
+        })`,
+      );
       for (const finding of openFindings) {
         const location =
           finding.location === undefined ? "" : ` @${finding.location}`;
