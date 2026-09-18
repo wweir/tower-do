@@ -125,25 +125,30 @@ and the last 12 are random:
 - Labels that are not generated session labels (a pinned `config.identity`, an
   `as` label) compare verbatim: no pattern, no aliasing.
 
-**Same agent.** `sameAgent(a, b)` is exact equality plus one legacy rule: a
-`session-<time8>` label denotes the same agent as the `session-<time8>-<rand8>`
-label it prefixes. Two CURRENT labels are never equated, not even inside one
-bucket — that equality is the collision. The rule is for migration only: rows,
-receipts, audiences and `owner=` values written before 0.4.1 stay editable,
-addressable and liveness-protected instead of being orphaned, and the row
-adopts the current label the next time its session writes.
+**Permission is exact; only delivery and display alias.** The owner guard (and
+the staleness gate that feeds it, and the takeover/adoption path) compares
+labels **character for character**, exactly as it always did. A legacy
+`session-<time8>` label cannot name one member of its 65.5 s bucket, so making
+it an alias in the guard would hand every bucket sibling write rights over the
+row — the collision in permission clothing. Ambiguity is resolved strictly: the
+row is touched by its exact label, by `tower`, or through the idle-window
+takeover (adopt it by setting `owner` to yourself, then edit in a second
+write). That is the remedy, and it is deliberate rather than guessed.
+
+`sameAgent(a, b)` is the **delivery/display** relation: exact equality, plus a
+legacy `session-<time8>` reaching the `session-<time8>-<rand8>` label it
+prefixes, so mail addressed to a pre-0.4.1 label is still delivered and a
+migrated row renders as the same agent. It may therefore *over-deliver* within
+one bucket (the pre-0.4.1 reach — never worse, and never lost mail); it never
+grants rights. Two CURRENT labels are never equated, not even inside one bucket.
 
 - It is **not transitive** (legacy ↔ each bucket sibling), so grouping must be
   keyed, never transitive: `derivePresence` merges a legacy row only into a
   bucket holding exactly one current label; two current labels in one bucket
   always render as two rows.
-- A legacy label stays ambiguous for its whole bucket by construction — 8
-  digits cannot name one member — and no amount of aliasing fixes that.
-- Applied at: the owner guard (change and removal), the staleness gate (with a
-  bucket-level `lastSeen` fallback that can only make an owner look *fresher*,
-  so it can withhold a takeover but never cause one), inbox addressing
-  (`to`/`from`/broadcast audience), read receipts (an ack upgrades a legacy
-  entry to the current label) and recipient validation.
+- Applied at: inbox addressing (`to`/`from`/broadcast audience), read receipts
+  (additive; a legacy receipt is left as written) and recipient validation —
+  plus the dashboard's `me` markers. Never at the owner guard.
 - Test gate: `test/identity-label.ts`, plus the in-process bucket-sibling case
   in `test/identity-scope.ts`.
 
@@ -282,7 +287,7 @@ bun run test/task-cap.ts            # open-task budget + fabricated-receipt boun
 bun run test/mine-first.ts          # glance/reminder mine-first order + dashboard budget slice/note (23 cases)
 bun run test/limits.ts              # arg schema vs fold: derived bounds, transport guard, key-bearing errors, list-cap ordering, code-point metric (60 cases)
 bun run test/identity-scope.ts      # session scoping: a nested in-process session never re-labels its parent (reminder + status identity), bucket siblings stay distinct (6 cases)
-bun run test/identity-label.ts       # identity labels: bucket siblings stay distinct, legacy labels alias only their own session, owner/staleness/inbox honour it (33 cases)
+bun run test/identity-label.ts       # identity labels: bucket siblings stay distinct; permission exact, delivery aliased, legacy rows adoptable via the idle window (39 cases)
 ```
 
 Coverage intent: **pure, dependency-free logic** (state.ts, git-count.ts)

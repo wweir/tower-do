@@ -29,20 +29,26 @@ full id was rejected as machinery that buys nothing over the ULID/UUIDv7 tail
 the id already carries; widening the prefix (e.g. 10 hex digits = 2048 ms) was
 rejected because it is still pure timestamp.
 
-**Migration.** Rows, receipts and messages written before 0.4.1 carry the
-legacy label. `sameAgent(a, b)` equates a legacy `session-<time8>` with the
-CURRENT label it prefixes, and never two current labels — not even in one
-bucket, because that equality is the bug. It is deliberately NOT transitive
-(legacy ↔ each sibling), so grouping must stay keyed, never transitive
-(`derivePresence` merges a legacy row only into a bucket that holds exactly one
-current label). The relation is applied at every identity comparison: the
-owner guard (change and removal), the staleness gate (plus a bucket-level
-`lastSeen` fallback that can only make an owner look fresher, i.e. only withhold
-a takeover), the inbox (`to`/`from`/audience), read receipts (ack upgrades a
-legacy entry to the current label) and recipient validation. Legacy rows stay
-ambiguous by construction — an 8-digit label cannot name one member of its
-bucket — and the upgrade heals that row as soon as its session writes again.
-Gate: `test/identity-label.ts` (33 cases) plus the in-process collision case in
+**Migration, and where the alias may apply.** Rows, receipts and messages
+written before 0.4.1 carry the legacy label, which cannot name one member of its
+bucket. The alias is therefore split by consequence:
+
+- **Permission stays exact.** The owner guard (change and removal), the
+  staleness gate and the takeover path compare labels character for character,
+  exactly as before. Aliasing them would let any bucket sibling edit or delete a
+  legacy row — the same collision wearing permission clothes. A legacy row is
+  reached by its own label, by `tower`, or through the idle-window takeover
+  (adopt, then edit in a second write). 0.4.1 shipped with the permissive
+  version and 0.4.2 tightened it to this rule.
+- **Delivery and display alias.** `sameAgent` (exact equality plus legacy →
+  current of the same bucket) is used for inbox `to`/`from`/audience, read
+  receipts (purely additive — an existing legacy receipt is left as written),
+  recipient validation and the dashboard's `me` markers. It may over-deliver
+  inside one bucket (the pre-0.4.1 reach, never worse) and must never lose mail.
+  It is deliberately NOT transitive, so grouping stays keyed: `derivePresence`
+  merges a legacy row only into a bucket holding exactly one current label.
+
+Gate: `test/identity-label.ts` (39 cases) plus the in-process collision case in
 `test/identity-scope.ts`; reverting `sessionLabel` to the legacy form fails both.
 
 ## 2026-09 — session identity is per extension instance, never a module global

@@ -377,18 +377,24 @@ export function sessionLabel(sessionId: string): string {
 }
 
 /**
- * Do two labels denote the same agent?
+ * Do two labels reach the same agent? DELIVERY AND DISPLAY ONLY — never
+ * permission (see the owner guard: it compares labels exactly).
  *
  * Exact equality always does. Beyond that a legacy `session-<time8>` label
- * denotes the same agent as the `session-<time8>-<rand8>` label it prefixes: a
- * row written before 0.4.1 must stay editable, addressable and
- * liveness-protected for the session that wrote it.
+ * reaches the `session-<time8>-<rand8>` label it prefixes, so mail addressed to
+ * a pre-0.4.1 label is still delivered and a migrated row still renders as the
+ * same agent. A legacy label is ambiguous for its whole 65.5 s bucket by
+ * construction — it cannot name one member — so this relation is deliberately
+ * permissive: it may over-deliver (the pre-0.4.1 reach, never worse) but must
+ * never lose mail.
  *
  * Two CURRENT labels are never equated, not even when they share the 8-digit
- * time prefix — that prefix is a 65.5 s bucket, not an identity, and treating
- * bucket siblings as one agent is exactly the collision this fixes. Labels that
- * are not generated session labels (a pinned `config.identity`, an `as` label)
- * compare verbatim.
+ * time prefix: that prefix is a bucket, not an identity, and treating bucket
+ * siblings as one agent is exactly the collision this fixes. Labels that are
+ * not generated session labels (a pinned `config.identity`, an `as` label)
+ * compare verbatim. The relation is NOT transitive (legacy ↔ each sibling), so
+ * grouping must stay keyed — `derivePresence` merges a legacy row only into a
+ * bucket that holds exactly one current label.
  */
 export function sameAgent(left: string, right: string): boolean {
   if (left === right) return true;
@@ -404,8 +410,9 @@ export function sameAgent(left: string, right: string): boolean {
   return false;
 }
 
-/** Set membership that honours `sameAgent` (identity sets are small: owners,
- * audiences, read receipts). */
+/** Set membership that honours `sameAgent` — for reachability and display
+ * (audiences, recipient validation, presence). NEVER for permission: the owner
+ * guard compares labels exactly. Identity sets are small. */
 export function identitySetHas(
   set: ReadonlySet<string>,
   label: string,
@@ -423,16 +430,15 @@ export function identityListHas(
   return (list ?? []).some((candidate) => sameAgent(candidate, label));
 }
 
-/** `readBy` after `label` acks: no duplicate entry for the same agent, and a
- * legacy entry is upgraded to the current label (see identitySetAdd). */
+/** `readBy` after `label` acks: append unless the same agent is already
+ * recorded. Purely additive — an existing legacy entry is left alone, because
+ * rewriting another label's receipt is not this ack's business. */
 export function readByWith(
   readBy: readonly string[] | undefined,
   label: string,
 ): string[] {
   const next = [...(readBy ?? [])];
-  const index = next.findIndex((candidate) => sameAgent(candidate, label));
-  if (index === -1) next.push(label);
-  else if (CURRENT_SESSION_LABEL.test(label)) next[index] = label;
+  if (!identityListHas(next, label)) next.push(label);
   return next;
 }
 
@@ -572,15 +578,17 @@ export function writeBoardSnapshot(
   // path, but a hopeless task should not need an adopter first). Completed
   // tasks keep the full guard — a receipt cannot be dropped by a peer.
   for (const removed of removedTasks) {
+    // EXACT label match, not `sameAgent`: a legacy `session-<time8>` label
+    // cannot name one member of its 65.5 s bucket, so aliasing it here would
+    // hand every bucket sibling write rights over the row. Ambiguity is
+    // resolved strictly (the owner is unreachable ⇒ takeover/tower), never by
+    // guessing.
     if (
       removed.owner !== undefined &&
-      !sameAgent(caller, removed.owner) &&
+      caller !== removed.owner &&
       caller !== TOWER_IDENTITY
     ) {
-      if (
-        identitySetHas(staleOwners, removed.owner) &&
-        removed.status !== "completed"
-      )
+      if (staleOwners.has(removed.owner) && removed.status !== "completed")
         continue;
       throw new TowerDoValidationError(
         `task ${removed.key} is owned by "${removed.owner}" — only its owner or ${TOWER_IDENTITY} may remove it` +
@@ -642,7 +650,7 @@ export function writeBoardSnapshot(
     // someone's content or forge a receipt.
     const adoptingStale =
       existing.owner !== undefined &&
-      identitySetHas(staleOwners, existing.owner) &&
+      staleOwners.has(existing.owner) &&
       existing.status !== "completed" &&
       task.owner === caller &&
       taskEquals(
@@ -653,7 +661,7 @@ export function writeBoardSnapshot(
       );
     if (
       existing.owner !== undefined &&
-      !sameAgent(caller, existing.owner) &&
+      caller !== existing.owner &&
       caller !== TOWER_IDENTITY &&
       !adoptingStale
     ) {
@@ -1824,22 +1832,10 @@ export function staleTaskOwners(
   liveOwners: ReadonlySet<string> = new Set(),
 ): Set<string> {
   const lastSeen = new Map<string, number>();
-  // Legacy owners (`session-<time8>`) may hold no activity under their own
-  // label once the current label gained a suffix. The bucket map is a
-  // migration-window fallback: it can only make an owner look FRESHER, i.e. it
-  // can withhold a takeover but never cause one — the conservative direction
-  // for a permission gate.
-  const lastSeenBucket = new Map<string, number>();
   for (const entry of entries) {
     const prior = lastSeen.get(entry.by);
     if (prior === undefined || entry.at > prior)
       lastSeen.set(entry.by, entry.at);
-    const bucket = CURRENT_SESSION_LABEL.exec(entry.by)?.[1];
-    if (bucket !== undefined) {
-      const priorBucket = lastSeenBucket.get(bucket);
-      if (priorBucket === undefined || entry.at > priorBucket)
-        lastSeenBucket.set(bucket, entry.at);
-    }
   }
   const stale = new Set<string>();
   // No activity data at all (unreadable / garbage log) must disable the
@@ -1849,19 +1845,17 @@ export function staleTaskOwners(
   // task-creation events are always parseable.
   if (entries.length === 0) return stale;
   for (const task of tasks) {
+    // Exact label again: a bucket sibling's activity or heartbeat must not
+    // decide whether THIS owner is stale. A legacy row therefore goes stale by
+    // its own label's silence and becomes adoptable through the normal window —
+    // that is the documented remedy, predictable rather than guessed.
     if (
       task.owner === undefined ||
       task.status === "completed" ||
-      identitySetHas(liveOwners, task.owner)
+      liveOwners.has(task.owner)
     )
       continue;
-    const legacyBucket = LEGACY_SESSION_LABEL.exec(task.owner)?.[1];
-    const quietSince =
-      lastSeen.get(task.owner) ??
-      (legacyBucket === undefined
-        ? undefined
-        : lastSeenBucket.get(legacyBucket)) ??
-      task.updatedAt;
+    const quietSince = lastSeen.get(task.owner) ?? task.updatedAt;
     if (now - quietSince > idleMs) stale.add(task.owner);
   }
   return stale;
@@ -1879,8 +1873,7 @@ function staleOwnerHint(
   task: TowerDoTask,
   staleOwners: ReadonlySet<string>,
 ): string {
-  if (task.owner === undefined || !identitySetHas(staleOwners, task.owner))
-    return "";
+  if (task.owner === undefined || !staleOwners.has(task.owner)) return "";
   if (task.status === "completed")
     return " (owner idle, but a completed task stays with its owner — receipt integrity)";
   return ` (owner idle ${Math.round(OWNER_TAKEOVER_MS / 60_000)}+ min: adopt it by setting owner to yourself, or remove it)`;

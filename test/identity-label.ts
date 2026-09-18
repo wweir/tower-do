@@ -178,9 +178,35 @@ const relabel = (view: TowerBoardView, caller: string, owner?: string) =>
     caller,
   );
 
+expectThrows(
+  "a bucket sibling CANNOT take a legacy-owned row (ambiguity is strict, never guessed)",
+  () => relabel(legacyOwned, labelA),
+  /is owned by/,
+);
+expectThrows(
+  "a bucket sibling CANNOT remove a legacy-owned row",
+  () => writeBoardSnapshot(legacyOwned, { baseRevision: 1, tasks: [] }, labelA),
+  /is owned by/,
+);
 check(
-  "a legacy-owned row is editable by the same session's current label",
-  relabel(legacyOwned, labelA).view.tasks[0]?.owner === labelA,
+  "the legacy label itself still matches its own row exactly (a pre-0.4.1 caller)",
+  writeBoardSnapshot(
+    legacyOwned,
+    { baseRevision: 1, tasks: [{ key: "work", subject: "task" }] },
+    legacyOf(SIBLING_A),
+  ).view.tasks[0]?.owner === legacyOf(SIBLING_A),
+);
+check(
+  "a legacy row IS adoptable through the idle window (the documented remedy)",
+  writeBoardSnapshot(
+    legacyOwned,
+    {
+      baseRevision: 1,
+      tasks: [{ key: "work", subject: "task", owner: labelA }],
+    },
+    labelA,
+    new Set([legacyOf(SIBLING_A)]),
+  ).view.tasks[0]?.owner === labelA,
 );
 expectThrows(
   "a bucket sibling cannot take a CURRENT-label row (the collision)",
@@ -223,9 +249,19 @@ const activity: ActivityEntry[] = [
   { kind: "task", by: legacyOf(SIBLING_A), at: OLD, glyph: "◐", detail: "work" },
 ];
 check(
-  "a legacy-owned row is NOT stale while its session's current label is live",
+  "a current-label heartbeat does NOT speak for a legacy owner (exact staleness)",
   staleTaskOwners(activity, [legacyTask], Date.now(), undefined, new Set([labelA]))
-    .size === 0,
+    .has(legacyOf(SIBLING_A)),
+);
+check(
+  "a legacy owner is protected by a heartbeat under its own label",
+  staleTaskOwners(
+    activity,
+    [legacyTask],
+    Date.now(),
+    undefined,
+    new Set([legacyOf(SIBLING_A)]),
+  ).size === 0,
 );
 check(
   "…and the same query still reports stale when nobody is live",
@@ -267,8 +303,12 @@ const withMessage = (to: string, readBy?: string[]): TowerBoardView => ({
   messages: [message(to, readBy)],
 });
 check(
-  "a message addressed to the legacy label reaches the current label",
+  "a message addressed to the legacy label is DELIVERED to the current label",
   messagesToMe(withMessage(legacyOf(SIBLING_A)), labelA).length === 1,
+);
+check(
+  "a bucket sibling also receives it — deliberate: over-delivery beats losing mail",
+  messagesToMe(withMessage(legacyOf(SIBLING_A)), labelB).length === 1,
 );
 check(
   "a message addressed to the current label reaches the legacy label",
@@ -286,9 +326,13 @@ check(
   ).length === 0,
 );
 check(
-  "acking upgrades a legacy receipt to the current label (no ambiguity left)",
+  "acking a message whose legacy receipt exists does not duplicate it",
   JSON.stringify(readByWith([legacyOf(SIBLING_A)], labelA)) ===
-    JSON.stringify([labelA]),
+    JSON.stringify([legacyOf(SIBLING_A)]),
+);
+check(
+  "acking a message with no receipt appends the current label",
+  JSON.stringify(readByWith([], labelA)) === JSON.stringify([labelA]),
 );
 check(
   "acking twice does not duplicate the receipt",
