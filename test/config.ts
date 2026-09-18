@@ -86,7 +86,7 @@ expectThrows(
 expectThrows(
   "over-long identity is rejected",
   () => normalizeBoardConfig({ identity: "x".repeat(65) }),
-  /at most 64 characters/,
+  /is 65 characters \(max 64\)/,
 );
 expectThrows(
   "non-object config is rejected",

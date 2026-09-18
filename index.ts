@@ -88,6 +88,7 @@ import {
 import {
   cloneBoard,
   createEmptyBoard,
+  DASHBOARD_ROW_BUDGET,
   DEFAULT_IDENTITY,
   derivePresence,
   findAllUnresolvedDeps,
@@ -114,10 +115,19 @@ import {
   liveOwnerIdentities,
   liveSessionCount,
   parseLiveRecord,
+  MAX_CHANGED_FILES,
+  MAX_FINDING_LOCATION_CHARS,
+  MAX_FINDING_SUGGESTED_FIX_CHARS,
   MAX_FINDING_SUMMARY_CHARS,
   MAX_FINDING_TITLE_CHARS,
+  MAX_IDENTITY_CHARS,
   MAX_MESSAGE_BYTES,
   MAX_MESSAGE_SUBJECT_CHARS,
+  MAX_SCOPE_GLOBS,
+  MAX_TASK_DEPENDENCIES,
+  MAX_TASK_DESCRIPTION_CHARS,
+  MAX_TASK_KEY_CHARS,
+  MAX_TASK_SUBJECT_CHARS,
   MAX_TOWER_DO_ALIASES,
   MAX_TOWER_DO_OPEN_TASKS,
   messagesToMe,
@@ -127,6 +137,9 @@ import {
   sliceTaskDashboard,
   staleTaskOwners,
   taskIsBlocked,
+  TASK_KEY_PATTERN,
+  textLength,
+  transportLimit,
   TOWER_DO_BOARD_TYPE,
   TOWER_DO_REMINDER_TYPE,
   TOWER_DO_STATUS_TOOL_NAME,
@@ -165,6 +178,9 @@ const REMINDER_ARMED = REMINDER_INTERVAL - 1;
 const WIDGET_TASK_LIMIT = 3; // unfinished tasks shown in the above-editor line
 const STATUS_ACTIVITY_TAIL = 8; // activity feed lines in tower_do_status
 const MESSAGE_RETENTION = 50; // max fully-read messages kept in the view
+/** Default `tower_do_talk inbox` page size: the schema description and the
+ * handler must agree, so the number lives once. */
+const DEFAULT_INBOX_LIMIT = 20;
 
 // ---------------------------------------------------------------------------
 // Config (global, HOME-scoped, fail-loud JSON)
@@ -400,27 +416,39 @@ function resolveCaller(
 
 const TaskKeySchema = Type.String({
   description:
-    "Stable 1-40 character lowercase task key, e.g. auth-refactor or feat-gemm",
+    `Stable 1-${MAX_TASK_KEY_CHARS} character lowercase task key, e.g. auth-refactor or feat-gemm`,
   minLength: 1,
-  maxLength: 40,
-  pattern: "^[a-z0-9][a-z0-9._-]*$",
+  maxLength: MAX_TASK_KEY_CHARS,
+  pattern: TASK_KEY_PATTERN.source,
 });
 
+// Task fields are ARRAY ELEMENTS: a schema rejection can name only
+// `tasks.84.*`, so every element-level bound declared here is
+// `transportLimit(...)` (a strictly looser payload guard) and the extension —
+// fold or execute — owns the error and names the task. Top-level scalar limits
+// (as/to/message subject/finding fields) keep the business value — the host
+// error names those fields itself, and the extension's own checks there are
+// backstops. See CONTRACTS.md "arg schema vs the fold".
 const TowerDoTaskSchema = Type.Object({
   key: TaskKeySchema,
   subject: Type.Optional(
     Type.String({
       description:
-        "Short imperative task subject; required for a new key, omitted to preserve an existing value",
-      minLength: 1,
-      maxLength: 160,
+        `Short imperative task subject, at most ${MAX_TASK_SUBJECT_CHARS} characters; required for a new key, omitted to preserve an existing value`,
+      // No `minLength`: emptiness is a content rule the fold owns, so an empty
+      // subject is reported as `tasks[N].subject (key) is required` instead of
+      // a preflight `/tasks/N/subject must not have fewer than 1 characters`
+      // that would abort the whole write without naming the task.
+      // Transport guard only: the fold enforces the limit so its error can
+      // name the task (see transportLimit).
+      maxLength: transportLimit(MAX_TASK_SUBJECT_CHARS),
     }),
   ),
   description: Type.Optional(
     Type.String({
       description:
-        "Long-form task description; omitted to preserve, empty string to clear",
-      maxLength: 2_000,
+        `Long-form task description, at most ${MAX_TASK_DESCRIPTION_CHARS} characters; omitted to preserve, empty string to clear. Keep it a durable statement of the task — evidence and logs belong in a tower_do_talk message or finding, not in every task-list write.`,
+      maxLength: transportLimit(MAX_TASK_DESCRIPTION_CHARS),
     }),
   ),
   status: Type.Optional(
@@ -433,35 +461,35 @@ const TowerDoTaskSchema = Type.Object({
     Type.String({
       description:
         'Agent/session identity that owns this task. Only the owner or the orchestrator identity "tower" may change its fields (status/owner/scope/changedFiles/subject/description/dependsOn/blockedBy).',
-      maxLength: 64,
+      maxLength: transportLimit(MAX_IDENTITY_CHARS),
     }),
   ),
   dependsOn: Type.Optional(
     Type.Array(Type.String(), {
       description:
         "Dependency keys; each must exist on the shared board or in this call, and the graph must stay acyclic. Omitted to preserve, empty array to clear. in_progress/completed require every dependency to be completed first (blocked is exempt).",
-      maxItems: 20,
+      maxItems: transportLimit(MAX_TASK_DEPENDENCIES),
     }),
   ),
   scope: Type.Optional(
     Type.Array(Type.String(), {
       description:
         "Optional file-glob list describing what paths this task may touch (Tower mission scope). Only owner/tower may change it.",
-      maxItems: 20,
+      maxItems: transportLimit(MAX_SCOPE_GLOBS),
     }),
   ),
   changedFiles: Type.Optional(
     Type.Array(Type.String(), {
       description:
         'Delivery receipt: files the owner actually changed, repo-relative. Only settable when status is "completed" — pass it in the same call that completes the task. Reopening the task (status back to pending/in_progress/blocked) without an explicit changedFiles voids the inherited receipt; changedFiles: [] clears it while staying completed. A worker may set it once; its owner or "tower" may amend later (the owner guard rejects other workers).',
-      maxItems: 100,
+      maxItems: transportLimit(MAX_CHANGED_FILES),
     }),
   ),
   blockedBy: Type.Optional(
     Type.Array(Type.String(), {
       description:
         "Free-form blocker ids this task waits on — task, message, or finding ids; not validated against the board. Non-empty renders a non-completed task as blocked (task-status gating goes through dependsOn instead).",
-      maxItems: 20,
+      maxItems: transportLimit(MAX_TASK_DEPENDENCIES),
     }),
   ),
 });
@@ -481,8 +509,8 @@ const TowerDoParamsSchema = Type.Object({
   as: Type.Optional(
     Type.String({
       description:
-        'Identity to act as (default: your session identity); the call is then owner-guarded as that identity. Pass a subagent id to record work on its behalf. Must be a single line, at most 64 characters, and not the reserved broadcast recipient "all".',
-      maxLength: 64,
+        `Identity to act as (default: your session identity); the call is then owner-guarded as that identity. Pass a subagent id to record work on its behalf. Must be a single line, at most ${MAX_IDENTITY_CHARS} characters, and not the reserved broadcast recipient "all".`,
+      maxLength: MAX_IDENTITY_CHARS,
     }),
   ),
 });
@@ -496,7 +524,7 @@ const TalkParamsSchema = Type.Object({
     Type.String({
       description:
         'send: recipient identity — "all" (broadcast), "tower" (orchestrator), a current task owner, or anyone with recent board activity. Self-send is rejected.',
-      maxLength: 64,
+      maxLength: MAX_IDENTITY_CHARS,
     }),
   ),
   subject: Type.Optional(
@@ -507,7 +535,7 @@ const TalkParamsSchema = Type.Object({
   ),
   body: Type.Optional(
     Type.String({
-      description: `send or finding: the message body (required for send) or finding summary (required when filing a finding); send body max ${Math.round(MAX_MESSAGE_BYTES / 1024)} KiB — split oversized content into multiple messages`,
+      description: `send: the message body (required for send), max ${Math.round(MAX_MESSAGE_BYTES / 1024)} KiB — split oversized content into multiple messages. Findings use the separate summary/suggestedFix fields, not body.`,
     }),
   ),
   taskKey: Type.Optional(
@@ -515,8 +543,8 @@ const TalkParamsSchema = Type.Object({
       description:
         "send only: task key this message threads under (must exist on the board). Passing it with inbox/finding is an error — findings are board-level and carry no task link.",
       minLength: 1,
-      maxLength: 40,
-      pattern: "^[a-z0-9][a-z0-9._-]*$",
+      maxLength: MAX_TASK_KEY_CHARS,
+      pattern: TASK_KEY_PATTERN.source,
     }),
   ),
   kind: Type.Optional(
@@ -544,11 +572,14 @@ const TalkParamsSchema = Type.Object({
   location: Type.Optional(
     Type.String({
       description: "finding: file/line location",
-      maxLength: 256,
+      maxLength: MAX_FINDING_LOCATION_CHARS,
     }),
   ),
   suggestedFix: Type.Optional(
-    Type.String({ description: "finding: suggested fix", maxLength: 2_000 }),
+    Type.String({
+      description: "finding: suggested fix",
+      maxLength: MAX_FINDING_SUGGESTED_FIX_CHARS,
+    }),
   ),
   findingId: Type.Optional(
     Type.String({ description: "finding: id to update (with status)" }),
@@ -561,7 +592,7 @@ const TalkParamsSchema = Type.Object({
   ),
   limit: Type.Optional(
     Type.Integer({
-      description: "inbox: max messages to return (default 20)",
+      description: `inbox: max messages to return (default ${DEFAULT_INBOX_LIMIT})`,
       minimum: 1,
       maximum: 100,
     }),
@@ -569,8 +600,8 @@ const TalkParamsSchema = Type.Object({
   as: Type.Optional(
     Type.String({
       description:
-        'Identity to act as (default: your session identity); the call is then attributed to that identity. Pass a subagent id to send or file as it. Must be a single line, at most 64 characters, and not the reserved broadcast recipient "all".',
-      maxLength: 64,
+        `Identity to act as (default: your session identity); the call is then attributed to that identity. Pass a subagent id to send or file as it. Must be a single line, at most ${MAX_IDENTITY_CHARS} characters, and not the reserved broadcast recipient "all".`,
+      maxLength: MAX_IDENTITY_CHARS,
     }),
   ),
 });
@@ -581,14 +612,14 @@ const StatusParamsSchema = Type.Object({
       description:
         "When set, return the FULL detail of this single task (description, scope, changedFiles, updatedAt) instead of the whole dashboard; owner/status/limit are ignored in this mode. Error if the key does not exist.",
       minLength: 1,
-      maxLength: 40,
-      pattern: "^[a-z0-9][a-z0-9._-]*$",
+      maxLength: MAX_TASK_KEY_CHARS,
+      pattern: TASK_KEY_PATTERN.source,
     }),
   ),
   owner: Type.Optional(
     Type.String({
       description: "Filter tasks by owner identity (combined AND with status)",
-      maxLength: 64,
+      maxLength: MAX_IDENTITY_CHARS,
     }),
   ),
   status: Type.Optional(
@@ -599,7 +630,7 @@ const StatusParamsSchema = Type.Object({
   limit: Type.Optional(
     Type.Integer({
       description:
-        "Max task lines (default 200). The default budget is won by open (non-completed) rows, so a long completed history can never hide unfinished work; an explicit limit is honoured in fold order. Hidden rows are reported in the output.",
+        `Max task lines (default ${DASHBOARD_ROW_BUDGET}). The default budget is won by open (non-completed) rows, so a long completed history can never hide unfinished work; an explicit limit is honoured in fold order. Hidden rows are reported in the output.`,
       minimum: 1,
     }),
   ),
@@ -1608,6 +1639,7 @@ export default function towerDoExtension(pi: ExtensionAPI): void {
 - Owner guard: a task with an owner can only be changed (any field) or removed by its owner or the "tower" identity. Exception: an owner idle for 30+ min (OWNER_TAKEOVER_MS) may be displaced on a non-completed task — adopt it by setting owner to yourself and changing nothing else in that write (any content edit in the same write is rejected; re-plan in a second write), or remove it; completed tasks stay guarded.
 - Dependencies gate status: in_progress/completed require every dependsOn entry to be completed, dependsOn keys must exist on the board or in this call, and cycles are rejected (blocked is exempt).
 - Set changedFiles only in the same write that completes a task; reopening a task without changedFiles voids the inherited receipt.
+- Content limits (subject ${MAX_TASK_SUBJECT_CHARS} / description ${MAX_TASK_DESCRIPTION_CHARS} characters) are enforced per task and a violation names the task key, so fix that one row instead of resending everything. An omitted field on an existing task is preserved (send only what changes); long-form evidence belongs in a tower_do_talk message or a finding, not in description.
 - Always pass baseRevision from tower_do_status; omitting it disables the stale-write check.
 - Capacity: up to ${MAX_TOWER_DO_OPEN_TASKS} non-completed tasks. Completed rows are receipts — they replay free, do not count, and can only be dropped by their owner or "tower", so a board of finished work never blocks a new plan. One write may introduce at most ${MAX_TOWER_DO_OPEN_TASKS} NEW completed rows (replaying an existing receipt is free; split a larger batch of deliveries across successive writes). When the open budget is full, omit your own or an unowned task; a board holding only completed rows is compacted by an as: "tower" write replaying just the rows to keep. Optional per-task fields: dependsOn (see above), scope (file globs the task may touch), blockedBy (free-form ids — non-empty renders a non-completed task as blocked).`,
     promptSnippet:
@@ -1955,7 +1987,7 @@ export default function towerDoExtension(pi: ExtensionAPI): void {
       }
 
       if (params.action === "inbox") {
-        const limit = params.limit ?? 20;
+        const limit = params.limit ?? DEFAULT_INBOX_LIMIT;
         const now2 = Date.now();
         // Reading your inbox acks the messages shown (LWW readBy update): the
         // sender learns you saw them, and fully-read history can be retired.
@@ -2102,9 +2134,9 @@ export default function towerDoExtension(pi: ExtensionAPI): void {
           "finding location must be a single line",
         );
       }
-      if (location && location.length > 256) {
+      if (location && textLength(location) > MAX_FINDING_LOCATION_CHARS) {
         throw new TowerDoValidationError(
-          "finding location must be at most 256 characters",
+          `finding location is ${textLength(location)} characters (max ${MAX_FINDING_LOCATION_CHARS}) — shorten it`,
         );
       }
       const suggestedFix = params.suggestedFix?.trim();
@@ -2113,9 +2145,12 @@ export default function towerDoExtension(pi: ExtensionAPI): void {
           "finding suggestedFix must be a single line",
         );
       }
-      if (suggestedFix && suggestedFix.length > 2_000) {
+      if (
+        suggestedFix &&
+        textLength(suggestedFix) > MAX_FINDING_SUGGESTED_FIX_CHARS
+      ) {
         throw new TowerDoValidationError(
-          "finding suggestedFix must be at most 2000 characters",
+          `finding suggestedFix is ${textLength(suggestedFix)} characters (max ${MAX_FINDING_SUGGESTED_FIX_CHARS}) — shorten it`,
         );
       }
       const finding: TowerDoFinding = {

@@ -36,9 +36,6 @@ export const MAX_TOWER_DO_OPEN_TASKS = 50;
  * liveness sidecar. Unrelated to the task budget (identities, not work); they
  * were one constant before and silently changed together. */
 export const MAX_TOWER_DO_ALIASES = 50;
-const MAX_TASK_DEPENDENCIES = 20;
-const MAX_SCOPE_GLOBS = 20;
-const MAX_CHANGED_FILES = 100;
 export const DEFAULT_IDENTITY = "main";
 /** Reserved orchestrator identity that may act on any owned task (Tower). */
 export const TOWER_IDENTITY = "tower";
@@ -46,6 +43,79 @@ export const MAX_MESSAGE_BYTES = 32 * 1024;
 export const MAX_MESSAGE_SUBJECT_CHARS = 200;
 export const MAX_FINDING_TITLE_CHARS = 200;
 export const MAX_FINDING_SUMMARY_CHARS = 4000;
+export const MAX_FINDING_LOCATION_CHARS = 256;
+export const MAX_FINDING_SUGGESTED_FIX_CHARS = 2_000;
+
+// ---------------------------------------------------------------------------
+// Content limits — defined exactly once, here.
+//
+// The tool-arg schema is built from these constants (index.ts) instead of
+// restating them, and each limit has exactly one enforcing layer: an
+// element-level limit (`tasks[i].*`) is enforced by the extension so its error
+// can name the task, a named top-level field by the schema. Nothing else may
+// hard-code a limit: a second definition is a second rule that drifts (see
+// CONTRACTS.md "arg schema vs the fold").
+//
+// Metric: `textLength` counts Unicode code points — not `String.length`
+// (UTF-16 units, where one emoji is two) and not grapheme clusters (where a
+// combining sequence is one). Code points are the cheap, dependency-free
+// metric that matches the documented wording for the ordinary cases a caller
+// writes; the host's own count is never larger (see `transportLimit`), so a
+// limit expressed in code points never lets through what the host would refuse.
+// ---------------------------------------------------------------------------
+
+/** Task key: ASCII only, so the length is metric-free and the arg schema owns
+ * the rule outright (pattern + length). The pattern derives from the length so
+ * there is exactly one place to change it. */
+export const MAX_TASK_KEY_CHARS = 40;
+export const TASK_KEY_PATTERN = new RegExp(
+  `^[a-z0-9][a-z0-9._-]{0,${MAX_TASK_KEY_CHARS - 1}}$`,
+);
+export const MAX_TASK_SUBJECT_CHARS = 160;
+export const MAX_TASK_DESCRIPTION_CHARS = 2_000;
+export const MAX_IDENTITY_CHARS = 64;
+export const MAX_TASK_DEPENDENCIES = 20;
+export const MAX_SCOPE_GLOBS = 20;
+export const MAX_CHANGED_FILES = 100;
+/** `blockedBy` is a free-form blocker list, not a dependency list: same shape,
+ * different rule. Kept as its own constant so retuning the dependency cap
+ * cannot silently retune the blocker cap (CONTRACTS.md task model). */
+export const MAX_TASK_BLOCKERS = 20;
+/** Longest single entry in a path-ish list (`scope` glob, `changedFiles`
+ * path). Both are single-line repo-relative strings that must stay readable in
+ * the dashboard, so one limit covers both. */
+export const MAX_PATH_ENTRY_CHARS = 256;
+
+/** Length of `value` in Unicode code points — the metric every user-facing
+ * "at most N characters" limit in this extension uses. */
+export function textLength(value: string): number {
+  return [...value].length;
+}
+
+/** Arg-schema transport guard for a limit the EXTENSION enforces (fold or
+ * execute). pi validates tool arguments against the same schema before
+ * `execute` runs, and a rejection there can name only an array index
+ * (`tasks.84.description`) — so an element-level bound living in the schema
+ * rejects a whole write with an error that cannot say which task it hit.
+ * Wherever the schema declares an element-level bound, it is this guard, and
+ * the extension owns the error, because only it can name the task key, the
+ * measured length and the remedy (CONTRACTS.md "arg schema vs the fold").
+ * Limits the schema does not declare at all (per-entry size of
+ * `scope`/`changedFiles`, the key format inside `dependsOn`) are enforced by
+ * the extension alone and need no guard — nothing can pre-empt them.
+ *
+ * The guard is a payload bound, not a second rule: the host's length check
+ * never counts more than the fold's code points (plain BMP text: exactly equal;
+ * astral or combining text: fewer code points per counted character), so a
+ * value the fold accepts is never refused preflight. 2× keeps the guard
+ * strictly above the limit so a realistic overshoot (the incident was 1.11×)
+ * reaches the fold's key-bearing error instead of the host's index-only one,
+ * while still bounding the ordinary case at twice the intended payload. It is
+ * deliberately not an upper bound on payload: a base character plus thousands
+ * of combining marks is one grapheme and passes any such guard. */
+export function transportLimit(limit: number): number {
+  return limit * 2;
+}
 
 export type TowerDoStatus = "pending" | "in_progress" | "completed" | "blocked";
 export type FindingKind = "bug" | "improve" | "vuln" | "idea";
@@ -226,9 +296,9 @@ function normalizeOptionalText(value: string | undefined): string | undefined {
 
 function normalizeTaskKey(value: string, location: string): string {
   const key = value.trim();
-  if (!/^[a-z0-9][a-z0-9._-]{0,39}$/.test(key)) {
+  if (!TASK_KEY_PATTERN.test(key)) {
     throw new TowerDoValidationError(
-      `${location} must be 1-40 lowercase ASCII letters, numbers, dots, underscores, or hyphens`,
+      `${location} must be 1-${MAX_TASK_KEY_CHARS} lowercase ASCII letters, numbers, dots, underscores, or hyphens`,
     );
   }
   return key;
@@ -257,9 +327,10 @@ export function normalizeIdentity(
   const identity = value?.trim();
   if (!identity) throw new TowerDoValidationError(`${location} is required`);
   assertSingleLine(identity, location);
-  if (identity.length > 64)
+  const identityLength = textLength(identity);
+  if (identityLength > MAX_IDENTITY_CHARS)
     throw new TowerDoValidationError(
-      `${location} must be at most 64 characters`,
+      `${location} is ${identityLength} characters (max ${MAX_IDENTITY_CHARS}) — shorten it`,
     );
   if (identity === "all") {
     throw new TowerDoValidationError(
@@ -318,7 +389,9 @@ export function writeBoardSnapshot(
     }
     const owner = patch.owner ?? existing?.owner;
     if (owner !== undefined) {
-      normalizeIdentity(owner, `tasks[${index}].owner`);
+      // Validate here too (fail fast before the merge), but with the key: an
+      // element-level rejection must be attributable to a task.
+      normalizeIdentity(owner, `tasks[${index}].owner (${key})`);
     }
     // Receipts describe a completed delivery: do not inherit one onto a
     // reopen, or normalizeTask rejects a field the caller never sent.
@@ -575,48 +648,38 @@ function normalizeTask(
   const key = normalizeTaskKey(input.key, `tasks[${index}].key`);
   const subject = assertSingleLine(
     input.subject.trim(),
-    `tasks[${index}].subject`,
+    `tasks[${index}].subject (${key})`,
   );
   if (!subject)
-    throw new TowerDoValidationError(`tasks[${index}].subject is required`);
-  if (subject.length > 160)
     throw new TowerDoValidationError(
-      `tasks[${index}].subject must be at most 160 characters`,
+      `tasks[${index}].subject (${key}) is required`,
+    );
+  const subjectLength = textLength(subject);
+  if (subjectLength > MAX_TASK_SUBJECT_CHARS)
+    throw new TowerDoValidationError(
+      `tasks[${index}].subject (${key}) is ${subjectLength} characters (max ${MAX_TASK_SUBJECT_CHARS}) — shorten it`,
     );
 
   const description = normalizeOptionalText(input.description);
-  if (description && description.length > 2_000) {
-    throw new TowerDoValidationError(
-      `tasks[${index}].description must be at most 2000 characters`,
-    );
+  if (description !== undefined) {
+    const descriptionLength = textLength(description);
+    if (descriptionLength > MAX_TASK_DESCRIPTION_CHARS) {
+      throw new TowerDoValidationError(
+        `tasks[${index}].description (${key}) is ${descriptionLength} characters (max ${MAX_TASK_DESCRIPTION_CHARS}) — shorten it, or omit the field to preserve the stored text`,
+      );
+    }
   }
 
   if (!isTowerDoStatus(input.status)) {
     throw new TowerDoValidationError(
-      `tasks[${index}].status is invalid: ${String(input.status)}`,
+      `tasks[${index}].status (${key}) is invalid: ${String(input.status)}`,
     );
   }
 
-  if ((input.dependsOn?.length ?? 0) > MAX_TASK_DEPENDENCIES) {
-    throw new TowerDoValidationError(
-      `tasks[${index}].dependsOn supports at most ${MAX_TASK_DEPENDENCIES} keys`,
-    );
-  }
-  if ((input.scope?.length ?? 0) > MAX_SCOPE_GLOBS) {
-    throw new TowerDoValidationError(
-      `tasks[${index}].scope supports at most ${MAX_SCOPE_GLOBS} globs`,
-    );
-  }
-  if ((input.changedFiles?.length ?? 0) > MAX_CHANGED_FILES) {
-    throw new TowerDoValidationError(
-      `tasks[${index}].changedFiles supports at most ${MAX_CHANGED_FILES} paths`,
-    );
-  }
-  if ((input.blockedBy?.length ?? 0) > MAX_TASK_DEPENDENCIES) {
-    throw new TowerDoValidationError(
-      `tasks[${index}].blockedBy supports at most ${MAX_TASK_DEPENDENCIES} entries`,
-    );
-  }
+  // Lists: normalize (trim, drop blanks, dedupe) FIRST, then validate entries,
+  // then apply the cap. Counting the raw input would reject a batch whose
+  // stored value is legal: 101 changedFiles entries with one duplicate is 100
+  // paths, and 21 dependsOn entries with a duplicate is one dependency.
   const dependsOn = [
     ...new Set(
       (input.dependsOn ?? [])
@@ -627,58 +690,101 @@ function normalizeTask(
   for (const [dependencyIndex, dependency] of dependsOn.entries()) {
     normalizeTaskKey(
       dependency,
-      `tasks[${index}].dependsOn[${dependencyIndex}]`,
+      `tasks[${index}].dependsOn[${dependencyIndex}] (${key})`,
+    );
+  }
+  if (dependsOn.length > MAX_TASK_DEPENDENCIES) {
+    throw new TowerDoValidationError(
+      `tasks[${index}].dependsOn (${key}) supports at most ${MAX_TASK_DEPENDENCIES} keys`,
     );
   }
   if (dependsOn.includes(key)) {
     throw new TowerDoValidationError(
-      `tasks[${index}] cannot depend on itself (${key})`,
+      `tasks[${index}].dependsOn (${key}) cannot depend on itself`,
     );
   }
 
-  const scope = (input.scope ?? [])
-    .map((glob) => assertSingleLine(glob.trim(), `tasks[${index}].scope entry`))
-    .filter(Boolean);
-  for (const glob of scope) {
-    if (glob.length === 0 || glob.length > 256) {
+  const scope = [
+    ...new Set(
+      (input.scope ?? [])
+        .map((glob, entryIndex) =>
+          assertSingleLine(
+            glob.trim(),
+            `tasks[${index}].scope[${entryIndex}] (${key})`,
+          ),
+        )
+        .filter(Boolean),
+    ),
+  ];
+  for (const [entryIndex, glob] of scope.entries()) {
+    const globLength = textLength(glob);
+    if (globLength > MAX_PATH_ENTRY_CHARS) {
       throw new TowerDoValidationError(
-        `tasks[${index}].scope entry must be 1-256 characters`,
+        `tasks[${index}].scope[${entryIndex}] (${key}) is ${globLength} characters (max ${MAX_PATH_ENTRY_CHARS}) — shorten it`,
       );
     }
   }
+  if (scope.length > MAX_SCOPE_GLOBS) {
+    throw new TowerDoValidationError(
+      `tasks[${index}].scope (${key}) supports at most ${MAX_SCOPE_GLOBS} globs`,
+    );
+  }
+
   const changedFiles = [
     ...new Set(
       (input.changedFiles ?? [])
-        .map((file) =>
-          assertSingleLine(file.trim(), `tasks[${index}].changedFiles entry`),
+        .map((file, entryIndex) =>
+          assertSingleLine(
+            file.trim(),
+            `tasks[${index}].changedFiles[${entryIndex}] (${key})`,
+          ),
         )
         .filter(Boolean),
     ),
   ];
-  for (const file of changedFiles) {
-    if (file.length === 0 || file.length > 256) {
+  for (const [entryIndex, file] of changedFiles.entries()) {
+    const fileLength = textLength(file);
+    if (fileLength > MAX_PATH_ENTRY_CHARS) {
       throw new TowerDoValidationError(
-        `tasks[${index}].changedFiles entry must be 1-256 characters`,
+        `tasks[${index}].changedFiles[${entryIndex}] (${key}) is ${fileLength} characters (max ${MAX_PATH_ENTRY_CHARS}) — shorten it`,
       );
     }
   }
-  if (changedFiles.length > 0 && input.status !== "completed") {
+  if (changedFiles.length > MAX_CHANGED_FILES) {
     throw new TowerDoValidationError(
-      `tasks[${index}].changedFiles is a delivery receipt — it requires status "completed" (got "${input.status}")`,
+      `tasks[${index}].changedFiles (${key}) supports at most ${MAX_CHANGED_FILES} paths`,
     );
   }
+  if (changedFiles.length > 0 && input.status !== "completed") {
+    throw new TowerDoValidationError(
+      `tasks[${index}].changedFiles (${key}) is a delivery receipt — it requires status "completed" (got "${input.status}")`,
+    );
+  }
+
   const blockedBy = [
     ...new Set(
       (input.blockedBy ?? [])
-        .map((entry) =>
-          assertSingleLine(entry.trim(), `tasks[${index}].blockedBy entry`),
+        .map((entry, entryIndex) =>
+          assertSingleLine(
+            entry.trim(),
+            `tasks[${index}].blockedBy[${entryIndex}] (${key})`,
+          ),
         )
         .filter(Boolean),
     ),
   ];
+  if (blockedBy.length > MAX_TASK_BLOCKERS) {
+    throw new TowerDoValidationError(
+      `tasks[${index}].blockedBy (${key}) supports at most ${MAX_TASK_BLOCKERS} entries`,
+    );
+  }
 
   const owner = normalizeOptionalText(input.owner);
-  if (owner !== undefined) normalizeIdentity(owner, `tasks[${index}].owner`);
+  if (owner !== undefined) {
+    // Key in the location: `owner` is an element-level limit, so the fold is
+    // the only layer that can attribute the rejection to a task.
+    normalizeIdentity(owner, `tasks[${index}].owner (${key})`);
+  }
 
   return {
     key,
@@ -739,7 +845,7 @@ function assertDependenciesAreConsistent(
       const omitted = boardByKey.get(dependency);
       throw new TowerDoValidationError(
         omitted === undefined
-          ? `tasks[${index}].dependsOn references missing task ${dependency} — it must exist on the shared board or in this call`
+          ? `tasks[${index}].dependsOn (${task.key}) references missing task ${dependency} — it must exist on the shared board or in this call`
           : `cannot remove task ${dependency} (this write omits it): ${task.key} still depends on it — keep it in the batch or drop the dependency first`,
       );
     }
@@ -749,7 +855,7 @@ function assertDependenciesAreConsistent(
     );
     if (unresolved.length > 0) {
       throw new TowerDoValidationError(
-        `tasks[${index}] cannot be ${task.status} while dependencies are unresolved: ${unresolved.join(", ")}`,
+        `tasks[${index}] (${task.key}) cannot be ${task.status} while dependencies are unresolved: ${unresolved.join(", ")}`,
       );
     }
   }
@@ -1670,7 +1776,8 @@ function readLiveAliases(value: unknown): string[] | undefined {
     if (out.length >= MAX_TOWER_DO_ALIASES) break;
     if (typeof item !== "string") continue;
     const id = item.trim();
-    if (id === "" || id === "all" || id.length > 64) continue;
+    if (id === "" || id === "all" || textLength(id) > MAX_IDENTITY_CHARS)
+      continue;
     if (seen.has(id)) continue;
     seen.add(id);
     out.push(id);
@@ -1924,7 +2031,7 @@ export function formatBoardReminder(
       "If your work changed (or should change) any task's status, owner, or deps, write it via tower_do " +
       `with baseRevision ${view.revision} — attach changedFiles (files you actually changed) when completing. ` +
       "To coordinate, message the task owner or file a finding via tower_do_talk instead of silently changing tasks you don't own. " +
-      "An owner idle for 30+ minutes (OWNER_TAKEOVER_MS) may be displaced: adopt the non-completed task by setting owner to yourself, or remove it. " +
+      `An owner idle for ${String(Math.round(OWNER_TAKEOVER_MS / 60_000))}+ minutes (OWNER_TAKEOVER_MS) may be displaced: adopt the non-completed task by setting owner to yourself, or remove it. ` +
       "Do not call tower_do only to acknowledge this reminder.",
   );
   return lines.join("\n");

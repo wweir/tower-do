@@ -48,6 +48,7 @@ jobs:
           bun run test/board-progress.ts
           bun run test/task-cap.ts
           bun run test/mine-first.ts
+          bun run test/limits.ts
 
       - name: Verify tag matches package version
         run: |

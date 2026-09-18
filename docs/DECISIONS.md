@@ -4,6 +4,65 @@
 > / reviews live in docs/plans + docs/reviews and get folded here when they
 > become durable rules.
 
+## 2026-09 — content limits are enforced by the fold, guarded by the schema
+
+**Context.** An 85-task replay was rejected preflight by the host's
+arg-schema validation: `tasks.84.description: must not have more than 2000
+characters`. The description had grown from a stored 1664 characters (83% of
+the cap) to 2224; the error named only the array index, the whole write was
+aborted before the extension ran, and the host echoed the entire 85-task
+payload (6279 characters) back into context to say so. The limit existed
+twice — `maxLength: 2_000` in the arg schema and the same check in the fold —
+with different wording, and the layer that fired first was structurally
+incapable of naming the task it rejected (an instance path can only carry an
+index). The two layers also disagreed on the metric (host: UTF-16 units for BMP
+text, grapheme clusters for astral text; fold: `String.length`), so which error
+a caller saw depended on the characters involved.
+
+**Decision.** One definition per limit (`state.ts` constants, exported) and one
+owning layer per rule class. An **element-level** rule (anything under
+`tasks[i].*`) is enforced by the **extension**, because only it can name the
+task, and its arg-schema bound is `transportLimit(limit)` = 2× — a payload
+guard, not a rule. A **named top-level field** (`as`, `to`, message `subject`,
+finding `title`/`summary`) keeps the business limit in the schema, because that
+error path already names the field. The guard is safe rather than arbitrary: the
+host's counted length is never larger than the extension's code-point count
+(plain BMP text: equal; astral or combining text: fewer), so a value the
+extension accepts is never refused preflight, and 2× keeps a realistic
+overshoot (the incident was 1.11×) on the key-bearing path; it is deliberately
+not an upper bound on payload, since one grapheme may carry thousands of code
+points. The extension counts Unicode **code points** (`textLength`) — one emoji
+is one character, unlike `String.length` — and its messages name index, key,
+measured length, limit and remedy
+(`tasks[84].description (cg-release-145-catalog-fix) is 2224 characters
+(max 2000) — shorten it, or omit the field to preserve the stored text`). The
+tool and field descriptions state the limits so a caller can budget without
+being told. Gates: `test/limits.ts` (derived bounds for element and named
+fields, the enforced limit and limit + 1 pass the real registered schema, the
+guard refuses a gross overflow, key-bearing rejection for text AND counts,
+code-point boundary, combining text still reaching the extension,
+omission-preserves).
+
+**Rejected.** Keeping the schema bound equal to the enforced limit and only
+re-wording the messages (the host still fires first for BMP text — the
+extension's actionable error stays unreachable and the payload echo stays); a
+much looser guard such as 20k (widens the preflight echo by an order of
+magnitude and buys nothing — the guard is a payload bound, not the business
+rule); silently truncating to the limit (the silent-wrong class this extension
+exists to prevent); switching the metric to UTF-8 bytes (a legal
+1664-character Chinese description is already ~5KB, so a byte cap would shrink
+the budget of boards holding valid text) or to grapheme clusters
+(`Intl.Segmenter`, and the host's own count is already a hybrid of UTF-16 units
+and graphemes, so matching it exactly buys nothing at a real cost).
+
+**Also.** The guard bounds one field, not the write: the preflight echo is
+dominated by the number of rows, and `tasks` deliberately has no `maxItems`
+(completed rows are receipts that replay free, and a full replay is mandatory),
+and combining-heavy text passes any `maxLength` guard, so an invalid write can
+still echo a large payload. That is a host-behaviour +
+full-replacement-design issue, filed as a finding (f-04f7935e-b9a) rather than
+papered over by a row ceiling that would break the capacity contract.
+
 ## 2026-09 — open-task budget: completed rows never block a new plan
 
 **Context.** The batch cap (`MAX_TOWER_DO_TASKS` = 50) was checked against the
