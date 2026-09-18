@@ -4,6 +4,43 @@
 > / reviews live in docs/plans + docs/reviews and get folded here when they
 > become durable rules.
 
+## 2026-09 — session identity is per extension instance, never a module global
+
+**Context.** pi runs subagent task sessions in-process (they appear as
+`sessions/<parent>/tasks/<child>.jsonl`), and every `towerDoExtension(pi)` call
+in that process shares module scope. The extension kept its ambient session
+context in a module-level variable, so a child session's `restore()` re-labelled
+its parent. Observed live while auditing this repo: the parent's board reminder
+announced `you are session-01a0b47e` (a subagent), then `you are main` after the
+child's `session_shutdown` cleared the global, while the parent's own tasks were
+owned by `session-01a0b444`. The parent's liveness heartbeat wrote the child's
+identity, so a live owner read as idle and its tasks became displaceable after
+the takeover window; presence and `live N` merged the two sessions. The tool
+path masked it — `prepare()` assigned the global to its own ctx immediately
+before resolving the caller — which is why task writes stayed correctly
+attributed and the bug survived.
+
+**Decision.** Session-scoped state lives in the extension closure (`selfCtx`),
+and `sessionIdentity`/`resolveCaller` take the calling session's context
+explicitly; no module-level mutable session state. Gate:
+`test/identity-scope.ts` loads two instances into one process and asserts the
+parent's reminder and status identity are unchanged after the child starts
+(verified by reintroducing the global: the parent was re-labelled
+`session-bbbbbbbb`).
+
+**Rejected.** Keying a module-level cache by `pi` in a `WeakMap` (correct only
+while pi hands every session its own API object; an explicit ctx is correct
+under either) and clearing the global on `session_shutdown` (a child's shutdown
+then wipes the parent's context — observed as `you are main`).
+
+**Also filed.** The default identity is `session-<first 8 chars of the session
+ULID>` — pure timestamp, zero entropy — so two sessions started within the same
+1024 ms bucket collide. Observed live: two sibling subagents
+(`01a0b47e-b9bf…`, `01a0b47e-b9d9…`, 0 ms apart) both became
+`session-01a0b47e`, and their liveness records cross-protect each other's
+ownership. Changing the format is a user-visible identifier change that would
+orphan existing owners, so it is filed as a finding rather than changed here.
+
 ## 2026-09 — content limits are enforced by the fold, guarded by the schema
 
 **Context.** An 85-task replay was rejected preflight by the host's

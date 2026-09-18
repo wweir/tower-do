@@ -363,16 +363,28 @@ class BoardCache {
 
 const boards = new BoardCache();
 
-// Module-scope session handle shared with sessionIdentity (identity fallback
-// to the session id) and reset on session_shutdown.
-let lastContext: ExtensionContext | undefined;
-
 // ---------------------------------------------------------------------------
 // Identity
 // ---------------------------------------------------------------------------
 
-/** Resolve the acting identity: config > session name > session id. */
-function sessionIdentity(cwd: string | undefined, pi: ExtensionAPI): string {
+/**
+ * Resolve the acting identity: config > session name > session id.
+ *
+ * `ctx` MUST be the calling session's own context. This used to read a
+ * module-level `lastContext` that every `towerDoExtension(pi)` call in the
+ * process overwrote, so a nested session (a subagent task session, which pi
+ * runs in-process) silently re-labelled its PARENT: the parent's heartbeat
+ * wrote the child's identity, the board reminder announced the child's
+ * identity, `as`-less writes were attributed to the child, and the parent's
+ * own tasks lost their liveness protection (a live owner looked idle and
+ * became displaceable). Session-scoped state must never live in a module
+ * global.
+ */
+function sessionIdentity(
+  cwd: string | undefined,
+  pi: ExtensionAPI,
+  ctx: ExtensionContext | undefined,
+): string {
   const entry = cwd === undefined ? undefined : boards.entryFor(cwd);
   const configured = entry?.config.identity?.trim();
   if (configured) return configured;
@@ -382,8 +394,8 @@ function sessionIdentity(cwd: string | undefined, pi: ExtensionAPI): string {
       : undefined;
   if (sessionName) return sessionName;
   const sessionId =
-    typeof lastContext?.sessionManager.getSessionId === "function"
-      ? (lastContext.sessionManager.getSessionId() ?? "")
+    typeof ctx?.sessionManager.getSessionId === "function"
+      ? (ctx.sessionManager.getSessionId() ?? "")
       : "";
   if (sessionId) return `session-${sessionId.slice(0, 8)}`;
   return DEFAULT_IDENTITY;
@@ -393,14 +405,18 @@ function resolveCaller(
   as: string | undefined,
   cwd: string | undefined,
   pi: ExtensionAPI,
+  ctx: ExtensionContext | undefined,
 ): string {
   const caller = as?.trim();
-  if (!caller) return sessionIdentity(cwd, pi);
+  if (!caller) return sessionIdentity(cwd, pi, ctx);
   if (/[\r\n\u2028\u2029]/.test(caller)) {
     throw new TowerDoValidationError("as must be a single line");
   }
-  if (caller.length > 64) {
-    throw new TowerDoValidationError("as must be at most 64 characters");
+  const callerLength = textLength(caller);
+  if (callerLength > MAX_IDENTITY_CHARS) {
+    throw new TowerDoValidationError(
+      `as is ${callerLength} characters (max ${MAX_IDENTITY_CHARS}) — shorten it`,
+    );
   }
   if (caller === "all") {
     throw new TowerDoValidationError(
@@ -772,6 +788,10 @@ export default function towerDoExtension(pi: ExtensionAPI): void {
   let widgetRegistered = false;
   let uiContext: ExtensionContext | undefined;
   let activeCwd: string | undefined;
+  // This instance's own session context (per `towerDoExtension` call), for the
+  // identity fallback and the paths that run without a ctx in hand (heartbeat
+  // timer, context hook). Instance-scoped on purpose — see sessionIdentity.
+  let selfCtx: ExtensionContext | undefined;
 
   // -------------------------------------------------------------------------
   // Widget (above-editor status line)
@@ -1201,10 +1221,10 @@ export default function towerDoExtension(pi: ExtensionAPI): void {
 
   /** Filename-safe component (identities/session ids are human-chosen). */
   const sanitizeLiveName = (s: string): string =>
-    s.replace(/[^A-Za-z0-9._-]/g, "_").slice(0, 64) || "x";
+    s.replace(/[^A-Za-z0-9._-]/g, "_").slice(0, MAX_IDENTITY_CHARS) || "x";
 
   const selfSessionId = (ctx?: ExtensionContext): string => {
-    const manager = ctx?.sessionManager ?? lastContext?.sessionManager;
+    const manager = ctx?.sessionManager ?? selfCtx?.sessionManager;
     // Call the method BOUND to the manager: extracting it into a local first
     // (unbound call) makes `this` undefined inside pi's SessionManager and
     // crashes with "undefined is not an object (evaluating 'this.sessionId')".
@@ -1230,7 +1250,7 @@ export default function towerDoExtension(pi: ExtensionAPI): void {
       await writeFile(
         tmp,
         JSON.stringify({
-          identity: sessionIdentity(cwd, pi),
+          identity: sessionIdentity(cwd, pi, selfCtx),
           at: Date.now(),
           ...(liveAliases.size > 0 ? { aliases: [...liveAliases] } : {}),
         }),
@@ -1251,7 +1271,7 @@ export default function towerDoExtension(pi: ExtensionAPI): void {
   };
 
   const rememberLiveAlias = (cwd: string, caller: string): void => {
-    const self = sessionIdentity(cwd, pi);
+    const self = sessionIdentity(cwd, pi, selfCtx);
     if (caller === self || caller === "" || caller === "all") return;
     if (liveAliases.has(caller)) return;
     if (liveAliases.size >= MAX_TOWER_DO_ALIASES) {
@@ -1303,7 +1323,7 @@ export default function towerDoExtension(pi: ExtensionAPI): void {
     // a stale count from another board must not land.
     if (activeCwd !== cwd) return;
     liveSessions = {
-      count: liveSessionCount(records, sessionIdentity(cwd, pi), Date.now()),
+      count: liveSessionCount(records, sessionIdentity(cwd, pi, selfCtx), Date.now()),
     };
   };
 
@@ -1407,7 +1427,7 @@ export default function towerDoExtension(pi: ExtensionAPI): void {
     if (!existsSync(boards.entryFor(cwd).board.file)) return;
     selfLivePath = join(
       liveDirFor(cwd),
-      `${sanitizeLiveName(sessionIdentity(cwd, pi))}.${sanitizeLiveName(selfSessionId(ctx))}.json`,
+      `${sanitizeLiveName(sessionIdentity(cwd, pi, selfCtx))}.${sanitizeLiveName(selfSessionId(ctx))}.json`,
     );
     // The live dir must exist before watch(): the first session in a project
     // would otherwise miss its watcher forever (ENOENT swallowed, never
@@ -1451,7 +1471,7 @@ export default function towerDoExtension(pi: ExtensionAPI): void {
     );
     const unread = unreadMessagesToMe(
       currentView,
-      sessionIdentity(activeCwd, pi),
+      sessionIdentity(activeCwd, pi, selfCtx),
     ).length;
     const boardSegment = formatBoardProgress(
       unfinished.length,
@@ -1504,7 +1524,7 @@ export default function towerDoExtension(pi: ExtensionAPI): void {
                       (n) => theme.fg("success", theme.bold(String(n))),
                       (s) => theme.fg("dim", s),
                     );
-              const identity = sessionIdentity(activeCwd, pi);
+              const identity = sessionIdentity(activeCwd, pi, selfCtx);
               const inboxForMe = unreadMessagesToMe(
                 currentView,
                 identity,
@@ -1608,11 +1628,11 @@ export default function towerDoExtension(pi: ExtensionAPI): void {
   ): Promise<{ board: TowerBoard; caller: string; view: TowerBoardView }> => {
     const entry = boards.entryFor(ctx.cwd);
     const view = await foldRetained(ctx.cwd);
-    lastContext = ctx;
+    selfCtx = ctx;
     activeCwd = ctx.cwd;
     currentView = view;
     uiContext = ctx;
-    const caller = resolveCaller(as, ctx.cwd, pi);
+    const caller = resolveCaller(as, ctx.cwd, pi, ctx);
     rememberLiveAlias(ctx.cwd, caller);
     return { board: entry.board, caller, view };
   };
@@ -1798,7 +1818,7 @@ export default function towerDoExtension(pi: ExtensionAPI): void {
         // `as` overrides the session identity for this call; trimmed to
         // match resolveCaller on the execute side.
         const asArg = typeof args.as === "string" ? args.as.trim() : "";
-        const acting = asArg || sessionIdentity(activeCwd, pi);
+        const acting = asArg || sessionIdentity(activeCwd, pi, selfCtx);
         const owner2 =
           typeof task.owner === "string" && task.owner
             ? task.owner === acting
@@ -2627,7 +2647,7 @@ export default function towerDoExtension(pi: ExtensionAPI): void {
       const caller =
         typeof details.identity === "string"
           ? details.identity
-          : sessionIdentity(activeCwd, pi);
+          : sessionIdentity(activeCwd, pi, selfCtx);
       let rendered = lines
         .slice(0, keep)
         .map((line) =>
@@ -2653,7 +2673,9 @@ export default function towerDoExtension(pi: ExtensionAPI): void {
 
   const restore = async (ctx: ExtensionContext): Promise<void> => {
     clearWidget();
-    lastContext = ctx;
+    // Only this instance's own context — a nested session's restore must not
+    // re-label this one (see sessionIdentity).
+    selfCtx = ctx;
     activeCwd = ctx.cwd;
     const entry = boards.entryFor(ctx.cwd);
     // Disk is authoritative. Fall back to the last session checkpoint ONLY
@@ -2756,7 +2778,7 @@ export default function towerDoExtension(pi: ExtensionAPI): void {
     if (existsSync(contextEntry.board.file)) {
       currentView = await foldRetained(cwd);
     }
-    const identity = sessionIdentity(cwd, pi);
+    const identity = sessionIdentity(cwd, pi, selfCtx);
     const tasks = getAllTasks(currentView);
     const hasUnfinished = tasks.some((task) => task.status !== "completed");
     const hasInbox = unreadMessagesToMe(currentView, identity).length > 0;
@@ -2803,7 +2825,10 @@ export default function towerDoExtension(pi: ExtensionAPI): void {
       pi.sendMessage(
         {
           customType: TOWER_DO_BOARD_TYPE,
-          content: formatBoardReminder(snapshot, sessionIdentity(ctx.cwd, pi)),
+          content: formatBoardReminder(
+            snapshot,
+            sessionIdentity(ctx.cwd, pi, ctx),
+          ),
           display: false,
           details: snapshot,
         },
@@ -2830,7 +2855,7 @@ export default function towerDoExtension(pi: ExtensionAPI): void {
     return {
       message: {
         customType: TOWER_DO_BOARD_TYPE,
-        content: formatBoardReminder(currentView, sessionIdentity(cwd, pi)),
+        content: formatBoardReminder(currentView, sessionIdentity(cwd, pi, selfCtx)),
         display: false,
         details: cloneBoard(currentView),
       },
@@ -2846,7 +2871,7 @@ export default function towerDoExtension(pi: ExtensionAPI): void {
     stopLiveWatchers();
     clearWidget();
     uiContext = undefined;
-    lastContext = undefined;
+    selfCtx = undefined;
     activeCwd = undefined;
     currentView = createEmptyBoard();
     resetGitCounts();
