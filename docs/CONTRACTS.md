@@ -108,6 +108,45 @@ section, never a gate. Resolution is messaging the owner (`tower_do_talk`) or
 re-scoping, not an automated block. Glob matching supports `*`, `**`, `?` and
 exact paths; intersection is conservative (flags obvious collisions only).
 
+## Identity labels — one agent, one key
+
+A generated session identity is `session-<time8>-<rand8>`. pi session ids are
+UUIDv7 hex (`8-4-4-4-12`), so the first 12 digits are a millisecond timestamp
+and the last 12 are random:
+
+- **The first 8 digits alone are a 65.5 s bucket** (2^16 ms), not an identity.
+  Through 0.4.0 the label was exactly that, so every session started inside one
+  bucket shared one owner key — two sibling subagents 26 ms apart both became
+  `session-01a0b47e` (finding f-79d6f380-a2e).
+- `rand8` is 8 hex digits of the id's random tail: bucket siblings differ with
+  probability 1 − 2⁻³². The time prefix is kept verbatim only for readability
+  (labels are retyped into `owner=`, `to=` and `as=`) — it is not what makes the
+  label unique. A full 42-character id was rejected for that reason.
+- Labels that are not generated session labels (a pinned `config.identity`, an
+  `as` label) compare verbatim: no pattern, no aliasing.
+
+**Same agent.** `sameAgent(a, b)` is exact equality plus one legacy rule: a
+`session-<time8>` label denotes the same agent as the `session-<time8>-<rand8>`
+label it prefixes. Two CURRENT labels are never equated, not even inside one
+bucket — that equality is the collision. The rule is for migration only: rows,
+receipts, audiences and `owner=` values written before 0.4.1 stay editable,
+addressable and liveness-protected instead of being orphaned, and the row
+adopts the current label the next time its session writes.
+
+- It is **not transitive** (legacy ↔ each bucket sibling), so grouping must be
+  keyed, never transitive: `derivePresence` merges a legacy row only into a
+  bucket holding exactly one current label; two current labels in one bucket
+  always render as two rows.
+- A legacy label stays ambiguous for its whole bucket by construction — 8
+  digits cannot name one member — and no amount of aliasing fixes that.
+- Applied at: the owner guard (change and removal), the staleness gate (with a
+  bucket-level `lastSeen` fallback that can only make an owner look *fresher*,
+  so it can withhold a takeover but never cause one), inbox addressing
+  (`to`/`from`/broadcast audience), read receipts (an ack upgrades a legacy
+  entry to the current label) and recipient validation.
+- Test gate: `test/identity-label.ts`, plus the in-process bucket-sibling case
+  in `test/identity-scope.ts`.
+
 ## Ownership guard — every field
 
 Only the task `owner` (or reserved `tower`) may change an owned task's fields —
@@ -242,7 +281,8 @@ bun run test/board-progress.ts      # widget board-progress remaining-work glanc
 bun run test/task-cap.ts            # open-task budget + fabricated-receipt bound (19 cases)
 bun run test/mine-first.ts          # glance/reminder mine-first order + dashboard budget slice/note (23 cases)
 bun run test/limits.ts              # arg schema vs fold: derived bounds, transport guard, key-bearing errors, list-cap ordering, code-point metric (60 cases)
-bun run test/identity-scope.ts      # session scoping: a nested in-process session never re-labels its parent (reminder + status identity) (5 cases)
+bun run test/identity-scope.ts      # session scoping: a nested in-process session never re-labels its parent (reminder + status identity), bucket siblings stay distinct (6 cases)
+bun run test/identity-label.ts       # identity labels: bucket siblings stay distinct, legacy labels alias only their own session, owner/staleness/inbox honour it (33 cases)
 ```
 
 Coverage intent: **pure, dependency-free logic** (state.ts, git-count.ts)

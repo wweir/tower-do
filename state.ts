@@ -347,6 +347,95 @@ export function normalizeIdentity(
   return identity;
 }
 
+// ---------------------------------------------------------------------------
+// Identity labels — one agent, one key
+// ---------------------------------------------------------------------------
+
+/** pi session ids are UUIDv7 (hex, `8-4-4-4-12`): the first 12 hex digits are a
+ * millisecond timestamp, the last 12 are random. Two generated-label shapes
+ * exist: `session-<time8>` (≤ 0.4.0) and `session-<time8>-<rand8>` (≥ 0.4.1). */
+const LEGACY_SESSION_LABEL = /^session-([0-9a-f]{8})$/;
+const CURRENT_SESSION_LABEL = /^session-([0-9a-f]{8})-([0-9a-f]{8})$/;
+
+/** Board identity for a session id: `session-<time8>-<rand8>`.
+ *
+ * Through 0.4.0 the label was `session-<time8>`. The first 8 hex digits of a
+ * UUIDv7 are the top 32 bits of a 48-bit millisecond timestamp — pure time
+ * with no entropy — so every session started inside one 65536 ms (65.5 s)
+ * bucket resolved to the SAME identity: parallel subagents, launched within
+ * milliseconds of each other, shared one owner key (observed live: two
+ * siblings 26 ms apart, both `session-01a0b47e`). The suffix carries 8 hex
+ * digits of the id's random tail, which separates the bucket's members.
+ *
+ * The time prefix is kept verbatim, so a ≤ 0.4.0 label is a prefix of the
+ * label the same session resolves to now — that partition is what `sameAgent`
+ * uses to migrate rows written before the change. */
+export function sessionLabel(sessionId: string): string {
+  return `session-${sessionId.slice(0, 8)}-${sessionId
+    .replace(/-/g, "")
+    .slice(-8)}`;
+}
+
+/**
+ * Do two labels denote the same agent?
+ *
+ * Exact equality always does. Beyond that a legacy `session-<time8>` label
+ * denotes the same agent as the `session-<time8>-<rand8>` label it prefixes: a
+ * row written before 0.4.1 must stay editable, addressable and
+ * liveness-protected for the session that wrote it.
+ *
+ * Two CURRENT labels are never equated, not even when they share the 8-digit
+ * time prefix — that prefix is a 65.5 s bucket, not an identity, and treating
+ * bucket siblings as one agent is exactly the collision this fixes. Labels that
+ * are not generated session labels (a pinned `config.identity`, an `as` label)
+ * compare verbatim.
+ */
+export function sameAgent(left: string, right: string): boolean {
+  if (left === right) return true;
+  const legacyLeft = LEGACY_SESSION_LABEL.exec(left);
+  const legacyRight = LEGACY_SESSION_LABEL.exec(right);
+  if (legacyLeft === null && legacyRight === null) return false;
+  const currentLeft = CURRENT_SESSION_LABEL.exec(left);
+  const currentRight = CURRENT_SESSION_LABEL.exec(right);
+  if (legacyLeft !== null && currentRight !== null)
+    return legacyLeft[1] === currentRight[1];
+  if (legacyRight !== null && currentLeft !== null)
+    return legacyRight[1] === currentLeft[1];
+  return false;
+}
+
+/** Set membership that honours `sameAgent` (identity sets are small: owners,
+ * audiences, read receipts). */
+export function identitySetHas(
+  set: ReadonlySet<string>,
+  label: string,
+): boolean {
+  if (set.has(label)) return true;
+  for (const candidate of set) if (sameAgent(candidate, label)) return true;
+  return false;
+}
+
+/** List membership that honours `sameAgent` (read receipts, audiences). */
+export function identityListHas(
+  list: readonly string[] | undefined,
+  label: string,
+): boolean {
+  return (list ?? []).some((candidate) => sameAgent(candidate, label));
+}
+
+/** `readBy` after `label` acks: no duplicate entry for the same agent, and a
+ * legacy entry is upgraded to the current label (see identitySetAdd). */
+export function readByWith(
+  readBy: readonly string[] | undefined,
+  label: string,
+): string[] {
+  const next = [...(readBy ?? [])];
+  const index = next.findIndex((candidate) => sameAgent(candidate, label));
+  if (index === -1) next.push(label);
+  else if (CURRENT_SESSION_LABEL.test(label)) next[index] = label;
+  return next;
+}
+
 /**
  * Normalize one task input against the current board + existing task (merge
  * semantics like the reference todo: omitted fields preserve existing values,
@@ -485,10 +574,13 @@ export function writeBoardSnapshot(
   for (const removed of removedTasks) {
     if (
       removed.owner !== undefined &&
-      caller !== removed.owner &&
+      !sameAgent(caller, removed.owner) &&
       caller !== TOWER_IDENTITY
     ) {
-      if (staleOwners.has(removed.owner) && removed.status !== "completed")
+      if (
+        identitySetHas(staleOwners, removed.owner) &&
+        removed.status !== "completed"
+      )
         continue;
       throw new TowerDoValidationError(
         `task ${removed.key} is owned by "${removed.owner}" — only its owner or ${TOWER_IDENTITY} may remove it` +
@@ -550,7 +642,7 @@ export function writeBoardSnapshot(
     // someone's content or forge a receipt.
     const adoptingStale =
       existing.owner !== undefined &&
-      staleOwners.has(existing.owner) &&
+      identitySetHas(staleOwners, existing.owner) &&
       existing.status !== "completed" &&
       task.owner === caller &&
       taskEquals(
@@ -561,7 +653,7 @@ export function writeBoardSnapshot(
       );
     if (
       existing.owner !== undefined &&
-      caller !== existing.owner &&
+      !sameAgent(caller, existing.owner) &&
       caller !== TOWER_IDENTITY &&
       !adoptingStale
     ) {
@@ -1327,10 +1419,10 @@ export function messagesToMe(
   identity: string,
 ): TowerDoMessage[] {
   return view.messages.filter((message) => {
-    if (message.from === identity) return false;
-    if (message.to === identity) return true;
+    if (sameAgent(message.from, identity)) return false;
+    if (sameAgent(message.to, identity)) return true;
     if (message.to !== "all") return false;
-    return broadcastAudience(message, view).has(identity);
+    return identitySetHas(broadcastAudience(message, view), identity);
   });
 }
 
@@ -1340,7 +1432,7 @@ export function unreadMessagesToMe(
   identity: string,
 ): TowerDoMessage[] {
   return messagesToMe(view, identity).filter(
-    (message) => !(message.readBy ?? []).includes(identity),
+    (message) => !identityListHas(message.readBy, identity),
   );
 }
 
@@ -1363,12 +1455,14 @@ export function isMessageFullyRead(
     // owners). Nobody can ever read it now — treat as fully read so a
     // finished broadcast round cannot pin the retention budget forever.
     const pendingReaders = [...owners].filter(
-      (owner) => !readBy.includes(owner),
+      (owner) => !identityListHas(readBy, owner),
     );
     if (pendingReaders.length === 0) return true;
     const pendingStillHere = pendingReaders.some(
       (owner) =>
-        view.tasks.some((task) => task.owner === owner) || owner === message.to,
+        view.tasks.some(
+          (task) => task.owner !== undefined && sameAgent(task.owner, owner),
+        ) || sameAgent(owner, message.to),
     );
     if (!pendingStillHere) return true;
     return false;
@@ -1378,10 +1472,10 @@ export function isMessageFullyRead(
   // nobody can ever read it — treat it as fully read so orphan messages do
   // not accumulate in the folded view forever.
   const recipientStillHere = view.tasks.some(
-    (task) => task.owner === message.to,
+    (task) => task.owner !== undefined && sameAgent(task.owner, message.to),
   );
   if (!recipientStillHere) return true;
-  return readBy.includes(message.to);
+  return identityListHas(readBy, message.to);
 }
 
 /**
@@ -1478,7 +1572,7 @@ export function parseActivityLine(line: string): ActivityEntry | undefined {
       // message: it is traffic the *reader* generated. Render it as a read
       // notice, keyed to the reader, so activity doesn't look like the
       // reader re-sent the message.
-      if (by !== from && readBy.includes(by)) {
+      if (by !== from && identityListHas(readBy, by)) {
         return {
           kind: "message",
           by,
@@ -1637,16 +1731,54 @@ export function derivePresence(
     ownerOf.set(task.owner, list);
   }
   const identities = new Set<string>([...lastSeen.keys(), ...ownerOf.keys()]);
+  // A legacy row merges into the current label of its bucket only when exactly
+  // ONE current label carries that bucket: `sameAgent` is not transitive
+  // (legacy ↔ each sibling), so grouping must stay keyed, never transitive —
+  // otherwise two distinct sessions of one bucket would render as one agent,
+  // which is the collision this change removes.
+  const currentLabels = [...identities].filter((label) =>
+    CURRENT_SESSION_LABEL.test(label),
+  );
+  const displayLabel = (label: string): string => {
+    const legacy = LEGACY_SESSION_LABEL.exec(label);
+    if (legacy === null) return label;
+    const matches = currentLabels.filter(
+      (current) => CURRENT_SESSION_LABEL.exec(current)?.[1] === legacy[1],
+    );
+    return matches.length === 1 ? matches[0] : label;
+  };
   const lines: PresenceLine[] = [];
-  for (const identity of identities) {
-    const ownerOfKeys = ownerOf.get(identity) ?? [];
-    const lastSeenAt = lastSeen.get(identity);
+  for (const raw of identities) {
+    const identity = displayLabel(raw);
+    const existing = lines.find((line) => line.identity === identity);
+    const ownerOfKeys = ownerOf.get(raw) ?? [];
+    const lastSeenAt = lastSeen.get(raw);
+    if (existing !== undefined) {
+      for (const key of ownerOfKeys)
+        if (!existing.ownerOf.includes(key)) existing.ownerOf.push(key);
+      if (
+        lastSeenAt !== undefined &&
+        (existing.lastSeenAt === undefined || lastSeenAt > existing.lastSeenAt)
+      )
+        existing.lastSeenAt = lastSeenAt;
+      continue;
+    }
     const unstarted = ownerOfKeys.length > 0 && lastSeenAt === undefined;
     const idle =
       ownerOfKeys.length > 0 &&
       lastSeenAt !== undefined &&
       now - lastSeenAt > PRESENCE_IDLE_MS;
     lines.push({ identity, lastSeenAt, ownerOf: ownerOfKeys, unstarted, idle });
+  }
+  // Derived flags are recomputed after merging (a merged row may have gained
+  // the activity or the ownership the first pass did not see).
+  for (const line of lines) {
+    const hasOwnership = line.ownerOf.length > 0;
+    line.unstarted = hasOwnership && line.lastSeenAt === undefined;
+    line.idle =
+      hasOwnership &&
+      line.lastSeenAt !== undefined &&
+      now - line.lastSeenAt > PRESENCE_IDLE_MS;
   }
   lines.sort((a, b) => {
     const aAt = a.lastSeenAt ?? 0;
@@ -1692,10 +1824,22 @@ export function staleTaskOwners(
   liveOwners: ReadonlySet<string> = new Set(),
 ): Set<string> {
   const lastSeen = new Map<string, number>();
+  // Legacy owners (`session-<time8>`) may hold no activity under their own
+  // label once the current label gained a suffix. The bucket map is a
+  // migration-window fallback: it can only make an owner look FRESHER, i.e. it
+  // can withhold a takeover but never cause one — the conservative direction
+  // for a permission gate.
+  const lastSeenBucket = new Map<string, number>();
   for (const entry of entries) {
     const prior = lastSeen.get(entry.by);
     if (prior === undefined || entry.at > prior)
       lastSeen.set(entry.by, entry.at);
+    const bucket = CURRENT_SESSION_LABEL.exec(entry.by)?.[1];
+    if (bucket !== undefined) {
+      const priorBucket = lastSeenBucket.get(bucket);
+      if (priorBucket === undefined || entry.at > priorBucket)
+        lastSeenBucket.set(bucket, entry.at);
+    }
   }
   const stale = new Set<string>();
   // No activity data at all (unreadable / garbage log) must disable the
@@ -1708,10 +1852,16 @@ export function staleTaskOwners(
     if (
       task.owner === undefined ||
       task.status === "completed" ||
-      liveOwners.has(task.owner)
+      identitySetHas(liveOwners, task.owner)
     )
       continue;
-    const quietSince = lastSeen.get(task.owner) ?? task.updatedAt;
+    const legacyBucket = LEGACY_SESSION_LABEL.exec(task.owner)?.[1];
+    const quietSince =
+      lastSeen.get(task.owner) ??
+      (legacyBucket === undefined
+        ? undefined
+        : lastSeenBucket.get(legacyBucket)) ??
+      task.updatedAt;
     if (now - quietSince > idleMs) stale.add(task.owner);
   }
   return stale;
@@ -1729,7 +1879,8 @@ function staleOwnerHint(
   task: TowerDoTask,
   staleOwners: ReadonlySet<string>,
 ): string {
-  if (task.owner === undefined || !staleOwners.has(task.owner)) return "";
+  if (task.owner === undefined || !identitySetHas(staleOwners, task.owner))
+    return "";
   if (task.status === "completed")
     return " (owner idle, but a completed task stays with its owner — receipt integrity)";
   return ` (owner idle ${Math.round(OWNER_TAKEOVER_MS / 60_000)}+ min: adopt it by setting owner to yourself, or remove it)`;
@@ -1787,7 +1938,7 @@ function readLiveAliases(value: unknown): string[] | undefined {
     const id = item.trim();
     if (id === "" || id === "all" || textLength(id) > MAX_IDENTITY_CHARS)
       continue;
-    if (seen.has(id)) continue;
+    if (identitySetHas(seen, id)) continue;
     seen.add(id);
     out.push(id);
   }

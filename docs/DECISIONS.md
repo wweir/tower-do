@@ -4,6 +4,47 @@
 > / reviews live in docs/plans + docs/reviews and get folded here when they
 > become durable rules.
 
+## 2026-09 — a session label carries entropy; legacy labels alias their own session
+
+**Context.** The board identity for a session was `session-<first 8 chars of
+the session id>`. pi session ids are UUIDv7 hex (`8-4-4-4-12`), so those 8
+digits are the top 32 bits of a 48-bit millisecond timestamp: pure time, no
+entropy. Every session started inside one 65536 ms (65.5 s) bucket therefore
+resolved to the SAME identity — two sibling subagents 26 ms apart both became
+`session-01a0b47e`. The identity is the owner-guard key, the liveness-sidecar
+key and the message-audience key, so colliding sessions could edit each other's
+tasks, each heartbeat kept the other's ownership alive, and presence rendered
+two agents as one line. Parallel subagent launches are this extension's
+advertised workflow, so co-start inside one bucket was the norm (finding
+f-79d6f380-a2e).
+
+**Decision.** `sessionLabel(id)` = `session-<time8>-<rand8>`, where the suffix
+is 8 hex digits of the id's random tail (32 bits of within-bucket
+discrimination; a bucket holds ~65 s of starts, and parallel siblings differ in
+their tail with probability 1 − 2⁻³²). Labels stay short and keep the readable
+time prefix, because a model or human retypes them into `owner=`, `to=` and
+`as=` — a 42-character full id would trade a rare collision for frequent
+transcription errors. The full id was rejected for that reason; a hash of the
+full id was rejected as machinery that buys nothing over the ULID/UUIDv7 tail
+the id already carries; widening the prefix (e.g. 10 hex digits = 2048 ms) was
+rejected because it is still pure timestamp.
+
+**Migration.** Rows, receipts and messages written before 0.4.1 carry the
+legacy label. `sameAgent(a, b)` equates a legacy `session-<time8>` with the
+CURRENT label it prefixes, and never two current labels — not even in one
+bucket, because that equality is the bug. It is deliberately NOT transitive
+(legacy ↔ each sibling), so grouping must stay keyed, never transitive
+(`derivePresence` merges a legacy row only into a bucket that holds exactly one
+current label). The relation is applied at every identity comparison: the
+owner guard (change and removal), the staleness gate (plus a bucket-level
+`lastSeen` fallback that can only make an owner look fresher, i.e. only withhold
+a takeover), the inbox (`to`/`from`/audience), read receipts (ack upgrades a
+legacy entry to the current label) and recipient validation. Legacy rows stay
+ambiguous by construction — an 8-digit label cannot name one member of its
+bucket — and the upgrade heals that row as soon as its session writes again.
+Gate: `test/identity-label.ts` (33 cases) plus the in-process collision case in
+`test/identity-scope.ts`; reverting `sessionLabel` to the legacy form fails both.
+
 ## 2026-09 — session identity is per extension instance, never a module global
 
 **Context.** pi runs subagent task sessions in-process (they appear as
@@ -33,13 +74,14 @@ while pi hands every session its own API object; an explicit ctx is correct
 under either) and clearing the global on `session_shutdown` (a child's shutdown
 then wipes the parent's context — observed as `you are main`).
 
-**Also filed.** The default identity is `session-<first 8 chars of the session
-ULID>` — pure timestamp, zero entropy — so two sessions started within the same
-1024 ms bucket collide. Observed live: two sibling subagents
-(`01a0b47e-b9bf…`, `01a0b47e-b9d9…`, 0 ms apart) both became
-`session-01a0b47e`, and their liveness records cross-protect each other's
-ownership. Changing the format is a user-visible identifier change that would
-orphan existing owners, so it is filed as a finding rather than changed here.
+**Also filed (fixed in 0.4.1).** The default identity was `session-<first 8
+chars of the session id>` — pure timestamp, zero entropy. (Corrected: pi session
+ids are UUIDv7 hex, so those 8 hex digits are the top 32 bits of a 48-bit
+millisecond timestamp and the collision bucket is 65536 ms = **65.5 s**, not the
+1024 ms first reported.) Observed live: two sibling subagents
+(`01a0b47e-b9bf…`, `01a0b47e-b9d9…`, 26 ms apart) both became
+`session-01a0b47e`, and their liveness records cross-protected each other's
+ownership. See the 0.4.1 entry above for the fix.
 
 ## 2026-09 — content limits are enforced by the fold, guarded by the schema
 

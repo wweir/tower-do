@@ -137,6 +137,11 @@ import {
   sliceTaskDashboard,
   staleTaskOwners,
   taskIsBlocked,
+  identityListHas,
+  identitySetHas,
+  readByWith,
+  sameAgent,
+  sessionLabel,
   TASK_KEY_PATTERN,
   textLength,
   transportLimit,
@@ -400,7 +405,10 @@ function sessionIdentity(
     typeof ctx?.sessionManager.getSessionId === "function"
       ? (ctx.sessionManager.getSessionId() ?? "")
       : "";
-  if (sessionId) return `session-${sessionId.slice(0, 8)}`;
+  // `sessionLabel` is the one place that maps a session id to a board identity
+  // (see its doc: the ≤ 0.4.0 form was pure timestamp and collided for every
+  // session started inside one 65.5 s bucket).
+  if (sessionId) return sessionLabel(sessionId);
   return DEFAULT_IDENTITY;
 }
 
@@ -762,11 +770,11 @@ function ensureKnown(
   if (recipient === "all" || recipient === TOWER_IDENTITY) return;
   const known = new Set([
     ...view.tasks
-      .filter((task) => task.owner !== undefined)
-      .map((task) => task.owner),
+      .map((task) => task.owner)
+      .filter((owner): owner is string => owner !== undefined),
     ...activity,
   ]);
-  if (!known.has(recipient)) {
+  if (!identitySetHas(known, recipient)) {
     const knownNames = [...known].join(", ");
     throw new TowerDoValidationError(
       `unknown recipient "${recipient}" — address "all", ${TOWER_IDENTITY}, a current task owner, or someone with recent board activity (known: ${knownNames || "(none)"})`,
@@ -1906,7 +1914,9 @@ export default function towerDoExtension(pi: ExtensionAPI): void {
             "send recipient must be a single line",
           );
         }
-        if (to === caller)
+        // Same agent, not just the same string: a session that migrated from a
+        // legacy label must not be able to address itself.
+        if (sameAgent(to, caller))
           throw new TowerDoValidationError(
             "cannot send an inbox message to yourself",
           );
@@ -2037,7 +2047,7 @@ export default function towerDoExtension(pi: ExtensionAPI): void {
             };
           }
           const unacked = mine.filter(
-            (message) => !(message.readBy ?? []).includes(caller),
+            (message) => !identityListHas(message.readBy, caller),
           );
           if (unacked.length > 0) {
             throwIfAborted(signal, "TowerDo talk");
@@ -2046,7 +2056,7 @@ export default function towerDoExtension(pi: ExtensionAPI): void {
                 kind: "message" as const,
                 message: {
                   ...message,
-                  readBy: [...(message.readBy ?? []), caller],
+                  readBy: readByWith(message.readBy, caller),
                 },
                 by: caller,
                 at: now2,
@@ -2054,9 +2064,9 @@ export default function towerDoExtension(pi: ExtensionAPI): void {
             );
           }
           const updatedMessages = mine.map((message) =>
-            (message.readBy ?? []).includes(caller)
+            identityListHas(message.readBy, caller)
               ? message
-              : { ...message, readBy: [...(message.readBy ?? []), caller] },
+              : { ...message, readBy: readByWith(message.readBy, caller) },
           );
           currentView = cloneBoard({
             ...fresh,
@@ -2064,7 +2074,7 @@ export default function towerDoExtension(pi: ExtensionAPI): void {
               unacked.some((unackedMessage) => unackedMessage.id === message.id)
                 ? {
                     ...message,
-                    readBy: [...(message.readBy ?? []), caller],
+                    readBy: readByWith(message.readBy, caller),
                   }
                 : message,
             ),
@@ -2073,7 +2083,7 @@ export default function towerDoExtension(pi: ExtensionAPI): void {
           updateWidget(ctx);
           const lines = updatedMessages.map(
             (message) =>
-              `- [${message.id}] [${(message.readBy ?? []).includes(caller) ? "read" : "UNREAD"}] ${message.from} → ${message.to}${message.taskKey === undefined ? "" : ` (task ${message.taskKey})`}: ${message.subject}\n  ${message.body.split("\n")[0]}`,
+              `- [${message.id}] [${identityListHas(message.readBy, caller) ? "read" : "UNREAD"}] ${message.from} → ${message.to}${message.taskKey === undefined ? "" : ` (task ${message.taskKey})`}: ${message.subject}\n  ${message.body.split("\n")[0]}`,
           );
           return {
             content: [
@@ -2382,7 +2392,7 @@ export default function towerDoExtension(pi: ExtensionAPI): void {
         const ownerNote =
           task.owner === undefined
             ? ""
-            : ` (owner: ${task.owner}${task.owner === caller ? ", me" : ""})`;
+            : ` (owner: ${task.owner}${sameAgent(task.owner, caller) ? ", me" : ""})`;
         const detail: string[] = [
           `TowerDo task ${task.key} — revision ${view.revision} (board file: ${board.file})`,
           `- subject: ${task.subject}`,
@@ -2480,7 +2490,7 @@ export default function towerDoExtension(pi: ExtensionAPI): void {
         // Marker hugs the identity: "←" already means "depends on" on task
         // lines, so keep a single meaning per symbol.
         const label =
-          person.identity === caller
+          sameAgent(person.identity, caller)
             ? `${person.identity} (me)`
             : person.identity;
         lines.push(
@@ -2503,7 +2513,7 @@ export default function towerDoExtension(pi: ExtensionAPI): void {
           const owner =
             task.owner === undefined
               ? ""
-              : ` @${task.owner}${task.owner === caller ? " (me)" : ""}`;
+              : ` @${task.owner}${sameAgent(task.owner, caller) ? " (me)" : ""}`;
           const deps = task.dependsOn.length
             ? ` ← ${task.dependsOn.join(",")}`
             : "";
@@ -2570,7 +2580,7 @@ export default function towerDoExtension(pi: ExtensionAPI): void {
         }; ${myUnread} unread)`,
       );
       for (const message of myMessages) {
-        const readMark = (message.readBy ?? []).includes(caller)
+        const readMark = identityListHas(message.readBy, caller)
           ? "read"
           : "UNREAD";
         lines.push(

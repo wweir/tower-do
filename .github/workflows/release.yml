@@ -50,6 +50,7 @@ jobs:
           bun run test/mine-first.ts
           bun run test/limits.ts
           bun run test/identity-scope.ts
+          bun run test/identity-label.ts
 
       - name: Verify tag matches package version
         run: |
