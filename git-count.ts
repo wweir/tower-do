@@ -137,9 +137,11 @@ export function headMoveIsExternal(facts: {
  return facts.commits > EXTERNAL_MOVE_MAX_COMMITS;
 }
 
-/** Header segment `mine N · dirty N`. `em` wraps numbers; `label` wraps viewpoint words.
- * Labels are self-describing (mine = files this session changed, dirty = worktree
- * dirty files); defaults keep the empty-segment gate on plain text. */
+/** Header segment `files N · dirty N`. `em` wraps numbers; `label` wraps viewpoint words.
+ * Labels are self-describing (files = files this session changed, dirty = worktree
+ * dirty files); defaults keep the empty-segment gate on plain text. The segment
+ * shares a line with the board's task counts, so it must not spell a file count
+ * with the same word the task layers use. */
 export function formatGitSegment(
  dirty: number,
  session: number,
@@ -148,7 +150,7 @@ export function formatGitSegment(
 ): string {
  if (dirty === 0 && session === 0) return "";
  return (
-  label("mine ") +
+  label("files ") +
   em(session, "session") +
   label(" · dirty ") +
   em(dirty, "dirty")
