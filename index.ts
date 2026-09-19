@@ -86,9 +86,12 @@ import {
   zipHashObject,
 } from "./git-count.ts";
 import {
+  classifyTaskLayers,
   cloneBoard,
   createEmptyBoard,
+  DASHBOARD_FINDING_LINE_CHARS,
   DASHBOARD_ROW_BUDGET,
+  DASHBOARD_SCOPE_CONFLICT_LINES,
   DEFAULT_IDENTITY,
   derivePresence,
   findAllUnresolvedDeps,
@@ -98,14 +101,20 @@ import {
   formatActivityFeed,
   formatBoardProgress,
   formatBoardReminder,
+  foldDashboardSections,
   formatDashboardHiddenNote,
   findScopeConflicts,
-  orderTasksMineFirst,
+  formatKeyListLine,
+  formatLayerSummary,
+  formatLedgerKeyRows,
+  formatLedgerRow,
   formatLiveSegment,
+  formatOtherKeysLine,
   formatPresenceLine,
   getAllTasks,
   isCallerLine,
   isTowerDoStatus,
+  truncateChars,
   knownIdentities,
   latestActivity,
   latestBoardCheckpoint,
@@ -134,6 +143,7 @@ import {
   parseActivityLine,
   relativeTime,
   retainMessages,
+  sliceScopeConflicts,
   sliceTaskDashboard,
   staleTaskOwners,
   taskIsBlocked,
@@ -643,6 +653,13 @@ const StatusParamsSchema = Type.Object({
       pattern: TASK_KEY_PATTERN.source,
     }),
   ),
+  findingId: Type.Optional(
+    Type.String({
+      description:
+        "When set, return the FULL text of this single finding (summary + suggestedFix) instead of the dashboard — the list renders at most a truncated first line; takes precedence over taskKey. Error if the id is unknown.",
+      minLength: 1,
+    }),
+  ),
   owner: Type.Optional(
     Type.String({
       description: "Filter tasks by owner identity (combined AND with status)",
@@ -652,6 +669,12 @@ const StatusParamsSchema = Type.Object({
   status: Type.Optional(
     StringEnum(["pending", "in_progress", "completed", "blocked"] as const, {
       description: "Filter tasks by a single status",
+    }),
+  ),
+  view: Type.Optional(
+    StringEnum(["layers", "mine", "needs", "all"] as const, {
+      description:
+        "How much of the unfinished board renders as full rows. `layers` (default) renders your own work and the peer work you are coupled to, folding everything else into a one-line shape summary plus a compact `key status @owner` ledger — the keys stay enumerable for a full-replacement write. `all` expands every unfinished row, `mine` renders only your own rows in full, and `needs` is an alias for `layers`.",
     }),
   ),
   limit: Type.Optional(
@@ -1573,14 +1596,28 @@ export default function towerDoExtension(pi: ExtensionAPI): void {
               const lines = [header];
               // WIDGET_TASK_LIMIT caps how many unfinished tasks the
               // above-editor line shows; the rest fold into an overflow note.
-              // Rows are mine-first so the cap does not hide the caller's
-              // work behind older peer/unowned tasks. Counts stay board-wide.
-              const cap =
-                activeCwd === undefined ? unfinished.length : WIDGET_TASK_LIMIT;
-              const shown = orderTasksMineFirst(unfinished, identity).slice(
-                0,
-                cap,
+              // Rows are layered (mine → needs → other) and recency-first, so
+              // the cap shows the work the caller is in before peers. Counts
+              // stay board-wide.
+              // The glance spends its rows on the caller's own work and the
+              // peer work it is coupled to; unrelated unfinished tasks fold to
+              // one count line. Their keys stay one `tower_do_status` away,
+              // which any full-replacement write has to read anyway.
+              const layers = classifyTaskLayers(
+                unfinished,
+                currentView,
+                identity,
               );
+              const needsKeys = new Set(
+                layers.needs.map((entry) => entry.task.key),
+              );
+              const attention = [
+                ...layers.mine,
+                ...layers.needs.map((entry) => entry.task),
+              ];
+              const cap =
+                activeCwd === undefined ? attention.length : WIDGET_TASK_LIMIT;
+              const shown = attention.slice(0, cap);
               for (const task of shown) {
                 const glyph = STATUS_GLYPH[task.status];
                 const color = statusColor(task.status);
@@ -1590,15 +1627,41 @@ export default function towerDoExtension(pi: ExtensionAPI): void {
                     : task.owner === identity
                       ? theme.fg("accent", theme.bold(` @${task.owner}`))
                       : theme.fg("dim", ` @${task.owner}`);
+                const needsTag = needsKeys.has(task.key)
+                  ? theme.fg("dim", " [needs you]")
+                  : "";
                 lines.push(
-                  `${theme.fg(color, glyph)} ${theme.fg("dim", `${task.key}:`)} ${theme.fg("text", task.subject)}${owner}`,
+                  `${theme.fg(color, glyph)} ${theme.fg("dim", `${task.key}:`)} ${theme.fg("text", task.subject)}${owner}${needsTag}`,
                 );
               }
-              if (unfinished.length > shown.length) {
+              if (attention.length > shown.length) {
+                // Both layers feed `attention`, so "yours" would mislabel the
+                // coupled peer rows; name what the caller has to do with
+                // them — the dropped keys must stay enumerable for a
+                // full-replacement write. Narrow widgets truncate the tail
+                // (`truncateToWidth` below), which is fine: the leading keys
+                // still render.
                 lines.push(
                   theme.fg(
                     "dim",
-                    `… +${unfinished.length - shown.length} more`,
+                    formatKeyListLine(
+                      `… and ${String(attention.length - shown.length)} more task(s) you need to see: `,
+                      attention.slice(shown.length).map((task) => task.key),
+                    ),
+                  ),
+                );
+              }
+              if (layers.other.length > 0) {
+                // Same contract as the attention-overflow line above: the
+                // folded layer's keys stay enumerable for a full-replacement
+                // write; a narrow widget truncates the key tail, not the fact
+                // that the keys are named.
+                lines.push(
+                  theme.fg(
+                    "dim",
+                    formatOtherKeysLine(
+                      layers.other.map((task) => task.key),
+                    ),
                   ),
                 );
               }
@@ -2286,13 +2349,14 @@ export default function towerDoExtension(pi: ExtensionAPI): void {
   pi.registerTool({
     name: TOWER_DO_STATUS_TOOL_NAME,
     label: "TowerDo Status",
-    description: `Read the shared tower-do board: everyone's tasks (owner, status, deps, scope, blocks), messages addressed to you, open findings, and the recent activity tail. Also prints the board file path and the current revision (pass it back as baseRevision) so subagents can read state directly (file-as-state). Reading here does NOT ack messages (tower_do_talk action=inbox does). Pass taskKey to get the FULL detail of one task instead. Output is bounded to ${Math.round(DEFAULT_MAX_BYTES / 1024)}KB / ${String(DEFAULT_MAX_LINES)} lines from the TAIL (the head — header, revision, board file path and open-task rows — is dropped first) and says so in a footer when that happens.`,
+    description: `Read the shared tower-do board: everyone's tasks (owner, status, deps, scope, blocks), messages addressed to you, open findings, and the recent activity tail. Unfinished work is caller-centred: your own rows and the peer rows you are coupled to (your unfinished work awaits it, it awaits yours, unread mail threads under it, or its declared scope intersects yours) render in full, recency-first, while every other unfinished row folds into one shape summary plus a \`key status @owner\` ledger — keys stay enumerable for a full-replacement write, and completed rows stay a compact key ledger (their detail is one taskKey lookup away). Still bounded by the dashboard budget and the byte/line caps, which disclose what they cut. Also prints the board file path and the current revision (pass it back as baseRevision) so subagents can read state directly (file-as-state). Reading here does NOT ack messages (tower_do_talk action=inbox does). Pass taskKey for the FULL detail of one task, findingId for the full text of one finding, view=all to expand the folded layer, or view=mine to narrow to your own rows. Output is bounded to ${Math.round(DEFAULT_MAX_BYTES / 1024)}KB / ${String(DEFAULT_MAX_LINES)} lines from the TAIL (the head — header, revision, board file path and open-task rows — is dropped first) and says so in a footer when that happens.`,
     promptSnippet:
       "Show the shared multi-agent task board: tasks, messages, findings, activity",
     promptGuidelines: [
       "Use tower_do_status before starting work to see who owns what on the shared board, and before finishing work to reconcile your own tasks.",
       "When a tower_do write is rejected as stale, call tower_do_status first to re-read the current revision, then merge your changes and retry with the new baseRevision.",
       "Share the board file path from tower_do_status with subagents so they can read shared state directly; have them report back instead of editing owned tasks.",
+      "Before a tower_do write, make sure the whole board is in view: the folded `## Others` ledger already names every open key (view=all adds their rows), and a key omitted from the write is removed — the default view's ledger is the minimum you must enumerate.",
     ],
     parameters: StatusParamsSchema,
     executionMode: "sequential",
@@ -2373,11 +2437,82 @@ export default function towerDoExtension(pi: ExtensionAPI): void {
             )
           : tasks;
       const limit = params.limit;
-      // Open rows win the default budget (stable partition, so groups keep fold
-      // order); an explicit `limit` is honoured in fold order verbatim. Mine-first
-      // runs per status group on this already-sliced list — it must not steal the
-      // global limit budget.
+      // Open rows win the default budget (stable partition, so the slice keeps
+      // fold order); an explicit `limit` is honoured in fold order verbatim.
+      // The layers are computed over the whole board and the slice only decides
+      // which rows render — render order inside a layer is recency-first.
       const { shown, hidden } = sliceTaskDashboard(filtered, limit);
+
+      // Detail reads (taskKey / findingId) are bounded like the dashboard: a
+      // 4000-character summary can render thousands of lines, and the tool
+      // description promises the cut is disclosed.
+      const boundedDetail = (body: string, label: string): string => {
+        const cut = truncateTail(body, { maxBytes: DEFAULT_MAX_BYTES });
+        if (!cut.truncated) return cut.content;
+        const reserved =
+          `… ${label} truncated: showing the last ${String(cut.outputLines)} of ${String(cut.totalLines)} lines. ` +
+          `Revision ${String(view.revision)} · board file ${board.file}`;
+        const kept = truncateTail(body, {
+          maxBytes: DEFAULT_MAX_BYTES - Buffer.byteLength(reserved) - 1,
+          maxLines: DEFAULT_MAX_LINES - 1,
+        });
+        // The footer reports the second cut's real line count, not the first
+        // cut's: the second cut also applies the line cap, so `kept` can be
+        // shorter than `cut`. `kept.outputLines <= cut.outputLines`, so this
+        // footer never exceeds the `reserved` byte budget above.
+        const footer =
+          `… ${label} truncated: showing the last ${String(kept.outputLines)} of ${String(cut.totalLines)} lines. ` +
+          `Revision ${String(view.revision)} · board file ${board.file}`;
+        return `${kept.content}\n${footer}`;
+      };
+
+      // Single-finding detail mode: a finding's summary is capped at 4000
+      // characters and the dashboard list shows one truncated line, so the
+      // full text needs its own read path.
+      if (params.findingId !== undefined) {
+        const finding = view.findings.find(
+          (entry) => entry.id === params.findingId,
+        );
+        if (finding === undefined) {
+          throw new TowerDoValidationError(
+            `no finding with id "${params.findingId}" on the board (revision ${view.revision})`,
+          );
+        }
+        const detail = [
+          `TowerDo finding ${finding.id} — revision ${view.revision} (board file: ${board.file})`,
+          `- id: ${finding.id}`,
+          `- kind/severity: ${finding.kind} / ${finding.severity}`,
+          `- status: ${finding.status}`,
+          `- from: ${finding.from} (${new Date(finding.at).toISOString()})`,
+        ];
+        if (finding.location !== undefined) {
+          detail.push(`- location: ${finding.location}`);
+        }
+        detail.push(`- title: ${finding.title}`);
+        detail.push("- summary:");
+        for (const row of finding.summary.split("\n")) detail.push(`  ${row}`);
+        if (finding.suggestedFix !== undefined) {
+          detail.push("- suggestedFix:");
+          for (const row of finding.suggestedFix.split("\n")) {
+            detail.push(`  ${row}`);
+          }
+        }
+        return {
+          content: [
+            {
+              type: "text",
+              text: boundedDetail(`${detail.join("\n")}\n`, "finding detail"),
+            },
+          ],
+          details: {
+            caller,
+            revision: view.revision,
+            board: board.file,
+            identity: caller,
+            findingId: finding.id,
+          },
+        };
+      }
 
       // Single-task detail mode: taskKey takes precedence over the dashboard
       // filters — the caller asked for one task's full record (description is
@@ -2392,7 +2527,7 @@ export default function towerDoExtension(pi: ExtensionAPI): void {
         const ownerNote =
           task.owner === undefined
             ? ""
-            : ` (owner: ${task.owner}${sameAgent(task.owner, caller) ? ", me" : ""})`;
+            : ` (owner: ${task.owner}${task.owner === caller ? ", me" : ""})`;
         const detail: string[] = [
           `TowerDo task ${task.key} — revision ${view.revision} (board file: ${board.file})`,
           `- subject: ${task.subject}`,
@@ -2423,7 +2558,10 @@ export default function towerDoExtension(pi: ExtensionAPI): void {
             detail.push(`  ${row}`);
           }
         }
-        const detailText = detail.join("\n");
+        const detailText = boundedDetail(
+          `${detail.join("\n")}\n`,
+          "task detail",
+        );
         return {
           content: [{ type: "text", text: detailText }],
           details: {
@@ -2485,86 +2623,169 @@ export default function towerDoExtension(pi: ExtensionAPI): void {
             person.lastSeenAt >= recentWindow),
       );
       const historicalCount = presence.length - relevantPresence.length;
-      lines.push(`## Who is around (${relevantPresence.length})`);
-      for (const person of relevantPresence) {
-        // Marker hugs the identity: "←" already means "depends on" on task
-        // lines, so keep a single meaning per symbol.
-        const label =
-          sameAgent(person.identity, caller)
-            ? `${person.identity} (me)`
-            : person.identity;
+      if (relevantPresence.length === 0) {
+        // An empty presence section spends three lines saying nothing; the
+        // count the reader needs fits one.
         lines.push(
-          `- ${formatPresenceLine({ ...person, identity: label }, now)}`,
+          `## Who is around: nobody active${historicalCount > 0 ? ` (${String(historicalCount)} with only historical activity)` : ""}`,
         );
-      }
-      if (historicalCount > 0) {
-        lines.push(`- … ${historicalCount} more with only historical activity`);
+      } else {
+        lines.push(`## Who is around (${relevantPresence.length})`);
+        for (const person of relevantPresence) {
+          // Marker hugs the identity: "←" already means "depends on" on task
+          // lines, so keep a single meaning per symbol.
+          const label =
+            sameAgent(person.identity, caller)
+              ? `${person.identity} (me)`
+              : person.identity;
+          lines.push(
+            `- ${formatPresenceLine({ ...person, identity: label }, now)}`,
+          );
+        }
+        if (historicalCount > 0) {
+          lines.push(
+            `- … ${historicalCount} more with only historical activity`,
+          );
+        }
       }
       lines.push("");
 
-      const renderGroup = (
+      // Layered rendering: the caller's own unfinished work first, then the
+      // peer work it is coupled to, then everything else, then receipts. Order
+      // inside a layer is recency-first (classifyTaskLayers). A `view` that
+      // excludes a layer renders it as a compact ledger instead of dropping
+      // it, so the rows stay nameable for a full-replacement write.
+      //
+      // Classify the WHOLE board, then keep the sliced rows: the `needs` layer
+      // is derived from the caller's own unfinished work, and a limit/owner=/
+      // status= slice can exclude exactly that row.
+      const layers = classifyTaskLayers(tasks, view, caller);
+      const shownKeys = new Set(shown.map((task) => task.key));
+      const sliced = (list: readonly TowerDoTask[]): TowerDoTask[] =>
+        list.filter((task) => shownKeys.has(task.key));
+      const needsReason = new Map(
+        layers.needs.map((entry) => [entry.task.key, entry.reason]),
+      );
+      const taskRow = (task: TowerDoTask): string => {
+        const owner =
+          task.owner === undefined
+            ? ""
+            : ` @${task.owner}${task.owner === caller ? " (me)" : ""}`;
+        const deps = task.dependsOn.length
+          ? ` ← ${task.dependsOn.join(",")}`
+          : "";
+        const scope = task.scope?.length
+          ? ` [scope: ${task.scope.join(", ")}]`
+          : "";
+        // Derived status, like the summary counts: a gated pending row must
+        // not render as `○` while the header counts it blocked.
+        const shownStatus = displayStatus(task);
+        const blocked = shownStatus === "blocked";
+        // Same contract as the board reminder: the marker must carry the
+        // WHY (blockedBy ∪ unresolved deps), never a bare duplicate of the
+        // status glyph. Completed rows never show waiting reasons.
+        const blockers =
+          task.status === "completed"
+            ? []
+            : [
+                ...new Set([
+                  ...task.blockedBy,
+                  ...findAllUnresolvedDeps(task, view),
+                ]),
+              ];
+        const blockedSuffix = blocked
+          ? blockers.length > 0
+            ? ` [blocked by: ${blockers.join(",")}]`
+            : " [blocked]"
+          : "";
+        const reason = needsReason.get(task.key);
+        // A peer row wins the window because the caller is coupled to it; say
+        // why, or it reads as unrelated backlog the caller may skip.
+        const needsSuffix =
+          reason === undefined ? "" : ` [needs you: ${reason}]`;
+        return `- ${STATUS_GLYPH[shownStatus]} ${task.key}: ${task.subject}${owner}${deps}${scope}${changedFilesSuffix(task)}${blockedSuffix}${needsSuffix}`;
+      };
+      const renderSection = (
         label: string,
-        pick: (task: TowerDoTask) => boolean,
+        sectionTasks: readonly TowerDoTask[],
+        compact: boolean,
       ): void => {
-        const group = orderTasksMineFirst(shown.filter(pick), caller);
-        if (group.length === 0) return;
-        lines.push(`## ${label}`);
-        for (const task of group) {
-          const owner =
-            task.owner === undefined
-              ? ""
-              : ` @${task.owner}${sameAgent(task.owner, caller) ? " (me)" : ""}`;
-          const deps = task.dependsOn.length
-            ? ` ← ${task.dependsOn.join(",")}`
-            : "";
-          const scope = task.scope?.length
-            ? ` [scope: ${task.scope.join(", ")}]`
-            : "";
-          const blocked = taskIsBlocked(task, view);
-          // Same contract as the board reminder: the marker must carry the
-          // WHY (blockedBy ∪ unresolved deps), never a bare duplicate of the
-          // status glyph. Completed rows never show waiting reasons.
-          const blockers =
-            task.status === "completed"
-              ? []
-              : [
-                  ...new Set([
-                    ...task.blockedBy,
-                    ...findAllUnresolvedDeps(task, view),
-                  ]),
-                ];
-          const blockedSuffix = blocked
-            ? blockers.length > 0
-              ? ` [blocked by: ${blockers.join(",")}]`
-              : " [blocked]"
-            : "";
-          lines.push(
-            `- ${STATUS_GLYPH[task.status]} ${task.key}: ${task.subject}${owner}${deps}${scope}${changedFilesSuffix(task)}${blockedSuffix}`,
-          );
+        if (sectionTasks.length === 0) return;
+        const count = String(sectionTasks.length);
+        // The summary must describe the rows actually rendered: an explicit
+        // `limit` can drop rows from this layer, and a header that still counts
+        // the dropped ones contradicts its own body.
+        const detail = compact
+          ? ` · ${formatLayerSummary(sectionTasks, view)}`
+          : "";
+        lines.push(
+          compact
+            ? `## ${label} (${count}${detail}, ledger)`
+            : `## ${label} (${count})`,
+        );
+        for (const task of sectionTasks) {
+          lines.push(compact ? formatLedgerRow(task) : taskRow(task));
         }
         lines.push("");
       };
-      renderGroup("Blocked", (task) => displayStatus(task) === "blocked");
-      renderGroup(
-        "In progress",
-        (task) => displayStatus(task) === "in_progress",
+      const layerView = params.view ?? "layers";
+      // `mine` is never compacted by `view` (a view that hid the caller's own
+      // work would have no reason to be called); an explicit `limit` can still
+      // slice it, exactly as the documented fold-order contract says.
+      renderSection("Mine", sliced(layers.mine), false);
+      renderSection(
+        "Needs you",
+        sliced(layers.needs.map((entry) => entry.task)),
+        layerView === "mine",
       );
-      renderGroup("Pending", (task) => displayStatus(task) === "pending");
-      renderGroup("Completed", (task) => displayStatus(task) === "completed");
+      renderSection("Others", sliced(layers.other), layerView !== "all");
+      // Receipts render as a key ledger: their subject, scope and changedFiles
+      // are one `taskKey` lookup away, and rendering them per row spends the
+      // first screen on other sessions' history. The dashboard budget still
+      // applies to this section, and its cut is disclosed like any other.
+      const completedShown = sliced(layers.completed);
+      if (completedShown.length > 0) {
+        lines.push(`## Completed (${completedShown.length})`);
+        for (const row of formatLedgerKeyRows(completedShown)) {
+          lines.push(row);
+        }
+        lines.push("");
+      }
 
       if (shown.length === 0) lines.push("(no tasks match the filter)");
       const hiddenNote = formatDashboardHiddenNote(hidden, limit);
       if (hiddenNote !== undefined) lines.push(hiddenNote);
 
       if (scopeConflicts.length > 0) {
-        lines.push(`## Scope conflicts (${scopeConflicts.length}) — advisory`);
-        for (const conflict of scopeConflicts) {
+        const conflictKeys = new Set<string>([
+          ...layers.mine.map((task) => task.key),
+          ...layers.needs.map((entry) => entry.task.key),
+        ]);
+        const { shown: shownConflicts, hidden: hiddenConflicts } =
+          sliceScopeConflicts(
+            scopeConflicts,
+            conflictKeys,
+            layerView === "all"
+              ? scopeConflicts.length
+              : DASHBOARD_SCOPE_CONFLICT_LINES,
+          );
+        lines.push(
+          `## Scope conflicts (${String(scopeConflicts.length)}${
+            hiddenConflicts > 0 ? `, ${String(shownConflicts.length)} shown` : ""
+          }) — advisory`,
+        );
+        for (const conflict of shownConflicts) {
           const glyph = conflict.kind === "collision" ? "⚠" : "⛔";
           const label =
             conflict.kind === "collision"
               ? `collision: ${conflict.taskKey} × ${conflict.peerKey}`
               : `overlap: ${conflict.taskKey} plans to touch what ${conflict.peerKey} already changed`;
           lines.push(`- ${glyph} ${label} — ${conflict.detail}`);
+        }
+        if (hiddenConflicts > 0) {
+          lines.push(
+            `  … +${String(hiddenConflicts)} more conflict(s) not shown — view=all lists every one`,
+          );
         }
         lines.push(
           "  (advisory: scope is self-declared, changedFiles is self-reported — resolve by messaging the owner or re-scoping, not by gate)",
@@ -2600,12 +2821,15 @@ export default function towerDoExtension(pi: ExtensionAPI): void {
       for (const finding of openFindings) {
         const location =
           finding.location === undefined ? "" : ` @${finding.location}`;
-        const fix =
-          finding.suggestedFix === undefined
-            ? ""
-            : ` fix: ${finding.suggestedFix}`;
+        // The list is a list: one truncated line per finding, the full text is
+        // one `findingId` lookup away. suggestedFix is dropped here for the
+        // same reason (a finding holds up to 4000 + 2000 characters).
+        const summary = truncateChars(
+          finding.summary.split("\n")[0] ?? "",
+          DASHBOARD_FINDING_LINE_CHARS,
+        );
         lines.push(
-          `- [${finding.id}] [${finding.severity}/${finding.kind}] ${finding.title} (${finding.from})${location} — ${finding.summary.split("\n")[0]}${fix}`,
+          `- [${finding.id}] [${finding.severity}/${finding.kind}] ${finding.title} (${finding.from})${location} — ${summary}`,
         );
       }
       if (openFindings.length === 0) lines.push("(none)");
@@ -2674,7 +2898,6 @@ export default function towerDoExtension(pi: ExtensionAPI): void {
         return text;
       }
       const lines = output.split("\n");
-      const keep = expanded ? lines.length : Math.min(lines.length, 14);
       // Caller-owned lines stand out: accent + bold vs plain toolOutput. The
       // execute side already resolved the caller; prefer it over re-deriving.
       const details = (result.details ?? {}) as Record<string, unknown>;
@@ -2682,18 +2905,21 @@ export default function towerDoExtension(pi: ExtensionAPI): void {
         typeof details.identity === "string"
           ? details.identity
           : sessionIdentity(activeCwd, pi, selfCtx);
-      let rendered = lines
-        .slice(0, keep)
+      // Fold by section, not by line: a head-cut spends the window on whichever
+      // section renders first (the completed ledger) and hides the sections
+      // that need action.
+      const visible = expanded ? lines : foldDashboardSections(lines);
+      let rendered = visible
         .map((line) =>
           !context.isError && isCallerLine(line, caller)
             ? theme.fg("accent", theme.bold(line))
             : theme.fg(context.isError ? "error" : "toolOutput", line),
         )
         .join("\n");
-      if (lines.length > keep) {
+      if (visible.length < lines.length) {
         rendered += theme.fg(
           "dim",
-          `\n… ${lines.length - keep} more (${keyHint("app.tools.expand", "expand")})`,
+          `\n… ${lines.length - visible.length} more (${keyHint("app.tools.expand", "expand")})`,
         );
       }
       text.setText(rendered);

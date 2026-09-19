@@ -1152,6 +1152,32 @@ export function findScopeConflicts(board: TowerBoardView): ScopeConflict[] {
   return conflicts;
 }
 
+/** How many `## Scope conflicts` rows the default dashboard renders. The
+ *  section grows with the completed history — every receipt that touched a file
+ *  the caller's scope names is a row — so the default view keeps the rows that
+ *  involve the caller and reports the rest as a count; `view=all` expands. */
+export const DASHBOARD_SCOPE_CONFLICT_LINES = 5;
+
+/** Order conflicts for the caller and cut them to `cap`: conflicts involving a
+ *  key in `relevantKeys` (the caller's own or coupled tasks) come first, the
+ *  rest follow; `hidden` is how many rows the cut dropped. Pure. */
+export function sliceScopeConflicts(
+  conflicts: readonly ScopeConflict[],
+  relevantKeys: ReadonlySet<string>,
+  cap: number,
+): { shown: ScopeConflict[]; hidden: number } {
+  const relevant: ScopeConflict[] = [];
+  const rest: ScopeConflict[] = [];
+  for (const conflict of conflicts) {
+    const involvesCaller =
+      relevantKeys.has(conflict.taskKey) || relevantKeys.has(conflict.peerKey);
+    (involvesCaller ? relevant : rest).push(conflict);
+  }
+  const ordered = [...relevant, ...rest];
+  const shown = cap >= ordered.length ? ordered : ordered.slice(0, cap);
+  return { shown, hidden: ordered.length - shown.length };
+}
+
 // ---------------------------------------------------------------------------
 // Persisted-state reading (board file entries) + session checkpoint replay.
 // The disk board is authoritative; the session checkpoint is a fallback.
@@ -2066,23 +2092,183 @@ export function formatPresenceLine(line: PresenceLine, now: number): string {
   return `${line.identity} — ${seen}${owned}${state}`;
 }
 
-/** Stable partition: caller's owned tasks first, everyone else after.
- *  Relative order inside each group is preserved (fold order is updatedAt).
- *  Unowned is not mine. Identity match is exact — `alice` ≠ `alice-2`.
- *  Does not mutate `tasks`. Glance counts / overflow stay board-wide; this
- *  only changes which rows win the cap. */
-export function orderTasksMineFirst(
+/** Why a peer-owned unfinished task is in the caller's attention set. */
+export type NeedsReason = "await" | "blocking" | "scope" | "unread";
+
+/** One `needs` row: a peer task plus why the caller must still look at it. */
+export interface NeedsTask {
+  task: TowerDoTask;
+  reason: NeedsReason;
+}
+
+/** A board rendered for one caller in three unfinished layers plus receipts.
+ *
+ *  `mine`  — unfinished tasks the caller owns.
+ *  `needs` — peer-owned unfinished tasks the caller is coupled to: its own
+ *            unfinished work awaits them (`await`), a message to the caller
+ *            threads under them (`unread`), or they await the caller's
+ *            unfinished work (`blocking`).
+ *  `other` — the remaining unfinished tasks.
+ *  `completed` — receipts, rendered as a compact key ledger, never as rows.
+ *
+ *  Order inside every layer is recency-first (`updatedAt` DESC, `key` ASC as
+ *  the tiebreaker — one batch write stamps several rows with one `updatedAt`),
+ *  so a cap cannot hide the newest work behind arbitrary order. Identity match
+ *  is exact (`alice` ≠ `alice-2`); unowned is not mine. Does not mutate
+ *  `tasks`. */
+export interface TaskLayers {
+  mine: TowerDoTask[];
+  needs: NeedsTask[];
+  other: TowerDoTask[];
+  completed: TowerDoTask[];
+}
+
+function byRecency(a: TowerDoTask, b: TowerDoTask): number {
+  if (a.updatedAt !== b.updatedAt) return b.updatedAt - a.updatedAt;
+  return a.key < b.key ? -1 : a.key > b.key ? 1 : 0;
+}
+
+/** Split a board into the caller's layers. Pure; callers own the rendering. */
+export function classifyTaskLayers(
   tasks: readonly TowerDoTask[],
+  view: TowerBoardView,
+  identity: string,
+): TaskLayers {
+  const mine: TowerDoTask[] = [];
+  const completed: TowerDoTask[] = [];
+  const mineKeys = new Set<string>();
+  for (const task of tasks) {
+    if (task.status === "completed") {
+      completed.push(task);
+      continue;
+    }
+    if (identity !== "" && task.owner === identity) {
+      mine.push(task);
+      mineKeys.add(task.key);
+    }
+  }
+  // Keys the caller's own unfinished work is still waiting on. `blockedBy` is
+  // free-form (a task key, a message id, a finding id); when it names a task on
+  // this board, the caller is parked on that task too.
+  const boardKeys = new Set(tasks.map((task) => task.key));
+  const awaited = new Set<string>();
+  for (const task of mine) {
+    for (const key of findAllUnresolvedDeps(task, view)) awaited.add(key);
+    for (const key of task.blockedBy) {
+      if (boardKeys.has(key)) awaited.add(key);
+    }
+  }
+  // Peer tasks a message to the caller threads under.
+  const unreadKeys = new Set<string>();
+  for (const message of unreadMessagesToMe(view, identity)) {
+    if (message.taskKey !== undefined) unreadKeys.add(message.taskKey);
+  }
+  // Declared scopes of the caller's own unfinished work. A peer planning to
+  // touch the same files is the other half of "it affects me": not a gate, but
+  // the caller must see it before editing. Only the unfinished x unfinished
+  // pair lands here — an `overlap` against a completed receipt is what the
+  // standalone `## Scope conflicts` section renders.
+  const mineScopes = mine
+    .map((task) => task.scope ?? [])
+    .filter((scope) => scope.length > 0);
+  const scopeCollides = (task: TowerDoTask): boolean => {
+    const scope = task.scope ?? [];
+    if (scope.length === 0 || mineScopes.length === 0) return false;
+    return mineScopes.some((mineScope) =>
+      scope.some((glob) =>
+        mineScope.some((mineGlob) => scopeGlobIntersects(mineGlob, glob)),
+      ),
+    );
+  };
+  const needs: NeedsTask[] = [];
+  const other: TowerDoTask[] = [];
+  for (const task of tasks) {
+    if (task.status === "completed" || mineKeys.has(task.key)) continue;
+    if (awaited.has(task.key)) {
+      needs.push({ task, reason: "await" });
+    } else if (unreadKeys.has(task.key)) {
+      needs.push({ task, reason: "unread" });
+    } else if (task.dependsOn.some((key) => mineKeys.has(key))) {
+      // `mineKeys` only holds unfinished work, so this is "it awaits me".
+      needs.push({ task, reason: "blocking" });
+    } else if (scopeCollides(task)) {
+      needs.push({ task, reason: "scope" });
+    } else {
+      other.push(task);
+    }
+  }
+  needs.sort((a, b) => byRecency(a.task, b.task));
+  return {
+    mine: mine.sort(byRecency),
+    needs,
+    other: other.sort(byRecency),
+    completed: completed.sort(byRecency),
+  };
+}
+
+/** The layered order flattened: mine, then needs, then other. Exported for
+ *  callers that want the whole board as one ranked list; the widget and the
+ *  reminder use the layers directly and fold `other` into a single line. */
+export function orderTasksByLayer(
+  tasks: readonly TowerDoTask[],
+  view: TowerBoardView,
   identity: string,
 ): TowerDoTask[] {
-  const mine: TowerDoTask[] = [];
-  const rest: TowerDoTask[] = [];
-  for (const task of tasks) {
-    if (identity !== "" && task.owner === identity) mine.push(task);
-    else rest.push(task);
-  }
-  return [...mine, ...rest];
+  const layers = classifyTaskLayers(tasks, view, identity);
+  return [
+    ...layers.mine,
+    ...layers.needs.map((entry) => entry.task),
+    ...layers.other,
+  ];
 }
+
+/** Compact folded row: `key status @owner`. A key the caller can still name is
+ *  a key a full-replacement write can keep, so a folded section renders as this
+ *  instead of disappearing. The status printed is the STORED one, not the
+ *  derived `blocked` view: this row is what a replay writes back, and echoing a
+ *  derived blocked would turn a parked reason into a stored status. */
+export function formatLedgerRow(task: TowerDoTask): string {
+  const owner = task.owner === undefined ? "" : ` @${task.owner}`;
+  return `- ${task.key} ${task.status}${owner}`;
+}
+
+/** Compact key-only ledger, `maxChars` per line. Receipts share one status, so
+ *  repeating it per key buys nothing — this is the form that keeps every key
+ *  enumerable for a full-replacement write without spending a line per task. */
+export function formatLedgerKeyRows(
+  tasks: readonly TowerDoTask[],
+  maxChars = 96,
+): string[] {
+  const rows: string[] = [];
+  let current = "";
+  for (const task of tasks) {
+    const candidate = current === "" ? task.key : `${current}, ${task.key}`;
+    // `- ` counts against the width. A single key longer than the budget still
+    // gets its own line: losing a key is worse than a long line.
+    if (current !== "" && candidate.length + 2 > maxChars) {
+      rows.push(`- ${current}`);
+      current = task.key;
+      continue;
+    }
+    current = candidate;
+  }
+  if (current !== "") rows.push(`- ${current}`);
+  return rows;
+}
+
+/** Truncate to `max` Unicode code points, appending an ellipsis when cut.
+ *  Code points, not UTF-16 units — the same metric as every other limit. */
+export function truncateChars(value: string, max: number): string {
+  const chars = [...value];
+  return chars.length <= max ? value : `${chars.slice(0, max).join("")}…`;
+}
+
+/** Longest rendered `summary` prefix for one open finding in the dashboard.
+ * A finding's `summary` is up to 4000 characters and the list is not the place
+ * to read it — the full text is one `findingId` lookup away. The surrounding
+ * title/location/from fields carry their own limits, so the rendered line is
+ * longer than this. */
+export const DASHBOARD_FINDING_LINE_CHARS = 240;
 
 /** Default `tower_do_status` dashboard budget (rows rendered per call). The
  * open-task quota is 50, so this can only ever bind on a long completed
@@ -2095,8 +2281,8 @@ export const DASHBOARD_ROW_BUDGET = 200;
  * Default budget = open (non-completed) rows win it: a completed history
  * longer than the budget must never hide unfinished work, and boards now
  * outgrow the budget (the row cap became an open budget — see DECISIONS.md
- * "open-task budget"). Stable partition, so every status group keeps fold
- * order. Does not mutate `tasks`. */
+ * "open-task budget"). Stable partition, so the slice keeps fold order; the
+ * render order inside a layer is recency-first. Does not mutate `tasks`. */
 export function sliceTaskDashboard(
   tasks: readonly TowerDoTask[],
   limit: number | undefined,
@@ -2130,25 +2316,218 @@ export function formatDashboardHiddenNote(
   );
 }
 
-/** Compact status-line rendering of the whole board for reminders. */
+/** Section priority for the folded dashboard: the caller's own work first, then
+ * the sections that need action, then backlog and history. Titles match by
+ * prefix, so a count suffix (`## Mine (3)`) ranks the same as the bare title. */
+const DASHBOARD_SECTION_RANK: readonly string[] = [
+  "## Mine",
+  "## Needs you",
+  "## Open findings",
+  "## Messages for",
+  "## Scope conflicts",
+  "## Others",
+  "## Completed",
+  "## Recent activity",
+];
+
+const DASHBOARD_MUST_SEE_SECTIONS = 4;
+
+function dashboardSectionRank(title: string): number {
+  const index = DASHBOARD_SECTION_RANK.findIndex((prefix) =>
+    title.startsWith(prefix),
+  );
+  return index === -1 ? DASHBOARD_SECTION_RANK.length : index;
+}
+
+/** Fold a rendered dashboard to `budget` lines **by section**, keeping the
+ * original line order. A head-cut spends the window on whichever section
+ * renders first; this spends it where it matters.
+ *
+ *  - Every must-see section (rank < `DASHBOARD_MUST_SEE_SECTIONS`) keeps its
+ *    heading plus one content line before the rest is spent in priority order,
+ *    so a long `## Mine` cannot reduce `## Needs you` / findings / messages to
+ *    bare headings — while the budget affords it; a head cropped to an
+ *    explicit tiny budget may erase sections entirely (pinned by the
+ *    `budget < head` case).
+ *  - Budget cut notes and `(no tasks match the filter)` are always kept: they
+ *    are disclosures, not section content.
+ *
+ * Pure; the caller reports the cut (`lines.length - result.length`). */
+export function foldDashboardSections(
+  lines: readonly string[],
+  budget = 16,
+): string[] {
+  const head: string[] = [];
+  const notes: string[] = [];
+  const sections: { rank: number; rows: string[] }[] = [];
+  for (const line of lines) {
+    if (line.startsWith("## ")) {
+      sections.push({ rank: dashboardSectionRank(line), rows: [line] });
+    } else if (sections.length === 0) {
+      head.push(line);
+    } else if (
+      line === "(no tasks match the filter)" ||
+      // A section-internal disclosure is indented (`## Scope conflicts` cuts
+      // with `  … +N more …`), so match past the indent: a cut notice is a
+      // disclosure, not section content the budget may drop.
+      line.trimStart().startsWith("… ")
+    ) {
+      notes.push(line);
+    } else {
+      sections[sections.length - 1].rows.push(line);
+    }
+  }
+  if (sections.length === 0) {
+    // No headings at all (the taskKey / findingId detail reads): fall back to
+    // a plain cut so those outputs stay bounded too.
+    return head.slice(0, budget);
+  }
+  // The head is the board header plus its counts; it is bounded by
+  // construction, but an explicit small budget still has to hold, so crop it
+  // before the sections rather than returning more lines than `budget`.
+  const headBudget = Math.max(0, budget - notes.length);
+  const keptHead = head.length <= headBudget ? head : head.slice(0, headBudget);
+  let remaining = Math.max(0, budget - keptHead.length - notes.length);
+  const counts = sections.map(() => 0);
+  const ranked = sections
+    .map((section, index) => ({ index, rank: section.rank }))
+    .sort((a, b) => a.rank - b.rank);
+  // Pass 1: headings for every must-see section. A long header or a disclosure
+  // note must not erase the section that carries the action items.
+  for (const { index, rank } of ranked) {
+    if (remaining <= 0) break;
+    if (rank >= DASHBOARD_MUST_SEE_SECTIONS) continue;
+    counts[index] = 1;
+    remaining -= 1;
+  }
+  // Pass 2: one content line for each of those sections.
+  for (const { index, rank } of ranked) {
+    if (remaining <= 0) break;
+    if (rank >= DASHBOARD_MUST_SEE_SECTIONS) continue;
+    if (sections[index].rows.length <= counts[index]) continue;
+    counts[index] += 1;
+    remaining -= 1;
+  }
+  // Pass 3: spend what is left in priority order.
+  for (const { index } of ranked) {
+    if (remaining <= 0) break;
+    const room = sections[index].rows.length - counts[index];
+    if (room <= 0) continue;
+    const take = Math.min(room, remaining);
+    counts[index] += take;
+    remaining -= take;
+  }
+  const kept = [...keptHead];
+  for (const [index, section] of sections.entries()) {
+    for (let row = 0; row < counts[index]; row += 1) {
+      kept.push(section.rows[row]);
+    }
+  }
+  kept.push(...notes);
+  return kept;
+}
+
+/** One line listing unrelated unfinished keys: `+3 other task(s): a, b, c`.
+ *  The keys stay enumerable — a full-replacement write replays keys, not rows —
+ *  while the layer itself stops spending the caller's attention window. */
+export function formatOtherKeysLine(
+  keys: readonly string[],
+  maxChars = 160,
+): string {
+  return formatKeyListLine(
+    `+${String(keys.length)} other task(s): `,
+    keys,
+    maxChars,
+  );
+}
+
+/** `lead` followed by as many keys as fit in `maxChars`; a tail names the rest.
+ *  The keys stay enumerable — a full-replacement write replays keys, not rows —
+ *  while the layer (or an overflowed attention window) stops spending the
+ *  caller's rows. */
+export function formatKeyListLine(
+  lead: string,
+  keys: readonly string[],
+  maxChars = 160,
+): string {
+  let line = lead;
+  let taken = 0;
+  for (const key of keys) {
+    const candidate = taken === 0 ? `${line}${key}` : `${line}, ${key}`;
+    if (taken > 0 && candidate.length > maxChars) break;
+    line = candidate;
+    taken += 1;
+  }
+  const rest = keys.length - taken;
+  return rest > 0
+    ? `${line} … (+${String(rest)} more, see tower_do_status)`
+    : line;
+}
+
+/** One-line shape summary of a folded layer, e.g.
+ *  `2 owner(s) · 1 in_progress · 1 blocked` — the layer still reports what the
+ *  board holds; only its rows are gone. */
+export function formatLayerSummary(
+  tasks: readonly TowerDoTask[],
+  view: TowerBoardView,
+): string {
+  const owners = new Set(
+    tasks
+      .map((task) => task.owner)
+      .filter((owner): owner is string => owner !== undefined),
+  );
+  const counts = new Map<TowerDoStatus, number>();
+  let blocked = 0;
+  for (const task of tasks) {
+    counts.set(task.status, (counts.get(task.status) ?? 0) + 1);
+    if (taskIsBlocked(task, view)) blocked += 1;
+  }
+  const parts = [
+    owners.size > 0 ? `${String(owners.size)} owner(s)` : "unowned",
+  ];
+  for (const status of ["in_progress", "pending"] as const) {
+    const count = counts.get(status) ?? 0;
+    if (count > 0) parts.push(`${String(count)} ${status}`);
+  }
+  if (blocked > 0) parts.push(`${String(blocked)} blocked`);
+  return parts.join(" · ");
+}
+
+/** Compact status-line rendering of the whole board for reminders. Rows are
+ *  layered (mine → needs) and recency-first, so the cap shows the work the
+ *  caller is in and the peer work it is coupled to; the unrelated layer folds
+ *  to one key line. Counts stay board-wide. */
 export function formatBoardReminder(
   view: TowerBoardView,
   identity: string,
 ): string {
   const tasks = getAllTasks(view);
-  const unfinished = tasks.filter((task) => task.status !== "completed");
-  const completed = tasks.length - unfinished.length;
-  const blocked = tasks.filter((task) => taskIsBlocked(task, view));
-  const unread = unreadMessagesToMe(view, identity).length;
-  // The agent reading this snapshot must know which owner suffix is itself,
-  // or owner matching / (me) markers are guesswork.
-  const lines = [
-    `TowerDo shared board — you are ${identity} (revision ${view.revision}; ${tasks.length} task(s)${completed > 0 ? `, ${completed} completed hidden` : ""}, ${blocked.length} blocked, ${unread} unread message(s) for you).`,
+  const layers = classifyTaskLayers(tasks, view, identity);
+  const completed = layers.completed.length;
+  const unfinished = [
+    ...layers.mine,
+    ...layers.needs.map((entry) => entry.task),
+    ...layers.other,
   ];
-  const shown = orderTasksMineFirst(unfinished, identity).slice(
-    0,
-    REMINDER_TASK_LINE_CAP,
+  // Rows the caller must actually read: its own work plus the peer work it is
+  // coupled to. Unrelated unfinished tasks keep their counts and their keys
+  // (a full-replacement write replays keys, not rows) but not their rows.
+  const attention = [
+    ...layers.mine,
+    ...layers.needs.map((entry) => entry.task),
+  ];
+  const blocked = unfinished.filter((task) => taskIsBlocked(task, view));
+  const unread = unreadMessagesToMe(view, identity).length;
+  const needsReason = new Map(
+    layers.needs.map((entry) => [entry.task.key, entry.reason]),
   );
+  // The agent reading this snapshot must know which owner suffix is itself,
+  // or owner matching / (me) markers are guesswork. Counts stay board-wide so
+  // a folded layer is still measurable; only its rows are gone.
+  const lines = [
+    `TowerDo shared board — you are ${identity} (revision ${view.revision}; ${tasks.length} task(s), ${layers.mine.length} mine, ${layers.needs.length} need you, ${layers.other.length} other${completed > 0 ? `, ${completed} completed hidden` : ""}, ${blocked.length} blocked, ${unread} unread message(s) for you).`,
+  ];
+  const shown = attention.slice(0, REMINDER_TASK_LINE_CAP);
   for (const task of shown) {
     const owner =
       task.owner === undefined
@@ -2170,14 +2549,28 @@ export function formatBoardReminder(
     // (the suffix still carries the WHY). Otherwise the header says
     // "1 blocked" while the row reads [pending].
     const label = taskIsBlocked(task, view) ? "blocked" : task.status;
+    // A peer row wins the window because the caller is coupled to it; say why,
+    // or it reads as unrelated backlog the caller may skip.
+    const reason = needsReason.get(task.key);
+    const needsTag = reason === undefined ? "" : ` [needs you: ${reason}]`;
     lines.push(
-      `- [${label}] ${task.key}: ${task.subject}${owner}${deps}${blockedBy}`,
+      `- [${label}] ${task.key}: ${task.subject}${owner}${deps}${blockedBy}${needsTag}`,
     );
   }
-  if (unfinished.length > shown.length) {
+  if (attention.length > shown.length) {
+    // The overflow mixes the caller's own rows with the coupled peer rows, so
+    // the count must not claim them all as "yours" — and naming the keys keeps
+    // them enumerable for a full-replacement write.
+    const overflow = attention.slice(shown.length).map((task) => task.key);
     lines.push(
-      `… and ${unfinished.length - shown.length} more unfinished task(s)`,
+      formatKeyListLine(
+        `… and ${String(overflow.length)} more task(s) you need to see: `,
+        overflow,
+      ),
     );
+  }
+  if (layers.other.length > 0) {
+    lines.push(formatOtherKeysLine(layers.other.map((task) => task.key)));
   }
   lines.push(
     "Before your final response, reconcile actual progress with this shared board. " +
