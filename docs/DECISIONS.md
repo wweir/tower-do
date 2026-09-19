@@ -193,8 +193,7 @@ letting them drift); CONTRACTS.md *capacity* is the authority for both.
 previously capped at 50 rows, so `tower_do_status`'s 200-row dashboard slice
 could never bind. It can now, so the slice became a rule instead of an
 accident: under the default budget open rows win it (stable partition, groups
-keep fold order — the same "unfinished work wins the glance" principle as
-mine-first), an explicit `limit` still means fold order verbatim, and any
+keep fold order), an explicit `limit` still means fold order verbatim, and any
 hidden rows are reported (`… +N more row(s) hidden by the budget`, with the
 remedies: a larger `limit`, or `owner=`/`status=` narrowing). Without that, a
 long completed history would silently hide the one open row the caller needed
@@ -205,7 +204,8 @@ the rows it keeps — so the practical ceiling is what a caller can *read*, and
 the dashboard binds long before the log does: 200 rows, plus the host's caps —
 50KB **and** 2000 lines — whose **tail-kept cut removes the head** (header,
 revision, board file path, and the open rows, which render first). The line cap
-is reachable on its own once a caller raises `limit` past it with tiny rows.
+is structural rather than routinely reachable now that completed rows pack
+several keys per line — the byte cap binds first — but it stays enforced.
 The cut is therefore disclosed in a footer that repeats the revision and the
 board path (its bytes and its one line are reserved out of both caps), and
 paged reads of `board.jsonl` stay the complete path. The `board-prune` entry's
@@ -264,29 +264,62 @@ session after the first compact). Resetting the forced-checkpoint counter
 to 0 (the checkpoint's own snapshot is stripped before the LLM sees it, so
 its board context would never arrive).
 
-## 2026-09 — glance rows are mine-first, counts stay board-wide
+## 2026-09 — dashboard layers unfinished work; completed folds to a key ledger
 
-**Context.** Widget (cap 3) and reminder (cap 12) listed unfinished tasks in
-fold order (`updatedAt` ascending). On a busy board the caller's own work
-fell into `… +N more` behind older peer or unowned rows. A mine-only filter
-or a shortcut toggle would hide the room the glance is supposed to show.
+**Context.** A long-lived board carried 38 completed rows from ten departed
+sessions while the caller's own work was one row. `tower_do_status` rendered
+every completed receipt in full (measured: 211 bytes/row — subject, scope,
+changedFiles) and every open finding as an untruncated single line (one
+measured 2000+ characters), while the TUI result folded the FIRST 14 lines. The
+reader therefore saw other sessions' history and the top of the board, and the
+sections that need action (messages, findings) fell past the fold. The text
+layer keeps the TAIL over 50KB; the TUI kept the head — the two cuts pointed
+opposite ways.
 
-**Decision.** Partition display lists so `owner === identity` rows come first,
-preserving relative order inside each group (`orderTasksMineFirst` in
-`state.ts`). Identity match is exact (`alice` ≠ `alice-2`); unowned is not
-mine. Header `N open`, blocked/unread counts, and overflow `+N more` stay
-board-wide — only which rows win the cap changes. Widget and reminder apply
-this *before* their caps. `tower_do_status` applies it *inside* each status
-group after the dashboard slice, and the slice itself is open-first now that a
-board can outgrow it — see the open-task budget entry for what it hides and how
-that is reported. An explicit small `limit` still truncates by fold
-order, same as before; mine-first does not steal that budget. `owner=` on
-status still filters; this is not a second filter.
+**Decision.** Render unfinished rows in three layers and receipts as a ledger.
 
-**Rejected.** Default or togglable mine-only on the widget (a shared board
-that hides peers is not a shared board; status already has `owner=`); ranking
-by session UUID instead of identity (owner is identity, same as `live N`);
-putting unowned backlog in the mine group (anyone may claim it).
+- `mine` (the caller's unfinished work), `needs` (peer work the caller is
+  coupled to: its own unfinished work awaits it, a message to the caller
+  threads under it, or it awaits the caller's unfinished work), `other`.
+- Order inside every layer is recency-first (`updatedAt` DESC, `key` ASC). Fold
+  order hid the newest work behind the oldest as soon as a cap applied.
+- Completed rows render as a compact key ledger (several keys per line), so the
+  first screen is not spent on other sessions' receipts; subject / scope /
+  changedFiles are one `taskKey` lookup away. The ledger prints the STORED
+  status — it is the value a replay writes back, and echoing the derived
+  `blocked` view would turn a parked reason into a stored status. The dashboard
+  budget and the host byte/line caps still bound the ledger exactly as they
+  bounded rows before — a key outside the budget was already unenumerable, and
+  that cut was already disclosed.
+- Findings render as one truncated line (`DASHBOARD_FINDING_LINE_CHARS`); the
+  full text moves behind a new `findingId` read. `suggestedFix` leaves the
+  list.
+- The default `view` is `layers`: the caller's own unfinished rows and the
+  peer rows it is coupled to render in full; every other unfinished row folds
+  into a one-line shape summary plus a `key status @owner` ledger. `view=all`
+  expands that layer, `mine` narrows to the caller's own rows, and `needs`
+  stays an alias for `layers`; an excluded layer folds into the same ledger, it
+  never disappears.
+- The `needs` layer also covers a declared `scope` intersecting the caller's
+  own unfinished scope: a peer about to edit the same files affects the caller,
+  so it is shown rather than folded. The reminder and the widget follow the
+  same split — their rows carry the caller's own work and the coupled peer
+  work, and the unrelated layer folds to one key line (`formatOtherKeysLine`)
+  or a count, never to nothing.
+- The TUI result folds **by section** (mine / needs / findings / messages
+  first) instead of by line count.
+- The widget's git segment renames `mine N` to `files N`: the segment shares
+  its line with the board's task counts, and "mine" already names the caller's
+  task layer one field earlier.
+
+**Rejected.** Dropping peer rows from the default view (a full-replacement
+write must enumerate every key, or `tower_do` fails and unowned work is
+silently dropped); the earlier mine-first ordering as the whole answer (it
+reorders rows within a cap but still spends the window on other sessions'
+receipts, and it has no `needs` layer, so a caller blocked on a peer sees only
+a key); counting keys as rows so the 200-row dashboard budget could bound the
+ledger (that budget bounds rows and the ledger is deliberately fewer rows than
+keys — `view=all` plus the byte-cap disclosure stay the honest bound).
 
 ## 2026-09 — 0.3.x backlog cull: prune / keybinds / scope-split / gif
 

@@ -105,13 +105,18 @@ budget therefore has to leave room for a replay:
   (`… +N more row(s) hidden by the budget`) — widen with `limit`, or narrow with
   `owner=`/`status=`. A task that "disappeared" from a long board is a
   filter/limit question, not data loss: the fold is the board.
+- Unrelated unfinished work is folded, not dropped: the default `view` shows
+  your own rows plus the peer work you are coupled to, and folds the rest into
+  one stats line + a `key status @owner` ledger. `view=all` expands it, and
+  every key stays in the output either way — a `tower_do` write must be able to
+  name the rows it is not deleting.
 - A very large dashboard is also cut at the host caps (50KB and 2000 lines,
   tail kept), and the cut takes the HEAD (header, revision, board file path,
   open rows). The footer says so and repeats the revision + board file path
   (its own bytes and line are reserved, so it survives the cut); page that file
-  when you need every row for a full-replacement write. Raising `limit` past
-  2000 with small rows is what makes the line cap bind: it is a real bound,
-  not just the byte cap's shadow.
+  when you need every row for a full-replacement write. With completed rows
+  folded into a multi-key ledger the byte cap is what normally binds; the
+  2000-line bound stays enforced.
 
 When the open budget is full (`open 50/50`):
 

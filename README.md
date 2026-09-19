@@ -9,7 +9,7 @@
 
 [中文版说明 / Chinese README](./README.zh-CN.md)
 
-![tower-do above-editor widget: board progress (`TowerDo 6 open · 1 blocked`), live session count, `mine/dirty` file segments, and annotated unfinished-task rows](https://raw.githubusercontent.com/wweir/tower-do/main/docs/pi-tower-do.png)
+![tower-do above-editor widget: board progress (`TowerDo 6 open · 1 blocked`), live session count, `files/dirty` file segments, and annotated unfinished-task rows](https://raw.githubusercontent.com/wweir/tower-do/main/docs/pi-tower-do.png)
 
 ## What it does
 
@@ -38,7 +38,8 @@ work — and the manners to talk about it.
 - **A widget that explains the room.** The above-editor line shows remaining
   work (`TowerDo 2 open · 1 blocked`), how many sessions are live, which dirty
   files are yours vs. the worktree's, and the unfinished tasks with owners
-  (yours first; the open count is still the whole board).
+  (layered mine → needs you → others, recency-first; the open count is still
+  the whole board).
 
 Three tools:
 
@@ -46,7 +47,7 @@ Three tools:
 | --- | --- |
 | `tower_do` | One-shot atomic board update: plan / claim (`owner` + `in_progress`) / complete (`changedFiles` receipt) / block (`blocked` + `blockedBy`). `baseRevision` protects against clobbering |
 | `tower_do_talk` | Cross-agent messaging: `send` (owner / recent-activity identity / `all`; self-send rejected), `inbox`, `finding` (structured out-of-scope report / status update) |
-| `tower_do_status` | Shared dashboard: everyone's in-progress work (owner / deps / scope / changedFiles / block reasons), **scope conflicts**, messages, open findings, activity + presence; `taskKey` returns one task's full detail |
+| `tower_do_status` | Shared dashboard: your own unfinished work first, then the peer work you are coupled to (deps / unread mail / intersecting declared scope); everything else folds into a stats line + a `key status @owner` ledger, completed rows into a key ledger. `view=all` expands, `view=mine` narrows; `taskKey` / `findingId` return one record's full detail |
 
 ## Install
 

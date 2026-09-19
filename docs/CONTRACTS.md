@@ -36,11 +36,21 @@ who wants to keep an existing task must replay it (usually unchanged).
   live in the batch, completed rows included.
 - **Status rendering**: the dashboard is bounded (`DASHBOARD_ROW_BUDGET` = 200
   rows). Under the default budget, open rows win the slice (stable partition,
-  so every status group keeps fold order) — a completed history longer than
+  so the slice keeps fold order; the render order inside a layer is
+  recency-first — see DECISIONS.md "dashboard layers") — a completed history longer than
   the budget can never hide unfinished work; an explicit `limit` is honoured in
   fold order verbatim and may be raised past the default to widen. Whenever
   rows are hidden, the output names the count and the remedies (`limit`,
   `owner=`/`status=` narrowing).
+- **The default view folds unrelated work, and never drops a key**: the default
+  `view` (`layers`) renders the caller's own unfinished rows and the peer rows
+  it is coupled to in full, and folds every other unfinished row into a one-line
+  shape summary plus a `key status @owner` ledger. `all` expands everything,
+  `mine` narrows to the caller's own rows. Within the default row budget no
+  mode may hide a key: `tower_do` is a full replacement, so a caller must be
+  able to name every row it is not deleting. An explicit small `limit` cuts the
+  folded ledger like any other row and discloses the count, exactly as it does
+  for open rows (see DECISIONS.md "dashboard layers").
 - **Byte and line caps**: the rendered text is additionally bounded by the host
   caps (50KB, 2000 lines, **tail kept**), so a cut removes the *head* — the
   header, the revision, the board file path, and the open rows that render
@@ -48,8 +58,11 @@ who wants to keep an existing task must replay it (usually unchanged).
   survived and repeats the revision and board file path, so the caller can
   re-read the fold instead of replaying a silently incomplete board. The
   footer's bytes *and* its single line are reserved out of those bounds, so the
-  disclosure can never be what breaks them (the line cap is reachable on its
-  own once a caller raises `limit` past it with tiny rows).
+  disclosure can never be what breaks them (with completed rows rendered as a
+  multi-key ledger, the byte cap is what binds in practice; the 2000-line bound
+  stays enforced and is asserted as a bound, and test/smoke.ts drives a board
+  whose ledger alone exceeds the byte cap to check the disclosure and both
+  budgets).
 - **List caps count the normalized list, not the raw input**: `dependsOn`,
   `scope`, `changedFiles` and `blockedBy` are trimmed, blank-filtered and
   deduped before the cap is applied, so 101 `changedFiles` entries with one
@@ -104,7 +117,11 @@ who wants to keep an existing task must replay it (usually unchanged).
 - **collision**: two in-progress tasks with intersecting `scope` globs.
 
 Both are **advisory** — rendered by `tower_do_status` under a "Scope conflicts"
-section, never a gate. Resolution is messaging the owner (`tower_do_talk`) or
+section, never a gate. The section grows with the completed history, so the
+**default view** keeps the conflicts that involve the caller's own or coupled
+tasks first and cuts the section to `DASHBOARD_SCOPE_CONFLICT_LINES` (5) rows,
+reporting the rest as a count; `view=all` lists every one. The count is never
+hidden. Resolution is messaging the owner (`tower_do_talk`) or
 re-scoping, not an automated block. Glob matching supports `*`, `**`, `?` and
 exact paths; intersection is conservative (flags obvious collisions only).
 
@@ -284,7 +301,7 @@ bun run test/git-count.ts           # widget git-segment pure derivations (31 ca
 bun run test/live-sessions.ts       # widget live-segment liveness window + sidecar-record parsing (30 cases)
 bun run test/board-progress.ts      # widget board-progress remaining-work glance (8 cases)
 bun run test/task-cap.ts            # open-task budget + fabricated-receipt bound (19 cases)
-bun run test/mine-first.ts          # glance/reminder mine-first order + dashboard budget slice/note (23 cases)
+bun run test/view-layers.ts         # layered unfinished view (mine/needs/others) + key ledger + recency order + reminder + folded TUI sections + dashboard budget slice/note (74 cases)
 bun run test/limits.ts              # arg schema vs fold: derived bounds, transport guard, key-bearing errors, list-cap ordering, code-point metric (60 cases)
 bun run test/identity-scope.ts      # session scoping: a nested in-process session never re-labels its parent (reminder + status identity), bucket siblings stay distinct (6 cases)
 bun run test/identity-label.ts       # identity labels: bucket siblings stay distinct; permission exact, delivery aliased, legacy rows adoptable via the idle window (39 cases)

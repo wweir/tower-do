@@ -82,6 +82,13 @@ a board file get neither a live segment nor sidecar writes.
 Several board views are **pure read derivations** over the folded view / raw
 activity tail — they never mutate the file, and callers cannot "write" them:
 
+- **View layers** (`classifyTaskLayers`): unfinished tasks split for one
+  caller into `mine` / `needs` (the caller's own work awaits it, unread mail
+  threads under it, it awaits the caller's unfinished work, or its declared
+  scope intersects the caller's own unfinished scope) / `other`, plus
+  `completed` receipts; order inside every layer is `updatedAt` DESC, `key`
+  ASC. Feeds the widget rows, the reminder and the `tower_do_status`
+  dashboard. Pure — the folded view is untouched.
 - **Presence** (`Who is around`): per-identity last-seen from parsed activity
   lines; three states — active / `⚠ idle` (>10 min quiet) / (not started).
   Real idle owners of unfinished tasks are footnoted on `tower_do` receipts.

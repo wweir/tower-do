@@ -17,7 +17,12 @@ in progress* plus task-bound communication state, without any central server.
 - **Cross-agent messaging**: addressed mail between owners + structured
   out-of-scope findings for a coordinator to route.
 - **Global status dashboard**: who owns what, blocks, unread messages, open
-  findings, activity, presence.
+  findings, activity, presence. The default view is caller-centred — your own
+  unfinished work first, then the peer work you are coupled to (a dependency,
+  unread mail, or an intersecting declared scope); everything else folds into a
+  one-line shape summary plus a compact key ledger. `view=all` expands the
+  folded layer and `view=mine` narrows to your own rows; completed rows are
+  always a compact key ledger.
 - **Conflict awareness**: `changedFiles` delivery receipts on completed tasks
   and derived `scope` conflict advisories (overlap / collision) so parallel
   workers see boundary collisions before they write.
@@ -47,15 +52,16 @@ TowerDo is its state/communication substrate.
   appear/disappear within a second or two; crashed sessions expire after a
   2-minute silence window; counted by identity, so one configured identity
   running three sessions reads `live 1`; hidden in directories without a
-  board) and the git segment (`mine M · dirty N`):
+  board) and the git segment (`files M · dirty N`):
   worktree dirty file count vs files whose content this session actually
   changed (pre-dirty files count only if edited again; edits committed between
   refreshes are counted too, while a mid-session pull re-anchors attribution
-  instead of counting pulled files; later commits can leave `mine N · dirty 0`).
+  instead of counting pulled files; later commits can leave `files N · dirty 0`).
   Same unit, two labeled viewpoints; the git segment hides when both counts
   are 0 or the directory is not git; on an empty board the live segment alone
-  still shows. Unfinished-task rows (capped) list the caller's owned tasks
-  first; open/blocked/unread counts and the overflow note stay board-wide.
+  still shows. Unfinished-task rows (capped) are layered mine → needs you →
+  others, recency-first; open/blocked/unread counts stay board-wide, and the
+  overflow note names the attention rows that did not fit.
 
 ## Identity
 

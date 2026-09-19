@@ -9,7 +9,7 @@
 
 [English README](./README.md)
 
-![tower-do 编辑器上方 widget：剩余工作进度（`TowerDo 6 open · 1 blocked`）、活跃 session 数、`mine/dirty` 文件段、带标注的未完成任务行](https://raw.githubusercontent.com/wweir/tower-do/main/docs/pi-tower-do.png)
+![tower-do 编辑器上方 widget：剩余工作进度（`TowerDo 6 open · 1 blocked`）、活跃 session 数、`files/dirty` 文件段、带标注的未完成任务行](https://raw.githubusercontent.com/wweir/tower-do/main/docs/pi-tower-do.png)
 
 ## 解决什么问题
 
@@ -20,7 +20,7 @@
 - **在工作现场沟通。** 给任务 owner 发定向消息（或广播全员），外加结构化 finding（bug / improve / vuln / idea）上报越界发现——路由到对的 agent，而不是淹没在聊天里。
 - **冲突感知。** 仪表盘会提示：你任务的 scope 范围命中了同伴刚改过的文件，或两个进行中任务的 scope 相交——只是建议性告警，靠消息协调，不做拦截门禁。
 - **谁在场。** 在场状态显示哪些 session 活跃、哪些空闲、哪些还挂着未完成任务却没了动静——协调者知道该 ping 谁，而不是盲 目重派。
-- **一个说明现状的 widget。** 编辑器上方一行展示剩余工作（`TowerDo 2 open · 1 blocked`）、活跃 session 数、脏文件里哪些是你改的，以及带 owner 的未完成任务（你的排在前面；open 计数仍是全板）。
+- **一个说明现状的 widget。** 编辑器上方一行展示剩余工作（`TowerDo 2 open · 1 blocked`）、活跃 session 数、脏文件里哪些是你改的（`files N · dirty N`），以及带 owner 的未完成任务（分层：mine → needs you → others，recency-first；open 计数仍是全板）。
 
 三个工具：
 
@@ -28,7 +28,7 @@
 | --- | --- |
 | `tower_do` | 一次性原子更新看板：计划 / 认领（`owner` + `in_progress`）/ 完成（带 `changedFiles` 回执）/ 阻塞（`blocked` + `blockedBy`）。`baseRevision` 防覆盖 |
 | `tower_do_talk` | 跨 agent 消息：`send`（owner / 近期有活动的 identity / `all`；禁止自发）/ `inbox` / `finding`（结构化越界上报） |
-| `tower_do_status` | 共享仪表盘：所有人的进行中工作（owner / deps / scope / changedFiles / 阻塞原因）、**scope 冲突**、消息、open findings、活动与在场状态；`taskKey` 返回单任务全字段详情 |
+| `tower_do_status` | 共享仪表盘：先自己的未完成工作，再与本 session 相关的 peer 工作（依赖 / 未读邮件 / scope 相交）；其余折叠成一行统计 + `key status @owner` 账目，completed 仅列 key 账目。`view=all` 展开，`view=mine` 收窄；`taskKey` / `findingId` 返回单条全字段详情 |
 
 ## 安装
 
