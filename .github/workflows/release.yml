@@ -47,7 +47,7 @@ jobs:
           bun run test/live-sessions.ts
           bun run test/board-progress.ts
           bun run test/task-cap.ts
-          bun run test/mine-first.ts
+          bun run test/view-layers.ts
           bun run test/limits.ts
           bun run test/identity-scope.ts
           bun run test/identity-label.ts
