@@ -253,6 +253,7 @@ async function layer1(): Promise<void> {
           key: "wait",
           subject: "waiting on review",
           status: "in_progress",
+          owner: "alice",
           blockedBy: ["msg-1"],
         },
       ],
@@ -269,7 +270,8 @@ async function layer1(): Promise<void> {
   const reminderWaiting = formatBoardReminder(stillWaiting.view, "alice");
   check(
     "reminder labels blockedBy task [blocked], header agrees",
-    reminderWaiting.includes("1 task(s), 1 blocked") &&
+    reminderWaiting.includes("1 task(s), 1 mine, 0 need you, 0 other") &&
+      reminderWaiting.includes("1 blocked") &&
       reminderWaiting.includes("- [blocked] wait:"),
     reminderWaiting.split("\n")[1],
   );
@@ -277,11 +279,17 @@ async function layer1(): Promise<void> {
     createEmptyBoard(),
     {
       tasks: [
-        { key: "auth", subject: "refactor auth", status: "in_progress" },
+        {
+          key: "auth",
+          subject: "refactor auth",
+          status: "in_progress",
+          owner: "alice",
+        },
         {
           key: "billing",
           subject: "wire billing",
           status: "pending",
+          owner: "alice",
           dependsOn: ["auth"],
         },
       ],
@@ -574,6 +582,11 @@ async function layer2(): Promise<void> {
     s0.text.includes("smoke-session") && s0.text.includes("board.jsonl"),
     s0.text.slice(0, 80),
   );
+  check(
+    "an empty presence section collapses to one line",
+    s0.text.includes("## Who is around: nobody active"),
+    s0.text.split("\n").slice(5, 7).join(" / "),
+  );
 
   // alice claims auth; bob's dependent billing starts pending (waits on auth).
   const plan = await run("tower_do", {
@@ -617,27 +630,38 @@ async function layer2(): Promise<void> {
     s1.text.split("\n")[4],
   );
   check(
-    "status groups derived-blocked task under Blocked with why",
-    s1.text.includes("## Blocked") &&
-      /Blocked[\s\S]*?billing[\s\S]*?\[blocked by: auth\]/.test(s1.text) &&
-      !/## Pending[\s\S]*billing/.test(s1.text),
-    "billing in Blocked, absent from Pending",
+    "the default view folds other sessions' rows into stats plus a key ledger",
+    /## Others \(2 · 2 owner\(s\) · 1 in_progress · 1 pending · 1 blocked, ledger\)/.test(
+      s1.text,
+    ) &&
+      s1.text.includes("- billing pending @bob") &&
+      !s1.text.includes("- ✗ billing:"),
+    s1.text.split("\n").slice(4, 9).join(" / "),
+  );
+  const sAll = await run("tower_do_status", { view: "all" } as never);
+  check(
+    "view=all renders every unfinished row with its why",
+    /## Others \(2\)[\s\S]*?- ✗ billing:[\s\S]*?\[blocked by: auth\]/.test(
+      sAll.text,
+    ) && !/## Others[\s\S]*?- ○ billing:/.test(sAll.text),
+    "billing renders blocked in Others",
   );
 
   // The status filter follows the same derived contract as the rendering:
   // status:"blocked" finds gated pending tasks, status:"pending" does not.
   const asBlocked = await run("tower_do_status", {
     status: "blocked",
+    view: "all",
   } as never);
   check(
     "status filter blocked finds gated pending task",
-    /## Blocked[\s\S]*?billing[\s\S]*?\[blocked by: auth\]/.test(
+    /## Others \(1\)[\s\S]*?- ✗ billing:[\s\S]*?\[blocked by: auth\]/.test(
       asBlocked.text,
     ) &&
       /Tasks: 2 total \(1 in_progress, 1 blocked, 0 pending, 0 completed\)/.test(
         asBlocked.text,
       ),
-    "billing listed under Blocked",
+    "billing listed as blocked",
   );
   const asPending = await run("tower_do_status", {
     status: "pending",
@@ -648,8 +672,39 @@ async function layer2(): Promise<void> {
     "pending filter empty",
   );
 
+  // The default folds unrelated unfinished work into a compact ledger instead
+  // of dropping it (every key a full-replacement write must name stays
+  // readable), `view=mine` narrows further, and `view=all` expands. The ledger
+  // prints the STORED status —
+  // `billing` is stored `pending` and only derived-blocked — because that is
+  // the value a replay writes back.
+  const narrowMine = await run("tower_do_status", { view: "mine" } as never);
+  check(
+    "view=mine renders the other layers as a ledger",
+    narrowMine.text.includes("ledger)") &&
+      narrowMine.text.includes("- auth in_progress @alice") &&
+      narrowMine.text.includes("- billing pending @bob") &&
+      !narrowMine.text.includes("- ✗ billing:"),
+    narrowMine.text.split("\n").slice(8, 12).join(" / "),
+  );
+  const narrowNeeds = await run("tower_do_status", { view: "needs" } as never);
+  check(
+    "view=needs is an alias for the folded default",
+    narrowNeeds.text.includes("- auth in_progress @alice") &&
+      !narrowNeeds.text.includes("- ✗ billing:"),
+    narrowNeeds.text.split("\n").slice(8, 12).join(" / "),
+  );
+  const othersSection =
+    (s1.text.split("## Others")[1] ?? "").split("\n## ")[0] ?? "";
+  check(
+    "the folded default keeps every open key enumerable",
+    /^- auth in_progress @alice$/m.test(othersSection) &&
+      /^- billing pending @bob$/m.test(othersSection),
+    othersSection.split("\n").slice(0, 3).join(" / ") || "(missing)",
+  );
+
   // The explicit-limit branch of the hidden-rows note (the default-budget
-  // branch is unit-tested in test/mine-first.ts): the dashboard must SAY what
+  // branch is unit-tested in test/view-layers.ts): the dashboard must SAY what
   // it dropped.
   const capped = await run("tower_do_status", { limit: 1 } as never);
   check(
@@ -659,34 +714,87 @@ async function layer2(): Promise<void> {
     capped.text.split("\n").slice(-3).join(" / "),
   );
 
-  // A dashboard past the host byte cap must SAY it dropped its head: the head
-  // carries the revision, the board file path and (open-first) the unfinished
-  // work, so an unmarked cut would hand the caller a silently incomplete board
-  // to replay. Fat receipts are the cheapest way to grow the render.
-  const fatDir = mkdtempSync(join(tmpdir(), "tower-do-trunc-"));
-  const fatFiles = Array.from(
-    { length: 4 },
-    (_, i) => `src/some/long/path/segment-${String(i)}/${"x".repeat(200)}.ts`,
-  );
-  const fatBatch = (round: number): Array<Record<string, unknown>> =>
-    Array.from({ length: 50 }, (_, i) => ({
-      key: `fat-${String(round * 50 + i)}`,
-      subject: `delivered artifact ${String(round * 50 + i)}`,
-      status: "completed",
-      changedFiles: fatFiles,
-    }));
-  await run("tower_do", { tasks: fatBatch(0) } as never, fatDir);
+  // The scope-conflict section grows with the completed history (every receipt
+  // that touched a file the caller's scope names is a row), so the default view
+  // cuts it to DASHBOARD_SCOPE_CONFLICT_LINES and reports the rest. The
+  // disclosure must stay neutral: the hidden rows are mostly the CALLER's own
+  // tasks against old receipts, not conflicts "between other sessions".
+  const foldedConflictDir = mkdtempSync(join(tmpdir(), "tower-do-conflict-"));
   await run(
     "tower_do",
     {
       tasks: [
-        ...fatBatch(0).map((task) => ({ key: task.key })),
-        ...fatBatch(1),
+        {
+          key: "done-receipt",
+          subject: "touched src",
+          status: "completed",
+          changedFiles: ["src/a.ts"],
+        },
+        ...Array.from({ length: 6 }, (_, i) => ({
+          key: `scope-${String(i)}`,
+          subject: `scope row ${String(i)}`,
+          status: "pending",
+          // The caller owns one of them, so the cut must keep ITS conflict
+          // (relevant-first) instead of whatever fold order surfaced.
+          ...(i === 0 ? { owner: "smoke-session" } : {}),
+          scope: ["src/a.ts"],
+        })),
       ],
     } as never,
+    foldedConflictDir,
+  );
+  const conflictStatus = await run(
+    "tower_do_status",
+    {} as never,
+    foldedConflictDir,
+  );
+  check(
+    "the caller's own conflicts win the cut",
+    conflictStatus.text.includes(
+      "⛔ overlap: scope-0 plans to touch what done-receipt already changed",
+    ),
+    conflictStatus.text
+      .split("\n")
+      .filter((line) => line.includes("overlap:"))
+      .map((line) => line.slice(0, 60))
+      .join(" / "),
+  );
+  check(
+    "the folded scope-conflict section reports hidden rows neutrally",
+    conflictStatus.text.includes(
+      "## Scope conflicts (6, 5 shown) — advisory",
+    ) &&
+      conflictStatus.text.includes("… +1 more conflict(s) not shown") &&
+      !conflictStatus.text.includes("between other sessions"),
+    conflictStatus.text
+      .split("\n")
+      .filter((line) => line.includes("Scope conflicts") || line.includes("not shown"))
+      .join(" / ") || "(missing)",
+  );
+
+  // Completed rows are a compact key ledger now, so receipts no longer
+  // inflate the render: fat OPEN rows (a full scope list each) are the cheap
+  // way to grow it instead.
+  const fatDir = mkdtempSync(join(tmpdir(), "tower-do-trunc-"));
+  const fatGlobs = Array.from(
+    { length: 20 },
+    (_, i) => `${"x".repeat(220)}/segment-${String(i)}/**/*.ts`,
+  );
+  const fatBatch = (round: number): Array<Record<string, unknown>> =>
+    Array.from({ length: 50 }, (_, i) => ({
+      key: `fat-${String(round * 50 + i)}`,
+      subject: `open artifact ${String(round * 50 + i)}`,
+      status: "in_progress",
+      scope: fatGlobs,
+    }));
+  await run("tower_do", { tasks: fatBatch(0) } as never, fatDir);
+  // The byte-cap fixture needs the expanded view: the folded default renders
+  // these 50 rows as 50 short ledger lines, which is the point of the fold.
+  const fatStatus = await run(
+    "tower_do_status",
+    { view: "all" } as never,
     fatDir,
   );
-  const fatStatus = await run("tower_do_status", {} as never, fatDir);
   check(
     "dashboard past the byte cap discloses the dropped head",
     fatStatus.text.includes("… dashboard truncated:") &&
@@ -703,44 +811,81 @@ async function layer2(): Promise<void> {
     `${String(Buffer.byteLength(fatStatus.text, "utf8"))} bytes`,
   );
 
-  // The LINE bound is reachable in its own right: raise `limit` above it with
-  // tiny rows and it binds before the byte cap. The disclosure must survive
-  // this cut too (its line is reserved), so the result never reports a cut by
-  // exceeding the line budget it just applied.
+  // The layers are computed over the whole board: a `limit` that slices the
+  // caller's own row away must not reclassify the peer row it is coupled to.
+  const coupledDir = mkdtempSync(join(tmpdir(), "tower-do-coupled-"));
+  await run(
+    "tower_do",
+    {
+      tasks: [
+        {
+          key: "peer-dep",
+          subject: "peer work",
+          status: "in_progress",
+          owner: "carol",
+        },
+        {
+          key: "mine",
+          subject: "my work",
+          status: "pending",
+          owner: "smoke-session",
+          dependsOn: ["peer-dep"],
+        },
+      ],
+    } as never,
+    coupledDir,
+  );
+  const coupled = await run(
+    "tower_do_status",
+    { limit: 1 } as never,
+    coupledDir,
+  );
+  check(
+    "a sliced-away own row still classifies its peer dependency as needs",
+    coupled.text.includes("[needs you: await]") &&
+      !coupled.text.includes("- ○ mine:"),
+    coupled.text.slice(0, 200),
+  );
+
+  // A completed ledger line packs several keys, so the line cap can no longer
+  // fire before the byte cap does: assert the disclosure survives and both
+  // budgets hold on a board whose ledger alone exceeds the byte cap.
   const lineDir = mkdtempSync(join(tmpdir(), "tower-do-lines-"));
-  const lineEvents: ReturnType<typeof writeBoardSnapshot>["taskEvents"] = [];
-  let lineView = createEmptyBoard();
-  for (let round = 0; round < 45; round += 1) {
-    const details = writeBoardSnapshot(
-      lineView,
-      {
-        tasks: [
-          ...lineView.tasks.map((item) => ({ key: item.key })),
-          ...Array.from({ length: 50 }, (_, i) => ({
-            key: `l${String(round)}-${String(i)}`,
-            subject: "x",
-            status: "completed" as const,
-          })),
-        ],
-      },
-      "seed",
-    );
-    lineView = details.view;
-    lineEvents.push(...details.taskEvents);
-  }
+  // Seed the log directly: one writeBoardSnapshot call may introduce at most
+  // MAX_TOWER_DO_OPEN_TASKS new completed rows (the fabricated-receipt bound).
+  const lineEvents: ReturnType<typeof writeBoardSnapshot>["taskEvents"] =
+    Array.from({ length: 8000 }, (_, i) => {
+      const key = `l${String(i).padStart(5, "0")}`;
+      return {
+        kind: "task" as const,
+        op: "upsert" as const,
+        key,
+        task: {
+          key,
+          subject: "x",
+          status: "completed" as const,
+          dependsOn: [],
+          blockedBy: [],
+          updatedAt: i,
+        },
+        by: "seed",
+        at: i,
+      };
+    });
   await new TowerBoard(boardFileFor(lineDir)).append(lineEvents);
   const lineStatus = await run(
     "tower_do_status",
-    { limit: 5000 } as never,
+    { limit: 20_000 } as never,
     lineDir,
   );
   const lineCount = lineStatus.text.split("\n").length;
   check(
-    "line-bound cut keeps the disclosure and the line budget",
+    "truncated ledger still discloses the cut inside both budgets",
     lineStatus.text.includes("… dashboard truncated:") &&
       lineCount <= 2000 &&
+      Buffer.byteLength(lineStatus.text, "utf8") <= 50 * 1024 &&
       !lineStatus.text.includes("TowerDo shared board — identity"),
-    `rows=${String(lineView.tasks.length)} lines=${String(lineCount)}`,
+    `rows=8000 lines=${String(lineCount)}`,
   );
 
   // bob (as subagent id) tries to complete alice's task → ownership error.
@@ -861,6 +1006,31 @@ async function layer2(): Promise<void> {
     "finding visible on dashboard",
     s2.text.includes("token parser overflow"),
     "finding surfaced",
+  );
+
+  // The list truncates each finding to one line, so the full text needs its
+  // own read path; an unknown id must fail loud.
+  const findingId = s2.text.match(/- \[(f-[0-9a-f-]+)\]/)?.[1] ?? "";
+  const findingDetail = await run(
+    "tower_do_status",
+    { findingId } as never,
+  );
+  check(
+    "findingId returns the full finding text",
+    findingId !== "" &&
+      findingDetail.text.includes("token parser overflow") &&
+      findingDetail.text.includes("input not bounded") &&
+      findingDetail.text.includes("clamp length") &&
+      findingDetail.text.includes("- summary:"),
+    findingDetail.text.split("\n")[0],
+  );
+  const missingFinding = await runThrow("tower_do_status", {
+    findingId: "f-nope",
+  } as never);
+  check(
+    "unknown findingId is rejected",
+    /no finding with id/.test(missingFinding),
+    missingFinding.slice(0, 80),
   );
 
   // Stale write rejected via baseRevision (gate).
@@ -1238,29 +1408,32 @@ async function layer2(): Promise<void> {
     body: "hello",
     as: "alice",
   } as never);
-  const staleRow = await run("tower_do_status", {});
+  const staleRow = await run("tower_do_status", { view: "all" } as never);
   const statusLines = staleRow.text.split("\n");
-  // Pin the Completed-group glyph+key, not a substring that also appears
-  // in the activity feed (`- tower · … · ✓ stale: …`).
-  const staleLine =
-    statusLines.find((line) => line.startsWith("- ✓ stale:")) ?? "";
+  // Completed rows render as a key ledger now: pin that section, not a
+  // glyph+subject line (the subject still appears in the activity feed).
+  const completedSection = (
+    staleRow.text.split("## Completed")[1] ?? ""
+  ).split("\n## ")[0] ?? "";
+  // Pin the ledger's shape instead of asserting the absence of markers it can
+  // no longer render: every row is keys only (`- a, b`), which is what makes
+  // the section a replayable key list rather than another row list.
+  const completedLedgerRows = completedSection
+    .split("\n")
+    .slice(1) // drop the `(2)` count that followed the section title
+    .filter((line) => line.trim() !== "");
   check(
-    "completed row found for stale blockedBy",
-    staleLine !== "",
-    staleRow.text.slice(0, 80),
-  );
-  check(
-    "completed row shows no [blocked] marker",
-    staleLine !== "" && !staleLine.includes("[blocked]"),
-    staleLine || "(missing)",
-  );
-  check(
-    "completed row shows no waiting reason",
-    staleLine !== "" && !staleLine.includes("waiting"),
-    staleLine || "(missing)",
+    "completed ledger is one packed key-only row per line",
+    completedSection.includes("stale") &&
+      completedSection.includes("auth") &&
+      completedLedgerRows.length > 0 &&
+      completedLedgerRows.every((line) =>
+        /^- [a-z0-9][a-z0-9._-]*(, [a-z0-9][a-z0-9._-]*)*$/.test(line),
+      ),
+    completedLedgerRows.slice(0, 2).join(" / ") || "(missing)",
   );
   const waitLine =
-    statusLines.find((line) => line.startsWith("- ◐ wait:")) ?? "";
+    statusLines.find((line) => line.startsWith("- ✗ wait:")) ?? "";
   check(
     "in_progress + blockedBy row found",
     waitLine !== "",
@@ -1845,6 +2018,113 @@ async function layer2(): Promise<void> {
     homeBoard.revision >= 1 &&
       homeBoard.tasks.some((task) => task.key === "home-write"),
     `rev=${homeBoard.revision} file=${boardFileFor(homeProject)}`,
+  );
+
+  // A caller-centred view is only testable with a caller-coupled peer row:
+  // with no mine/needs rows, `view=mine`, `view=needs` and the default
+  // `layers` render the same output, so a regression that wired the wrong
+  // layer into the window would pass. Build a board where the caller's own
+  // work waits on a peer's task and one unrelated row exists, then pin each
+  // view's contract.
+  const layersViewDir = mkdtempSync(join(tmpdir(), "tower-do-view-layers-"));
+  await run(
+    "tower_do",
+    {
+      tasks: [
+        {
+          key: "peer-blocker",
+          subject: "peer gate",
+          status: "pending",
+          owner: "peer-owner",
+        },
+        {
+          key: "mine-waits",
+          subject: "my turn after the gate",
+          status: "pending",
+          owner: "smoke-session",
+          dependsOn: ["peer-blocker"],
+        },
+        {
+          key: "unrelated",
+          subject: "nobody business",
+          status: "pending",
+          owner: "someone-else",
+        },
+      ],
+    } as never,
+    layersViewDir,
+  );
+  const coupledDefault = await run("tower_do_status", {}, layersViewDir);
+  check(
+    "the default view renders the caller's own row and the coupled peer row in full",
+    /## Mine \(1\)[\s\S]*?- ✗ mine-waits: my turn after the gate @smoke-session \(me\)[\s\S]*?\[blocked by: peer-blocker\]/.test(
+      coupledDefault.text,
+    ) &&
+      /## Needs you \(1\)[\s\S]*?- ○ peer-blocker: peer gate @peer-owner \[needs you: await\]/.test(
+        coupledDefault.text,
+      ) &&
+      /## Others \(1 · 1 owner\(s\) · 1 pending, ledger\)[\s\S]*?- unrelated pending @someone-else/.test(
+        coupledDefault.text,
+      ),
+    coupledDefault.text.split("\n").slice(3, 12).join(" / "),
+  );
+  const coupledMine = await run(
+    "tower_do_status",
+    { view: "mine" } as never,
+    layersViewDir,
+  );
+  check(
+    "view=mine folds the coupled peer row into the ledger and drops its reason",
+    /## Needs you \(1 · 1 owner\(s\) · 1 pending, ledger\)[\s\S]*?- peer-blocker pending @peer-owner/.test(
+      coupledMine.text,
+    ) && !coupledMine.text.includes("[needs you: await]"),
+    coupledMine.text.split("\n").slice(3, 12).join(" / "),
+  );
+  const coupledNeeds = await run(
+    "tower_do_status",
+    { view: "needs" } as never,
+    layersViewDir,
+  );
+  check(
+    "view=needs folds exactly like the default layers view",
+    coupledNeeds.text.includes("## Needs you (1)") &&
+      coupledNeeds.text.includes("[needs you: await]") &&
+      coupledNeeds.text.includes(
+        "## Others (1 · 1 owner(s) · 1 pending, ledger)",
+      ) &&
+      !coupledNeeds.text.includes("- ○ unrelated:"),
+    coupledNeeds.text.split("\n").slice(3, 12).join(" / "),
+  );
+
+  // Detail reads are bounded like the dashboard: a long summary is cut with
+  // the cut disclosed. The dashboard path hits the byte cap first (its rows
+  // are long), so drive the LINE cap through one finding whose summary is
+  // thousands of one-character lines.
+  await run("tower_do_talk", {
+    action: "finding",
+    kind: "improve",
+    severity: "low",
+    title: "many lines",
+    summary: Array.from({ length: 2000 }, () => "x").join("\n"),
+  } as never);
+  const longSummaryId =
+    (
+      (await run("tower_do_status", {})).text.match(
+        /- \[(f-[0-9a-f-]+)\] \[low\/improve\] many lines/,
+      ) ?? []
+    )[1] ?? "";
+  const longDetail = await run(
+    "tower_do_status",
+    { findingId: longSummaryId } as never,
+  );
+  check(
+    "a multi-thousand-line finding detail is cut at the line budget and says so",
+    longSummaryId !== "" &&
+      longDetail.text.includes(
+        "… finding detail truncated: showing the last",
+      ) &&
+      longDetail.text.split("\n").length <= 2000,
+    (longDetail.text.split("\n").at(-1) ?? "").slice(0, 120),
   );
 }
 
