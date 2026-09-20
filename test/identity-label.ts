@@ -246,12 +246,24 @@ const legacyTask: TowerDoTask = {
   updatedAt: OLD,
 };
 const activity: ActivityEntry[] = [
-  { kind: "task", by: legacyOf(SIBLING_A), at: OLD, glyph: "◐", detail: "work" },
+  {
+    kind: "task",
+    by: legacyOf(SIBLING_A),
+    at: OLD,
+    glyph: "◐",
+    detail: "work",
+    taskKey: "work",
+  },
 ];
 check(
   "a current-label heartbeat does NOT speak for a legacy owner (exact staleness)",
-  staleTaskOwners(activity, [legacyTask], Date.now(), undefined, new Set([labelA]))
-    .has(legacyOf(SIBLING_A)),
+  staleTaskOwners(
+    activity,
+    [legacyTask],
+    Date.now(),
+    30 * 60_000,
+    new Set([labelA]),
+  ).has(legacyOf(SIBLING_A)),
 );
 check(
   "a legacy owner is protected by a heartbeat under its own label",
@@ -259,26 +271,40 @@ check(
     activity,
     [legacyTask],
     Date.now(),
-    undefined,
+    30 * 60_000,
     new Set([legacyOf(SIBLING_A)]),
   ).size === 0,
 );
 check(
   "…and the same query still reports stale when nobody is live",
-  staleTaskOwners(activity, [legacyTask], Date.now(), undefined, new Set()).has(
-    legacyOf(SIBLING_A),
-  ),
+  staleTaskOwners(
+    activity,
+    [legacyTask],
+    Date.now(),
+    30 * 60_000,
+    new Set(),
+  ).has(legacyOf(SIBLING_A)),
 );
 const currentTask: TowerDoTask = { ...legacyTask, owner: labelA };
 check(
   "a bucket sibling's liveness does NOT protect a current-label owner (the fix)",
-  staleTaskOwners(activity, [currentTask], Date.now(), undefined, new Set([labelB]))
-    .has(labelA),
+  staleTaskOwners(
+    activity,
+    [currentTask],
+    Date.now(),
+    30 * 60_000,
+    new Set([labelB]),
+  ).has(labelA),
 );
 check(
   "a current-label owner is protected by its own liveness",
-  staleTaskOwners(activity, [currentTask], Date.now(), undefined, new Set([labelA]))
-    .size === 0,
+  staleTaskOwners(
+    activity,
+    [currentTask],
+    Date.now(),
+    30 * 60_000,
+    new Set([labelA]),
+  ).size === 0,
 );
 
 // ---------------------------------------------------------------------------

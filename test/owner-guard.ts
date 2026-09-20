@@ -14,6 +14,7 @@
  */
 import {
   createEmptyBoard,
+  parseActivityLine,
   staleTaskOwners,
   writeBoardSnapshot,
   type ActivityEntry,
@@ -364,12 +365,18 @@ async function main(): Promise<void> {
 
   const NOW = 1_800_000_000_000;
   const MIN = 60_000;
-  const activityEntry = (by: string, at: number): ActivityEntry => ({
-    kind: "task",
+  const activityEntry = (
+    by: string,
+    at: number,
+    taskKey = "activity",
+    kind: ActivityEntry["kind"] = "task",
+  ): ActivityEntry => ({
+    kind,
     by,
     at,
     glyph: "○",
-    detail: "activity",
+    detail: taskKey,
+    ...(kind === "task" ? { taskKey } : {}),
   });
   const handTask = (over: Partial<TowerDoTask>): TowerDoTask => ({
     key: "t",
@@ -381,19 +388,19 @@ async function main(): Promise<void> {
     ...over,
   });
 
-  // Pure derivation: idle owner of an open task is stale; completed rows,
-  // fresh activity, and freshly assigned never-started work are not.
+  // Derivation is charged to activity ON THE TASK (Layer 1b): a non-completed
+  // row goes stale when its owner's clock for THAT key — or, absent any, the
+  // row's own updatedAt — is older than TASK_CLAIM_STALE_MS (6h).
   const tasksForDerivation = [
     handTask({ key: "idle", subject: "i", status: "in_progress", owner: "A" }),
     handTask({ key: "done", subject: "d", status: "completed", owner: "A" }),
+    handTask({ key: "fresh", subject: "f", status: "in_progress", owner: "B" }),
     handTask({
-      key: "fresh",
-      subject: "f",
-      status: "in_progress",
-      owner: "B",
-      updatedAt: NOW - 40 * MIN,
+      key: "never",
+      subject: "n",
+      owner: "C",
+      updatedAt: NOW - 7 * 60 * MIN,
     }),
-    handTask({ key: "never", subject: "n", owner: "C" }),
     handTask({
       key: "assigned",
       subject: "a",
@@ -403,20 +410,61 @@ async function main(): Promise<void> {
     handTask({ key: "open", subject: "o" }),
   ];
   const stale = staleTaskOwners(
-    [activityEntry("A", NOW - 40 * MIN), activityEntry("B", NOW - 1 * MIN)],
+    [
+      activityEntry("A", NOW - 7 * 60 * MIN, "idle"),
+      activityEntry("B", NOW - 1 * MIN, "fresh"),
+    ],
     tasksForDerivation,
     NOW,
   );
   check(
-    "staleTaskOwners marks idle owner + long-assigned never-started owner",
+    "staleTaskOwners marks a task whose own activity is old; fresh activity and a fresh assignment are protected",
     stale.has("A") && stale.has("C") && !stale.has("B") && !stale.has("D"),
     [...stale].join(","),
+  );
+
+  // Unrelated board chatter (a message, or work on another task key) must NOT
+  // immunize a stale row — the bug the per-task clock exists to fix.
+  check(
+    "unrelated global activity does not immunize a stale task",
+    staleTaskOwners(
+      [activityEntry("A", NOW - 1 * MIN, "some-other-task", "message")],
+      [
+        handTask({
+          key: "a-row",
+          subject: "a",
+          status: "in_progress",
+          owner: "A",
+          updatedAt: NOW - 7 * 60 * MIN,
+        }),
+      ],
+      NOW,
+    ).has("A"),
+  );
+  check(
+    "activity on the task itself within the window protects it",
+    staleTaskOwners(
+      [activityEntry("A", NOW - 1 * MIN, "a-row", "task")],
+      [
+        handTask({
+          key: "a-row",
+          subject: "a",
+          status: "in_progress",
+          owner: "A",
+          updatedAt: NOW - 7 * 60 * MIN,
+        }),
+      ],
+      NOW,
+    ).size === 0,
   );
 
   // Liveness tiebreaker: an owner whose process still heartbeats is never
   // stale, however quiet it has been on the board.
   const withLive = staleTaskOwners(
-    [activityEntry("A", NOW - 40 * MIN), activityEntry("B", NOW - 1 * MIN)],
+    [
+      activityEntry("A", NOW - 7 * 60 * MIN, "idle"),
+      activityEntry("B", NOW - 1 * MIN, "fresh"),
+    ],
     tasksForDerivation,
     NOW,
     undefined,
@@ -430,13 +478,14 @@ async function main(): Promise<void> {
   check(
     "liveOwners alias protects an as-label owner with stale board activity",
     staleTaskOwners(
-      [activityEntry("coder-1", NOW - 40 * MIN)],
+      [activityEntry("coder-1", NOW - 7 * 60 * MIN, "child")],
       [
         handTask({
           key: "child",
           subject: "c",
           status: "in_progress",
           owner: "coder-1",
+          updatedAt: NOW - 7 * 60 * MIN,
         }),
       ],
       NOW,
@@ -452,19 +501,19 @@ async function main(): Promise<void> {
     staleTaskOwners([], tasksForDerivation, NOW).size === 0,
   );
 
-  // An owner WITH prior activity is judged by that activity alone: a task
-  // freshly assigned to an already-quiet owner does not re-protect the row.
-  // (The fresh-updatedAt protection is for never-active owners only.)
+  // The clock is per task: a fresh `updatedAt` protects only that row, so an
+  // owner quiet on ONE task is still stale for its other stale rows.
   check(
-    "a quiet owner stays stale for a freshly assigned row too",
+    "a fresh row does not protect the owner's other stale rows",
     staleTaskOwners(
-      [activityEntry("E", NOW - 40 * MIN)],
+      [activityEntry("E", NOW - 7 * 60 * MIN, "e-old")],
       [
         handTask({
           key: "e-old",
           subject: "o",
           status: "in_progress",
           owner: "E",
+          updatedAt: NOW - 7 * 60 * MIN,
         }),
         handTask({
           key: "e-new",
@@ -475,6 +524,36 @@ async function main(): Promise<void> {
       ],
       NOW,
     ).has("E"),
+  );
+
+  // Real parser wiring: `parseActivityLine` must expose the structured taskKey
+  // (the display `detail` is `key: subject` and must never be parsed back).
+  const parsedActivity = parseActivityLine(
+    JSON.stringify({
+      kind: "task",
+      op: "upsert",
+      key: "real-key",
+      task: { subject: "real subject", status: "in_progress" },
+      by: "A",
+      at: NOW,
+    }),
+  );
+  check(
+    "parseActivityLine exposes the structured taskKey",
+    parsedActivity?.taskKey === "real-key" &&
+      staleTaskOwners(
+        [parsedActivity],
+        [
+          handTask({
+            key: "real-key",
+            subject: "real subject",
+            status: "in_progress",
+            owner: "A",
+            updatedAt: NOW - 7 * 60 * MIN,
+          }),
+        ],
+        NOW,
+      ).size === 0,
   );
 
   // Board: A owns an in_progress task and went quiet 40 min ago.

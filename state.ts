@@ -45,6 +45,42 @@ export const MAX_FINDING_TITLE_CHARS = 200;
 export const MAX_FINDING_SUMMARY_CHARS = 4000;
 export const MAX_FINDING_LOCATION_CHARS = 256;
 export const MAX_FINDING_SUGGESTED_FIX_CHARS = 2_000;
+/** Finding exit mechanism (see docs/plans/board-exit.md and CONTRACTS.md):
+ * open work is bounded, closing is auditable, and nothing actionable is ever
+ * retired by age alone. These are semantic constants, not tuning knobs. */
+/** Non-closed findings a board may carry (open + accepted + snoozed, expired
+ * snoozes included). "Snooze" and "claim" both occupy a slot; only a terminal
+ * status frees one — otherwise deferral would be a free way to clear the
+ * budget and the digest could grow without bound again. */
+export const MAX_TOWER_DO_OPEN_FINDINGS = 50;
+/** A claimed finding older than this is an unfulfilled close obligation: its
+ * owner must `done|rejected|snooze` before filing a new finding. Also the
+ * default-view grace period for closed findings (visible, then view-retired). */
+export const FINDING_CLOSE_GRACE_MS = 7 * 24 * 60 * 60_000;
+/** Upper bound on how far a snooze may push a finding (`snoozeUntil <= now +
+ * this`). An expired snooze flows back to `actionable`; a snooze never removes
+ * the finding, it only leaves the default list. */
+export const FINDING_SNOOZE_MAX_MS = 30 * 24 * 60 * 60_000;
+/** Close/snooze reason: single line, stored in the event, shown in the detail
+ * read. Closing without a reason is the silent-wrong class this board exists to
+ * prevent, so the field is required for terminal/held transitions. */
+export const MAX_FINDING_REASON_CHARS = 256;
+/** Age after which an unread message leaves the default view even though nobody
+ * acked it. The message stays on disk and is readable via `inbox all` — this is
+ * a VIEW retirement (Layer 2), never a delete. */
+export const MESSAGE_PENDING_RETIRE_MS = 14 * 24 * 60 * 60_000;
+/** Ownership-takeover window for non-completed tasks, separate from the 30 min
+ * presence/idle hint: ownership dies on the task-relevant activity clock, not
+ * on unrelated board chatter (see staleTaskOwners). */
+export const TASK_CLAIM_STALE_MS = 6 * 60 * 60_000;
+/** `tower_do_status` hint thresholds for the explicit `gc` compact — a hint,
+ * never an automatic trigger: rewriting the log must be a named, auditable
+ * action by `tower`, not a side effect of a threshold. */
+export const BOARD_COMPACT_HINT_LINES = 10_000;
+export const BOARD_COMPACT_HINT_BYTES = 1024 * 1024;
+/** Checkpoint custom-entry type carrying the bounded digest (Layer 4). The old
+ * `TOWER_DO_BOARD_TYPE` full-snapshot entries stay readable. */
+export const TOWER_DO_BOARD_DIGEST_TYPE = "pi-tower-do-board-digest";
 
 // ---------------------------------------------------------------------------
 // Content limits — defined exactly once, here.
@@ -81,6 +117,10 @@ export const MAX_CHANGED_FILES = 100;
  * different rule. Kept as its own constant so retuning the dependency cap
  * cannot silently retune the blocker cap (CONTRACTS.md task model). */
 export const MAX_TASK_BLOCKERS = 20;
+/** Longest single `blockedBy` entry. Blockers name a task/message/finding id,
+ * so 120 is generous, but the list still needs a bound: it is rendered inline
+ * in the reminder, which has no byte budget of its own. */
+export const MAX_BLOCKER_CHARS = 120;
 /** Longest single entry in a path-ish list (`scope` glob, `changedFiles`
  * path). Both are single-line repo-relative strings that must stay readable in
  * the dashboard, so one limit covers both. */
@@ -120,7 +160,12 @@ export function transportLimit(limit: number): number {
 export type TowerDoStatus = "pending" | "in_progress" | "completed" | "blocked";
 export type FindingKind = "bug" | "improve" | "vuln" | "idea";
 export type FindingSeverity = "low" | "medium" | "high";
-export type FindingStatus = "open" | "accepted" | "rejected" | "done";
+export type FindingStatus =
+  | "open"
+  | "accepted"
+  | "snoozed"
+  | "rejected"
+  | "done";
 
 export const TOWER_DO_STATUSES: ReadonlySet<string> = new Set([
   "pending",
@@ -142,6 +187,7 @@ export const FINDING_SEVERITIES: ReadonlySet<string> = new Set([
 export const FINDING_STATUSES: ReadonlySet<string> = new Set([
   "open",
   "accepted",
+  "snoozed",
   "rejected",
   "done",
 ]);
@@ -208,7 +254,17 @@ export interface TowerDoFinding {
   summary: string;
   location?: string;
   suggestedFix?: string;
+  /** Accountability owner (Layer 1): set on `claim`, displaceable by the same
+   * stale-owner takeover rules as a task. Optional — legacy rows and unclaimed
+   * findings have none. */
+  owner?: string;
+  /** Close/snooze reason (required for done|rejected|snoozed). Single line. */
+  reason?: string;
+  /** Wall-clock ms the finding returns to `actionable` (only for `snoozed`). */
+  snoozeUntil?: number;
   from: string;
+  /** Last write time — for `closed`/`snoozed` rows this is the transition time,
+   * so the close-age grace and the snooze deadline read it directly. */
   at: number;
 }
 
@@ -223,6 +279,16 @@ export interface TowerBoardView {
    * still holds but cannot show — never silent: the dashboard discloses it.
    * Not part of `revision` (which counts folded task events only). */
   skipped: number;
+  /** True when this view was rebuilt from a bounded digest because the board
+   * file was missing (Layer 4). Display-only fallback: it carries open tasks
+   * and finding titles, NOT full content or history, and must be disclosed.
+   * Never persisted into a board event. */
+  incomplete?: boolean;
+  /** Digest-only: the finding counts captured when the checkpoint was written.
+   * A restored digest carries no closed rows, so re-summarizing it would
+   * report `closed: 0 / retired: 0` as fact; renderers must prefer this
+   * snapshot when present. Never persisted into a board event. */
+  findingCountsAtCheckpoint?: FindingCounts;
 }
 
 interface TowerDoChangeSummary {
@@ -280,6 +346,10 @@ export function cloneBoard(view: TowerBoardView): TowerBoardView {
     schemaVersion: TOWER_DO_SCHEMA_VERSION,
     revision: view.revision,
     skipped: view.skipped,
+    ...(view.incomplete === undefined ? {} : { incomplete: view.incomplete }),
+    ...(view.findingCountsAtCheckpoint === undefined
+      ? {}
+      : { findingCountsAtCheckpoint: { ...view.findingCountsAtCheckpoint } }),
     tasks: view.tasks.map(cloneTask),
     messages: view.messages.map((message) => ({
       ...message,
@@ -490,9 +560,11 @@ export function writeBoardSnapshot(
       );
     }
     const owner = patch.owner ?? existing?.owner;
-    if (owner !== undefined) {
+    if (owner !== undefined && owner.trim() !== "") {
       // Validate here too (fail fast before the merge), but with the key: an
-      // element-level rejection must be attributable to a task.
+      // element-level rejection must be attributable to a task. A blank owner
+      // is skipped because the layers below treat "" as "no owner" — checking
+      // it here would make this pre-check stricter than the layer it guards.
       normalizeIdentity(owner, `tasks[${index}].owner (${key})`);
     }
     // Receipts describe a completed delivery: do not inherit one onto a
@@ -886,6 +958,14 @@ function normalizeTask(
       `tasks[${index}].blockedBy (${key}) supports at most ${MAX_TASK_BLOCKERS} entries`,
     );
   }
+  for (const [entryIndex, entry] of blockedBy.entries()) {
+    const entryLength = textLength(entry);
+    if (entryLength > MAX_BLOCKER_CHARS) {
+      throw new TowerDoValidationError(
+        `tasks[${index}].blockedBy[${entryIndex}] (${key}) is ${entryLength} characters (max ${MAX_BLOCKER_CHARS}) — shorten it`,
+      );
+    }
+  }
 
   const owner = normalizeOptionalText(input.owner);
   if (owner !== undefined) {
@@ -1187,6 +1267,14 @@ function isRecord(value: unknown): value is Record<string, unknown> {
   return !!value && typeof value === "object";
 }
 
+/** Finite epoch-ms guard. JSON admits `1e999` → Infinity (and a corrupt row
+ *  can carry NaN); a non-finite timestamp would permanently defeat every
+ *  time-based exit (staleness, overdue, message retirement), so it is
+ *  rejected exactly like any other malformed field. */
+export function isEpochMs(value: unknown): value is number {
+  return typeof value === "number" && Number.isFinite(value);
+}
+
 export function readPersistedTask(
   candidate: unknown,
   index: number,
@@ -1255,7 +1343,7 @@ export function readPersistedMessage(
     typeof candidate.from !== "string" ||
     typeof candidate.subject !== "string" ||
     typeof candidate.body !== "string" ||
-    typeof candidate.at !== "number"
+    !isEpochMs(candidate.at)
   ) {
     return undefined;
   }
@@ -1301,7 +1389,7 @@ export function readPersistedFinding(
     typeof candidate.status !== "string" ||
     typeof candidate.summary !== "string" ||
     typeof candidate.from !== "string" ||
-    typeof candidate.at !== "number"
+    !isEpochMs(candidate.at)
   ) {
     return undefined;
   }
@@ -1324,6 +1412,16 @@ export function readPersistedFinding(
       : {}),
     ...(typeof candidate.suggestedFix === "string"
       ? { suggestedFix: candidate.suggestedFix }
+      : {}),
+    // Optional accountability fields (Layer 1). Absent on legacy rows — an old
+    // finding must not be reported as `skipped` because it predates the model.
+    ...(typeof candidate.owner === "string" ? { owner: candidate.owner } : {}),
+    ...(typeof candidate.reason === "string"
+      ? { reason: candidate.reason }
+      : {}),
+    ...(typeof candidate.snoozeUntil === "number" &&
+    Number.isFinite(candidate.snoozeUntil)
+      ? { snoozeUntil: candidate.snoozeUntil }
       : {}),
     from: candidate.from,
     at: candidate.at,
@@ -1355,7 +1453,7 @@ function readBoardSnapshot(value: unknown): TowerBoardView | undefined {
     if (!task || keys.has(task.key)) return undefined;
     keys.add(task.key);
     const updatedAt =
-      isRecord(candidate) && typeof candidate.updatedAt === "number"
+      isRecord(candidate) && isEpochMs(candidate.updatedAt)
         ? candidate.updatedAt
         : Date.now();
     tasks.push({ ...cloneNormalizedTask(task), updatedAt });
@@ -1376,9 +1474,331 @@ function readBoardSnapshot(value: unknown): TowerBoardView | undefined {
     schemaVersion: TOWER_DO_SCHEMA_VERSION,
     revision: value.revision,
     skipped: typeof value.skipped === "number" ? value.skipped : 0,
+    ...(value.incomplete === true ? { incomplete: true } : {}),
     tasks,
     messages,
     findings,
+  };
+}
+
+// ---------------------------------------------------------------------------
+// Bounded checkpoint digest (Layer 4)
+// ---------------------------------------------------------------------------
+
+export interface TowerDoCheckpointDigest {
+  digestVersion: 1;
+  schemaVersion: typeof TOWER_DO_SCHEMA_VERSION;
+  revision: number;
+  identity: string;
+  counts: {
+    tasks: { byStatus: Record<TowerDoStatus, number>; open: number };
+    findings: FindingCounts;
+    unread: number;
+  };
+  openTasks: {
+    key: string;
+    status: TowerDoStatus;
+    owner?: string;
+    subject: string;
+  }[];
+  findings: {
+    id: string;
+    severity: FindingSeverity;
+    kind: FindingKind;
+    title: string;
+    owner?: string;
+    state: FindingState;
+    /** Epoch ms a snoozed finding returns to actionable. Carried so a
+     * digest-only restore still derives `snoozed` correctly instead of
+     * misreading it as actionable work. */
+    snoozeUntil?: number;
+  }[];
+}
+
+/**
+ * Bounded projection of a board view for the session transcript. Every field
+ * has an upper bound derived from a single constant: `openTasks` <=
+ * MAX_TOWER_DO_OPEN_TASKS, `findings` <= MAX_TOWER_DO_OPEN_FINDINGS, counts
+ * O(1). No field may grow with board history — a `retiredFindingIds`-style
+ * field is exactly the design error this forbids (see CONTRACTS.md).
+ */
+export function checkpointDigest(
+  view: TowerBoardView,
+  now: number,
+  liveOwners: ReadonlySet<string>,
+  identity: string,
+): TowerDoCheckpointDigest {
+  const byStatus: Record<TowerDoStatus, number> = {
+    pending: 0,
+    in_progress: 0,
+    completed: 0,
+    blocked: 0,
+  };
+  for (const task of view.tasks) byStatus[task.status] += 1;
+  const openTasks = view.tasks
+    .filter((task) => task.status !== "completed")
+    .slice(0, MAX_TOWER_DO_OPEN_TASKS)
+    .map((task) => ({
+      key: task.key,
+      status: task.status,
+      ...(task.owner === undefined ? {} : { owner: task.owner }),
+      subject: task.subject,
+    }));
+  const findings = findingPressureOrder(view.findings, now, liveOwners)
+    .filter(
+      (finding) => deriveFindingState(finding, now, liveOwners) !== "closed",
+    )
+    .slice(0, MAX_TOWER_DO_OPEN_FINDINGS)
+    .map((finding) => {
+      const state = deriveFindingState(finding, now, liveOwners);
+      return {
+        id: finding.id,
+        severity: finding.severity,
+        kind: finding.kind,
+        title: finding.title,
+        // Owner and snooze deadline are carried ONLY for the state they belong
+        // to. An `accepted` finding whose owner died derives `actionable`, and
+        // carrying the dead claim's owner would round-trip into the impossible
+        // `open`+`owner` shape (the live fold always clears an owner on open).
+        ...(state === "claimed" && finding.owner !== undefined
+          ? { owner: finding.owner }
+          : {}),
+        state,
+        ...(state === "snoozed" && finding.snoozeUntil !== undefined
+          ? { snoozeUntil: finding.snoozeUntil }
+          : {}),
+      };
+    });
+  return {
+    digestVersion: 1,
+    schemaVersion: TOWER_DO_SCHEMA_VERSION,
+    revision: view.revision,
+    identity,
+    counts: {
+      tasks: { byStatus, open: view.tasks.length - byStatus.completed },
+      findings: findingCountsFor(view, now, liveOwners),
+      unread: unreadMessagesToMe(view, identity).length,
+    },
+    openTasks,
+    findings,
+  };
+}
+
+function readFindingCounts(value: unknown): FindingCounts | undefined {
+  if (!isRecord(value)) return undefined;
+  const keys: (keyof FindingCounts)[] = [
+    "actionable",
+    "claimed",
+    "snoozed",
+    "closed",
+    "retired",
+  ];
+  const counts = {
+    actionable: 0,
+    claimed: 0,
+    snoozed: 0,
+    closed: 0,
+    retired: 0,
+  };
+  for (const key of keys) {
+    const n = value[key];
+    // Counts must be non-negative safe integers: a corrupt/foreign digest must
+    // never materialize a fractional or negative count.
+    if (typeof n !== "number" || !Number.isSafeInteger(n) || n < 0)
+      return undefined;
+    counts[key] = n;
+  }
+  return counts;
+}
+
+/** Validate a serialized digest (checkpoint read path). */
+export function readBoardDigest(
+  value: unknown,
+): TowerDoCheckpointDigest | undefined {
+  if (!isRecord(value) || value.digestVersion !== 1) return undefined;
+  if (value.schemaVersion !== TOWER_DO_SCHEMA_VERSION) return undefined;
+  if (
+    typeof value.revision !== "number" ||
+    !Number.isSafeInteger(value.revision) ||
+    value.revision < 0
+  ) {
+    return undefined;
+  }
+  if (typeof value.identity !== "string") return undefined;
+  if (!isRecord(value.counts)) return undefined;
+  const countsRecord = value.counts;
+  const findingCounts = readFindingCounts(countsRecord.findings);
+  if (findingCounts === undefined) return undefined;
+  if (!isRecord(countsRecord.tasks)) return undefined;
+  if (typeof countsRecord.unread !== "number") return undefined;
+  if (!Array.isArray(value.openTasks) || !Array.isArray(value.findings))
+    return undefined;
+  // The digest's whole point is a bounded payload; a restored digest must not
+  // be able to exceed those bounds (a corrupt/foreign entry would otherwise
+  // materialize an unbounded view).
+  if (
+    value.openTasks.length > MAX_TOWER_DO_OPEN_TASKS ||
+    value.findings.length > MAX_TOWER_DO_OPEN_FINDINGS ||
+    !Number.isSafeInteger(countsRecord.unread) ||
+    countsRecord.unread < 0
+  ) {
+    return undefined;
+  }
+  const byStatus: Record<TowerDoStatus, number> = {
+    pending: 0,
+    in_progress: 0,
+    completed: 0,
+    blocked: 0,
+  };
+  for (const status of TOWER_DO_STATUSES) {
+    const n = (countsRecord.tasks as Record<string, unknown>).byStatus;
+    if (!isRecord(n)) return undefined;
+    const value = n[status];
+    if (typeof value !== "number" || !Number.isSafeInteger(value) || value < 0)
+      return undefined;
+    byStatus[status as TowerDoStatus] = value;
+  }
+  if (
+    typeof countsRecord.tasks.open !== "number" ||
+    !Number.isSafeInteger(countsRecord.tasks.open) ||
+    countsRecord.tasks.open < 0
+  ) {
+    return undefined;
+  }
+  const openTasks: TowerDoCheckpointDigest["openTasks"] = [];
+  // Length is not the only bound: a foreign digest could carry a
+  // newline-injecting key, an oversized subject, or a non-key id. Restored
+  // rows render verbatim, so every rendered field must satisfy the same
+  // contract the fold enforces — that is what keeps "bounded" true.
+  const boundedLine = (value: string, max: number): boolean =>
+    textLength(value) <= max && !/[\r\n\u2028\u2029]/.test(value);
+  for (const candidate of value.openTasks) {
+    if (
+      !isRecord(candidate) ||
+      typeof candidate.key !== "string" ||
+      typeof candidate.subject !== "string" ||
+      !isTowerDoStatus(candidate.status) ||
+      candidate.status === "completed" ||
+      !TASK_KEY_PATTERN.test(candidate.key) ||
+      !boundedLine(candidate.subject, MAX_TASK_SUBJECT_CHARS) ||
+      (candidate.owner !== undefined &&
+        (typeof candidate.owner !== "string" ||
+          !boundedLine(candidate.owner, MAX_IDENTITY_CHARS)))
+    ) {
+      return undefined;
+    }
+    openTasks.push({
+      key: candidate.key,
+      status: candidate.status,
+      subject: candidate.subject,
+      ...(typeof candidate.owner === "string" ? { owner: candidate.owner } : {}),
+    });
+  }
+  const findings: TowerDoCheckpointDigest["findings"] = [];
+  for (const candidate of value.findings) {
+    if (
+      !isRecord(candidate) ||
+      typeof candidate.id !== "string" ||
+      typeof candidate.title !== "string" ||
+      typeof candidate.kind !== "string" ||
+      typeof candidate.severity !== "string" ||
+      typeof candidate.state !== "string" ||
+      !boundedLine(candidate.id, MAX_IDENTITY_CHARS) ||
+      !boundedLine(candidate.title, MAX_FINDING_TITLE_CHARS) ||
+      (candidate.owner !== undefined &&
+        (typeof candidate.owner !== "string" ||
+          !boundedLine(candidate.owner, MAX_IDENTITY_CHARS)))
+    ) {
+      return undefined;
+    }
+    if (
+      !FINDING_KINDS.has(candidate.kind) ||
+      !FINDING_SEVERITIES.has(candidate.severity) ||
+      !FINDING_STATES.has(candidate.state)
+    ) {
+      return undefined;
+    }
+    if (
+      candidate.snoozeUntil !== undefined &&
+      (typeof candidate.snoozeUntil !== "number" ||
+        !Number.isSafeInteger(candidate.snoozeUntil) ||
+        candidate.snoozeUntil <= 0)
+    ) {
+      return undefined;
+    }
+    findings.push({
+      id: candidate.id,
+      kind: candidate.kind as FindingKind,
+      severity: candidate.severity as FindingSeverity,
+      title: candidate.title,
+      state: candidate.state as FindingState,
+      ...(typeof candidate.owner === "string" ? { owner: candidate.owner } : {}),
+      ...(candidate.snoozeUntil === undefined
+        ? {}
+        : { snoozeUntil: candidate.snoozeUntil }),
+    });
+  }
+  return {
+    digestVersion: 1,
+    schemaVersion: TOWER_DO_SCHEMA_VERSION,
+    revision: value.revision,
+    identity: value.identity,
+    counts: {
+      tasks: { byStatus, open: countsRecord.tasks.open },
+      findings: findingCounts,
+      unread: countsRecord.unread,
+    },
+    openTasks,
+    findings,
+  };
+}
+
+/** Rebuild a DISPLAY-ONLY view from a digest (board file missing). It carries
+ * open tasks and finding titles verbatim; full content and history are gone,
+ * hence `incomplete: true`. The write path never reads this view's revision. */
+function digestToView(digest: TowerDoCheckpointDigest): TowerBoardView {
+  return {
+    schemaVersion: TOWER_DO_SCHEMA_VERSION,
+    revision: digest.revision,
+    skipped: 0,
+    incomplete: true,
+    tasks: digest.openTasks.map((task) => ({
+      key: task.key,
+      subject: task.subject,
+      status: task.status,
+      ...(task.owner === undefined ? {} : { owner: task.owner }),
+      dependsOn: [],
+      blockedBy: [],
+      updatedAt: 0,
+    })),
+    messages: [],
+    findings: digest.findings.map((finding) => ({
+      id: finding.id,
+      kind: finding.kind,
+      title: finding.title,
+      severity: finding.severity,
+      // A closed row can only arrive from a foreign/corrupt digest (the writer
+      // filters them out); mapping it to `done` keeps it closed instead of
+      // resurrecting it as actionable.
+      status:
+        finding.state === "closed"
+          ? "done"
+          : finding.state === "claimed" && finding.owner !== undefined
+            ? "accepted"
+            : finding.state === "snoozed"
+              ? "snoozed"
+              : "open",
+      summary: "",
+      from: "",
+      at: 0,
+      ...(finding.state === "claimed" && finding.owner !== undefined
+        ? { owner: finding.owner }
+        : {}),
+      ...(finding.state === "snoozed" && finding.snoozeUntil !== undefined
+        ? { snoozeUntil: finding.snoozeUntil }
+        : {}),
+    })),
+    findingCountsAtCheckpoint: { ...digest.counts.findings },
   };
 }
 
@@ -1386,7 +1806,9 @@ function readBoardSnapshot(value: unknown): TowerBoardView | undefined {
  * Latest valid board checkpoint on a session branch. Pi's `getBranch()` is
  * root-to-leaf (oldest first), so the *last* matching custom entry is the
  * one written by the most recent compact. Taking the first would resurrect
- * todos that a later compact already superseded.
+ * todos that a later compact already superseded. Both the legacy full
+ * snapshot and the bounded digest (Layer 4) are accepted; a digest restores
+ * as an `incomplete` display view.
  */
 export function latestBoardCheckpoint(
   entries: readonly {
@@ -1397,10 +1819,14 @@ export function latestBoardCheckpoint(
 ): TowerBoardView | undefined {
   let latest: TowerBoardView | undefined;
   for (const entry of entries) {
-    if (entry.type !== "custom" || entry.customType !== TOWER_DO_BOARD_TYPE)
-      continue;
-    const parsed = readBoardSnapshot(entry.data);
-    if (parsed !== undefined) latest = parsed;
+    if (entry.type !== "custom") continue;
+    if (entry.customType === TOWER_DO_BOARD_TYPE) {
+      const parsed = readBoardSnapshot(entry.data);
+      if (parsed !== undefined) latest = parsed;
+    } else if (entry.customType === TOWER_DO_BOARD_DIGEST_TYPE) {
+      const parsed = readBoardDigest(entry.data);
+      if (parsed !== undefined) latest = digestToView(parsed);
+    }
   }
   return latest;
 }
@@ -1504,7 +1930,10 @@ export function isMessageFullyRead(
   // Addressed message: fully read once the recipient acks. If the recipient
   // is no longer an owner on the board (they left / the board was rebuilt),
   // nobody can ever read it — treat it as fully read so orphan messages do
-  // not accumulate in the folded view forever.
+  // not accumulate in the folded view forever. Reachability is proxied by
+  // TASK OWNERSHIP (CONTRACTS.md "undeliverable/orphaned messages
+  // auto-retire"); a recipient admitted only for recent board activity may
+  // therefore retire earlier than the age valve, which stays the bound.
   const recipientStillHere = view.tasks.some(
     (task) => task.owner !== undefined && sameAgent(task.owner, message.to),
   );
@@ -1512,25 +1941,256 @@ export function isMessageFullyRead(
   return identityListHas(readBy, message.to);
 }
 
+// ---------------------------------------------------------------------------
+// Finding exit mechanism (Layer 1/2) — pure derivation, never writes.
+// ---------------------------------------------------------------------------
+
+export type FindingState = "actionable" | "claimed" | "snoozed" | "closed";
+
+export const FINDING_STATES: ReadonlySet<string> = new Set([
+  "actionable",
+  "claimed",
+  "snoozed",
+  "closed",
+]);
+
+export function isFindingClosed(finding: TowerDoFinding): boolean {
+  return finding.status === "done" || finding.status === "rejected";
+}
+
+/**
+ * Derived lifecycle state. `accepted` only counts as `claimed` while its owner
+ * is alive; a dead owner's claim collapses back to `actionable` so the finding
+ * can be taken over. Liveness never means "resolved" — only the terminal
+ * statuses do (see CONTRACTS.md).
+ */
+export function deriveFindingState(
+  finding: TowerDoFinding,
+  now: number,
+  liveOwners: ReadonlySet<string>,
+): FindingState {
+  if (isFindingClosed(finding)) return "closed";
+  if (finding.status === "snoozed") {
+    return finding.snoozeUntil !== undefined && finding.snoozeUntil > now
+      ? "snoozed"
+      : "actionable";
+  }
+  if (finding.status === "accepted") {
+    return finding.owner !== undefined && liveOwners.has(finding.owner)
+      ? "claimed"
+      : "actionable";
+  }
+  return "actionable";
+}
+
+/**
+ * Age past which a closed finding leaves the DEFAULT view (it stays in the
+ * fold and stays readable via `view=all` / `findingId`). `at` is the
+ * transition time, set by the close event, so this is the close age.
+ */
+export function findingViewRetired(
+  finding: TowerDoFinding,
+  now: number,
+): boolean {
+  return isFindingClosed(finding) && now - finding.at > FINDING_CLOSE_GRACE_MS;
+}
+
+/** Keep every non-closed finding; view-retire closed ones past the grace. This
+ * is the Layer 2 "default view" primitive: the dashboard's own state filter is
+ * narrower today, but retirement must stay the outer bound so a future list
+ * change cannot silently un-retire closed rows. */
+export function retainFindings(
+  findings: readonly TowerDoFinding[],
+  now: number,
+): TowerDoFinding[] {
+  return findings.filter((finding) => !findingViewRetired(finding, now));
+}
+
+export interface FindingCounts {
+  actionable: number;
+  claimed: number;
+  snoozed: number;
+  closed: number;
+  retired: number;
+}
+
+export function summarizeFindings(
+  findings: readonly TowerDoFinding[],
+  now: number,
+  liveOwners: ReadonlySet<string>,
+): FindingCounts {
+  const counts: FindingCounts = {
+    actionable: 0,
+    claimed: 0,
+    snoozed: 0,
+    closed: 0,
+    retired: 0,
+  };
+  for (const finding of findings) {
+    const state = deriveFindingState(finding, now, liveOwners);
+    if (state === "actionable") counts.actionable += 1;
+    else if (state === "claimed") counts.claimed += 1;
+    else if (state === "snoozed") counts.snoozed += 1;
+    else if (findingViewRetired(finding, now)) counts.retired += 1;
+    else counts.closed += 1;
+  }
+  return counts;
+}
+
+/** Non-closed findings a board carries — the budget's charge. */
+export function openFindingCount(
+  findings: readonly TowerDoFinding[],
+): number {
+  return findings.filter((finding) => !isFindingClosed(finding)).length;
+}
+
+/** Finding counts for a possibly digest-restored view. Only `closed`/`retired`
+ *  are taken from the checkpoint: a digest carries no closed rows, so
+ *  recomputing them would report 0 as fact. `actionable`/`claimed`/`snoozed`
+ *  are always recomputed — liveness and snooze deadlines move on, and a frozen
+ *  count would contradict the per-row state rendered on the same screen. */
+export function findingCountsFor(
+  view: TowerBoardView,
+  now: number,
+  liveOwners: ReadonlySet<string>,
+): FindingCounts {
+  const fresh = summarizeFindings(view.findings, now, liveOwners);
+  const carried = view.findingCountsAtCheckpoint;
+  return carried === undefined
+    ? fresh
+    : { ...fresh, closed: carried.closed, retired: carried.retired };
+}
+
+/** Overdue actionable: waiting longer than the close grace. */
+function findingOverdue(
+  finding: TowerDoFinding,
+  now: number,
+  state: FindingState,
+): boolean {
+  return state === "actionable" && now - finding.at > FINDING_CLOSE_GRACE_MS;
+}
+
+/**
+ * Pressure order for the list: overdue actionable first (oldest of those
+ * first — they are the rows the old `at DESC` page hid forever), then plain
+ * actionable (newest first), claimed, snoozed (soonest deadline first), then
+ * closed (newest first). Pure; the caller applies the page cut and discloses
+ * it.
+ *
+ * "Oldest" is measured from `at`, the LAST transition (a claim, a snooze, a
+ * reopen), not from first filing: a re-opened or re-claimed row ranks as
+ * freshly active, which is what a reader triaging debt needs. There is
+ * deliberately no separate `filedAt` (a persisted field nothing else reads).
+ */
+export function findingPressureOrder(
+  findings: readonly TowerDoFinding[],
+  now: number,
+  liveOwners: ReadonlySet<string>,
+): TowerDoFinding[] {
+  const rank = (finding: TowerDoFinding): number => {
+    const state = deriveFindingState(finding, now, liveOwners);
+    if (findingOverdue(finding, now, state)) return 0;
+    if (state === "actionable") return 1;
+    if (state === "claimed") return 2;
+    if (state === "snoozed") return 3;
+    return 4;
+  };
+  return [...findings].sort((a, b) => {
+    const ra = rank(a);
+    const rb = rank(b);
+    if (ra !== rb) return ra - rb;
+    if (ra === 3) {
+      const ua = a.snoozeUntil ?? 0;
+      const ub = b.snoozeUntil ?? 0;
+      if (ua !== ub) return ua - ub;
+    }
+    // Overdue and claimed: longest-waiting first. Everything else: newest.
+    if (ra === 0 || ra === 2) return a.at - b.at;
+    return b.at - a.at;
+  });
+}
+
+function ageDays(ms: number): number {
+  return Math.max(0, Math.floor(ms / 86_400_000));
+}
+
+/**
+ * Error message when filing a NEW finding must be rejected, else undefined.
+ * Two independent bars, both executable by the caller:
+ *  - close obligation: a live owner holding an overdue claimed finding;
+ *  - budget: all non-closed findings (snoozed included) at the cap.
+ * The budget error names the highest-pressure rows, because the failure the
+ * old model produced was precisely that the backlog was invisible.
+ */
+export function findingBudgetRejection(
+  findings: readonly TowerDoFinding[],
+  now: number,
+  liveOwners: ReadonlySet<string>,
+  caller: string,
+): string | undefined {
+  const owed = findings.filter(
+    (finding) =>
+      deriveFindingState(finding, now, liveOwners) === "claimed" &&
+      finding.owner !== undefined &&
+      // EXACT owner match, like every other permission/obligation check:
+      // aliasing here would make a bucket sibling carry (or escape) a claim
+      // that is not theirs (CONTRACTS.md "permission is exact").
+      finding.owner === caller &&
+      now - finding.at > FINDING_CLOSE_GRACE_MS,
+  );
+  if (owed.length > 0) {
+    return (
+      `you hold ${owed.length} claimed finding(s) past the ${String(Math.round(FINDING_CLOSE_GRACE_MS / 86_400_000))}d close grace ` +
+      `(${owed.map((finding) => finding.id).join(", ")}) — close (done|rejected) or snooze them before filing another`
+    );
+  }
+  const open = findings.filter((finding) => !isFindingClosed(finding));
+  if (open.length >= MAX_TOWER_DO_OPEN_FINDINGS) {
+    const pressing = findingPressureOrder(open, now, liveOwners)
+      .slice(0, 5)
+      .map(
+        (finding) =>
+          `${finding.id} (${String(ageDays(now - finding.at))}d, ${finding.severity}/${finding.kind})`,
+      );
+    return (
+      `non-closed findings are at the budget (${String(MAX_TOWER_DO_OPEN_FINDINGS)}): close one first — a snooze still occupies a slot, so it frees nothing.\n` +
+      `  most pressing: ${pressing.join(", ")}\n` +
+      `  remedy: tower_do_talk action=finding findingIds=[…] status=done|rejected reason=…`
+    );
+  }
+  return undefined;
+}
+
 /**
  * Retire fully-read history: keep at most `retention` fully-read messages
  * (oldest first) once the folded set exceeds the budget. Unread and
- * partially-read messages always survive — retiring them would silently
- * swallow traffic a peer has not seen. retention 0 = keep everything (legacy).
- * Returns a NEW messages array; the input view is not mutated.
+ * partially-read messages always survive the budget — retiring them would
+ * silently swallow traffic a peer has not seen — but an unread message nobody
+ * acks still leaves the DEFAULT view after `MESSAGE_PENDING_RETIRE_MS` (the
+ * age valve; disk and `inbox all` keep it). retention 0 = keep everything
+ * (legacy). Returns a NEW messages array; the input view is not mutated.
  */
 export function retainMessages(
   messages: readonly TowerDoMessage[],
   view: TowerBoardView,
   retention: number,
+  now: number = Date.now(),
 ): TowerDoMessage[] {
-  if (retention <= 0 || messages.length <= retention) return [...messages];
-  const done = messages.filter((message) => isMessageFullyRead(message, view));
-  const keepDone = Math.max(0, retention - (messages.length - done.length));
+  const fresh =
+    retention <= 0
+      ? [...messages]
+      : messages.filter(
+          (message) =>
+            isMessageFullyRead(message, view) ||
+            now - message.at <= MESSAGE_PENDING_RETIRE_MS,
+        );
+  if (retention <= 0 || fresh.length <= retention) return fresh;
+  const done = fresh.filter((message) => isMessageFullyRead(message, view));
+  const keepDone = Math.max(0, retention - (fresh.length - done.length));
   const surplus = done.length - keepDone;
-  if (surplus <= 0) return [...messages];
+  if (surplus <= 0) return fresh;
   const retired = new Set(done.slice(0, surplus).map((message) => message.id));
-  return messages.filter((message) => !retired.has(message.id));
+  return fresh.filter((message) => !retired.has(message.id));
 }
 
 // ---------------------------------------------------------------------------
@@ -1544,6 +2204,10 @@ export interface ActivityEntry {
   glyph: string;
   /** Human summary: task key / recipient / finding title. */
   detail: string;
+  /** Structured task key for task events (undefined otherwise). `detail` is a
+   * display string (`key: subject`) and must never be parsed back — the
+   * stale-owner clock keys on this field. */
+  taskKey?: string;
 }
 
 const ACTIVITY_GLYPHS: Record<TowerDoStatus, string> = {
@@ -1569,14 +2233,21 @@ export function parseActivityLine(line: string): ActivityEntry | undefined {
   if (!candidate || typeof candidate !== "object") return undefined;
   const record = candidate as Record<string, unknown>;
   const kind = record.kind;
-  const at = typeof record.at === "number" ? record.at : undefined;
+  const at = isEpochMs(record.at) ? record.at : undefined;
   const by = typeof record.by === "string" ? record.by : undefined;
   if (at === undefined || by === undefined) return undefined;
   if (kind === "task") {
     const task = record.task as Record<string, unknown> | undefined;
-    const key = typeof record.key === "string" ? record.key : "?";
+    const key = typeof record.key === "string" ? record.key : undefined;
     if (record.op === "remove") {
-      return { kind: "task", by, at, glyph: "🗑", detail: `${key} removed` };
+      return {
+        kind: "task",
+        by,
+        at,
+        glyph: "🗑",
+        detail: `${key ?? "?"} removed`,
+        ...(key === undefined ? {} : { taskKey: key }),
+      };
     }
     if (task && typeof task.subject === "string") {
       const status = isTowerDoStatus(task.status)
@@ -1587,7 +2258,8 @@ export function parseActivityLine(line: string): ActivityEntry | undefined {
         by,
         at,
         glyph: ACTIVITY_GLYPHS[status],
-        detail: `${key}: ${task.subject}`, // could be added or updated
+        detail: `${key ?? "?"}: ${task.subject}`, // could be added or updated
+        ...(key === undefined ? {} : { taskKey: key }),
       };
     }
     return undefined;
@@ -1824,25 +2496,39 @@ export function derivePresence(
 }
 
 /** Idle threshold after which the owner of a non-completed task becomes
- * adoptable/removable by anyone (see staleTaskOwners). Deliberately far
- * beyond PRESENCE_IDLE_MS (10 min, a display-only stall hint): a worker deep
- * in a long tool call or a coding stretch may legitimately go quiet for tens
- * of minutes without touching the board, and a takeover must not race
- * someone who is merely heads-down. Same value as SESSION_BREAK_GAP_MS —
- * past a session break the owner is invisible to every coordinator, and the
- * old advice ("message them or re-claim via tower") had no working path:
- * the owner guard rejected everyone except `tower`. */
-export const OWNER_TAKEOVER_MS = SESSION_BREAK_GAP_MS;
+ * adoptable/removable by anyone (see staleTaskOwners). Deliberately separate
+ * from SESSION_BREAK_GAP_MS (30 min), which now serves presence/idle display
+ * only: ownership must not look dead just because a 30-minute session break
+ * happened, and it must not survive 30 minutes of unrelated chatter either. */
+export const OWNER_TAKEOVER_MS = TASK_CLAIM_STALE_MS;
+
+/** Human form of the takeover window, derived from the constant so the
+ * user-facing hint can never drift from the permission it describes. */
+export function formatTakeoverWindow(
+  idleMs: number = OWNER_TAKEOVER_MS,
+): string {
+  const minutes = Math.round(idleMs / 60_000);
+  if (minutes < 60) return `${String(minutes)} min`;
+  const hours = minutes / 60;
+  return Number.isInteger(hours)
+    ? `${String(hours)}h`
+    : `${String(minutes)} min`;
+}
 
 /**
  * Owners eligible for takeover: an owner of at least one non-completed task
- * whose own board activity is older than `idleMs`. An owner who was never
- * active at all is judged by the task's `updatedAt` instead, so a task just
- * assigned to a never-seen owner stays protected ("just assigned, not begun
- * yet" — the unstarted/is-idle distinction derivePresence makes). An owner
- * WITH prior activity is stale by that activity alone, so every one of their
- * non-completed tasks becomes displaceable, however recently assigned. Pure
- * read derivation; never writes to the board.
+ * whose activity **on that task** is older than `idleMs`. Unrelated board
+ * activity (messages, or work on other task keys) does NOT immunize a stale
+ * row — the former `lastSeen` was board-global, so one status update anywhere
+ * protected every stale task that owner held. When the owner has no activity
+ * on the task, the task's own `updatedAt` is the clock, so a freshly assigned
+ * row stays protected ("just assigned, not begun yet"). Pure read derivation;
+ * never writes to the board.
+ *
+ * `dependsOn`/`blockedBy` references are not visible in an `ActivityEntry`
+ * (its `detail` is the task key for task events), so relevance is "this owner
+ * wrote this task event". A dependency edit is a change to the depended-on
+ * row, which that row's own owner clock already covers.
  */
 export function staleTaskOwners(
   entries: readonly ActivityEntry[],
@@ -1857,19 +2543,21 @@ export function staleTaskOwners(
    * the exception, not loosen it. */
   liveOwners: ReadonlySet<string> = new Set(),
 ): Set<string> {
-  const lastSeen = new Map<string, number>();
-  for (const entry of entries) {
-    const prior = lastSeen.get(entry.by);
-    if (prior === undefined || entry.at > prior)
-      lastSeen.set(entry.by, entry.at);
-  }
   const stale = new Set<string>();
   // No activity data at all (unreadable / garbage log) must disable the
   // exception, not loosen it: the updatedAt fallback below is only sound
-  // when the log EXISTS but simply has no events by that owner (the
-  // unstarted rule). An empty board log cannot happen for a real board —
-  // task-creation events are always parseable.
+  // when the log EXISTS but simply has no events for that owner+task.
   if (entries.length === 0) return stale;
+  // Task-relevant clock, keyed by owner + structured task key (`detail` is a
+  // display string and would never match; see ActivityEntry.taskKey).
+  const taskActivity = new Map<string, number>();
+  for (const entry of entries) {
+    if (entry.kind !== "task" || entry.taskKey === undefined) continue;
+    const key = `${entry.by}\u0000${entry.taskKey}`;
+    const prior = taskActivity.get(key);
+    if (prior === undefined || entry.at > prior)
+      taskActivity.set(key, entry.at);
+  }
   for (const task of tasks) {
     // Exact label again: a bucket sibling's activity or heartbeat must not
     // decide whether THIS owner is stale. A legacy row therefore goes stale by
@@ -1881,7 +2569,8 @@ export function staleTaskOwners(
       liveOwners.has(task.owner)
     )
       continue;
-    const quietSince = lastSeen.get(task.owner) ?? task.updatedAt;
+    const quietSince =
+      taskActivity.get(`${task.owner}\u0000${task.key}`) ?? task.updatedAt;
     if (now - quietSince > idleMs) stale.add(task.owner);
   }
   return stale;
@@ -1902,7 +2591,7 @@ function staleOwnerHint(
   if (task.owner === undefined || !staleOwners.has(task.owner)) return "";
   if (task.status === "completed")
     return " (owner idle, but a completed task stays with its owner — receipt integrity)";
-  return ` (owner idle ${Math.round(OWNER_TAKEOVER_MS / 60_000)}+ min: adopt it by setting owner to yourself, or remove it)`;
+  return ` (owner idle ${formatTakeoverWindow()}+ (per-task activity): adopt it by setting owner to yourself, or remove it)`;
 }
 
 /** Heartbeat cadence for the per-session liveness sidecar (`live/<sessionId>.json`, see index.ts): each session rewrites its own record on this cadence. */
@@ -2256,8 +2945,10 @@ export function formatLedgerKeyRows(
   return rows;
 }
 
-/** Truncate to `max` Unicode code points, appending an ellipsis when cut.
- *  Code points, not UTF-16 units — the same metric as every other limit. */
+/** Truncate the CONTENT to `max` code points, appending an ellipsis when cut
+ *  (so the result is at most `max + 1` code points — the marker is always
+ *  disclosed). Code points, not UTF-16 units — the same metric as every other
+ *  limit. */
 export function truncateChars(value: string, max: number): string {
   const chars = [...value];
   return chars.length <= max ? value : `${chars.slice(0, max).join("")}…`;
@@ -2527,6 +3218,11 @@ export function formatBoardReminder(
   const lines = [
     `TowerDo shared board — you are ${identity} (revision ${view.revision}; ${tasks.length} task(s), ${layers.mine.length} mine, ${layers.needs.length} need you, ${layers.other.length} other${completed > 0 ? `, ${completed} completed hidden` : ""}, ${blocked.length} blocked, ${unread} unread message(s) for you).`,
   ];
+  if (view.incomplete === true) {
+    lines.push(
+      "⚠ board file is missing — this is the last bounded checkpoint (open tasks and finding titles only). Full content (messages, completed receipts, finding bodies) is unavailable; writes fold the missing file as an empty board.",
+    );
+  }
   const shown = attention.slice(0, REMINDER_TASK_LINE_CAP);
   for (const task of shown) {
     const owner =
@@ -2577,7 +3273,7 @@ export function formatBoardReminder(
       "If your work changed (or should change) any task's status, owner, or deps, write it via tower_do " +
       `with baseRevision ${view.revision} — attach changedFiles (files you actually changed) when completing. ` +
       "To coordinate, message the task owner or file a finding via tower_do_talk instead of silently changing tasks you don't own. " +
-      `An owner idle for ${String(Math.round(OWNER_TAKEOVER_MS / 60_000))}+ minutes (OWNER_TAKEOVER_MS) may be displaced: adopt the non-completed task by setting owner to yourself, or remove it. ` +
+      `An owner idle for ${formatTakeoverWindow()}+ (per-task activity, not board chatter) may be displaced: adopt the non-completed task by setting owner to yourself, or remove it. ` +
       "Do not call tower_do only to acknowledge this reminder.",
   );
   return lines.join("\n");
