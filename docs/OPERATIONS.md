@@ -12,9 +12,11 @@ Three equivalent routes (README has the commands):
 2. **git** — `pi install git:https://github.com/wweir/tower-do.git@main`.
 3. **manual** — copy to `~/.pi/agent/extensions/`.
 
-Runtime deps (`typebox`, `@earendil-works/*`) are peer dependencies provided by
-the Pi host — no manual install. Dev-only `bun install` (bun-types +
-typescript) is for typecheck/tests.
+Runtime deps (`typebox`, `@earendil-works/pi-ai`, `@earendil-works/pi-tui`) are
+peer dependencies provided by the Pi host — no manual install.
+`@earendil-works/pi-coding-agent` is the host package itself, so it is a dev
+dependency (types/constants) yet always present at runtime. Dev-only
+`bun install` (bun-types + typescript) is for typecheck/tests.
 
 ## Configuration
 
@@ -126,8 +128,8 @@ When the open budget is full (`open 50/50`):
 2. **Compact a finished board** — when rows are all completed and owned by
 departed sessions, replay only the rows worth keeping under an explicit
 orchestrator identity: `tower_do` with `as: "tower"`. `tower` owns every task,
-so it may drop them; the dropped receipts survive in the JSONL history
-(`board.jsonl` is append-only), only the folded view shrinks. This is the
+so it may drop them; the dropped receipts survive in the JSONL history (until
+an explicit `gc` — see below), only the folded view shrinks. This is the
 documented, cooperative-trust escape hatch — it is unauthenticated, so treat a
 board compaction like any other shared-state maintenance and record it in a
 message (`tower_do_talk`) when peers are live.
@@ -136,9 +138,55 @@ Completed rows are never garbage-collected automatically: the owner guard
 exists to keep delivery receipts trustworthy, and the folded view already has
 display budgets (status slices at `limit`, widget shows remaining work only).
 Because a write must name the rows it keeps, the practical ceiling on history
-is what a reader can see: once a board stops fitting the status output (~10k
-log lines), the answer is log compaction (last-wins under the mutation queue,
-receipts folded, not deleted) — never silent row deletion. See DECISIONS.md.
+is what a reader can see; when the log itself matters, use the explicit `gc`
+below — never silent row deletion. See DECISIONS.md.
+
+### Log compaction (`tower_do action: "gc"`)
+
+The board log is append-only, so `retainMessages` / `retainFindings` (view
+projections) never shrink it. The only byte bound is an explicit compact:
+
+```
+tower_do  { "action": "gc", "tasks": [], "as": "tower" }
+```
+
+- `tower` identity only; `tasks` must be empty. Never periodic.
+- `append` and `compact` share a per-board `<board>.lock` lease (a directory
+  holding the holder's token file), so a peer
+  append cannot land inside the compaction window (a stale lease from a dead
+  holder is stolen after 30s; release unlinks only the holder's own token file
+  and `rmdir` refuses a non-empty directory, so a stolen holder's cleanup
+  cannot delete the new lease). `compact` fails
+  closed if the lock cannot be created; an `append` degrades to unlocked when
+  the lock path is unwritable (its own write is still atomic).
+- Rewrites `board.jsonl` as one `{kind:"compact"}` header + one last-wins
+  snapshot event per surviving entity (completed tasks and closed findings
+  INCLUDED — it folds superseded upserts/acks, it does not delete rows). The
+  snapshot preserves each owner's real last activity on a task, so a gc does
+  not flip the takeover clock.
+- The previous log is archived to `archive/board-rev<N>-<utc>.jsonl` — written
+  only after the CAS passes, immediately before the rename, so an aborted
+  compact never leaves an archive behind.
+- Content CAS: the live sha is re-checked immediately before the rename (read through a hard link taken just before the swap, so the checked bytes are exactly the ones the rename replaces), and the pre-rename guard also verifies the path still names that preserved inode — a peer that replaced the board (compaction) in the window makes the compact abort instead of silently swapping the peer's board away. A mismatch aborts with the live file untouched, and every crash point leaves the old file intact. The lease is
+  re-proven right after the rename: a holder paused past the staleness limit
+  inside that window fails loud, and when the shape is provable the compact
+  reconciles the window under a fresh lease (`content + P + W`, CAS re-checked
+  at the swap) so the peer's writes reappear in the live fold; when it is not
+  provable the pre-compact log is kept as a `board.jsonl.prev-*` evidence file
+  named in the error. Nothing is ever rolled back blindly.
+- `revision` is preserved (the header carries it), so `baseRevision` stays
+  valid. Unfoldable lines block it unless `dropSkipped: true` is passed
+  (recorded in the header as audit metadata; the live `skipped` count clears).
+- `tower_do_status` prints `State: <slug> · log N line(s) / XKB [· compact
+  rev M]` and hints the command at `BOARD_COMPACT_HINT_LINES` (10k) /
+  `BOARD_COMPACT_HINT_BYTES` (1 MiB) or when `skipped > 0`.
+- Known limit: the snapshot keeps each entity's ORIGINATING activity — the
+  task owner's real clock, and for findings the last event's actor — so a gc
+  does not flip the takeover clock or credit a peer's finding status change to
+  the original filer. Message ACKS by other identities are not replayed (only
+  the sender's time is kept), so the presence/idle hint can show an acker as
+  quieter than the pre-gc log implied. The takeover clock (the load-bearing
+  one) is preserved.
 
 ## Troubleshooting
 
@@ -146,17 +194,21 @@ receipts folded, not deleted) — never silent row deletion. See DECISIONS.md.
   `tower_do_status`, merge your changes onto the fresh view, retry with the new
   `baseRevision`.
 - **"owned by ..."** — you touched another owner's task. Only its owner or
-  `tower` may, unless that owner has been idle 30+ minutes with no fresh
-  `live/` heartbeat (including `as` aliases): then adopt by setting `owner`
-  to yourself, or remove the non-completed task. Completed tasks stay
-  guarded. Otherwise message the owner via `tower_do_talk`, or have `tower`
-  do it.
+  `tower` may, unless that owner's activity ON THAT TASK is older than the
+  takeover window (`TASK_CLAIM_STALE_MS`, 6 h) with no fresh `live/` heartbeat
+  (including `as` aliases): then adopt by setting `owner` to yourself, or remove
+  the non-completed task. Unrelated board activity does not protect the row.
+  Completed tasks stay guarded. Otherwise message the owner via `tower_do_talk`,
+  or have `tower` do it.
 - **"open tasks support at most 50 items"** — the board's open budget is full.
   Omit your own or an unowned task, or compact a finished board with
   `as: "tower"` (see *Board capacity and compaction*). Completed rows do not
   consume the budget, so a board of finished work is never the cause.
-- **Board file missing / empty view after cleanup** — falls back to the last
-  session checkpoint for display (disk stays authoritative).
+- **Board file missing / empty view after cleanup** — `tower_do_status` warns
+  and shows an empty fold; if the transcript holds a bounded checkpoint digest
+  it is shown instead (open tasks + finding titles only, marked incomplete).
+  Disk stays authoritative: a write treats the missing file as an empty board
+  (revision 0), so no stale `baseRevision` survives the loss.
 - **Conflicting scope advisories** — advisory only: message the peer owner or
   re-scope. They never block writes.
 - **Peer edits invisible** — every read path re-folds from disk. Widget and

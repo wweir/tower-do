@@ -15,7 +15,10 @@ in progress* plus task-bound communication state, without any central server.
 - **Shared task board**: plan / claim / update / complete / block tasks; model
   ownership and dependencies.
 - **Cross-agent messaging**: addressed mail between owners + structured
-  out-of-scope findings for a coordinator to route.
+  out-of-scope findings for a coordinator to route. Findings have an explicit,
+  auditable exit: a claim/close/snooze lifecycle with reasons, a bounded
+  non-closed budget (so the backlog is actionable instead of silently
+  accumulating), and a pressure-ordered list that never hides the oldest debt.
 - **Global status dashboard**: who owns what, blocks, unread messages, open
   findings, activity, presence. The default view is caller-centred — your own
   unfinished work first, then the peer work you are coupled to (a dependency,

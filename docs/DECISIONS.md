@@ -4,6 +4,63 @@
 > / reviews live in docs/plans + docs/reviews and get folded here when they
 > become durable rules.
 
+## 2026-09 — board exit: four layers, no single TTL
+
+**Context.** Boards accumulated without bound in four DIFFERENT ways, and every
+prior fix addressed one while leaving the others: findings had NO exit at all
+(append-only, no budget; `tower_do_status` rendered the newest 20, so the oldest
+debt was permanently invisible — one board held 73 open findings, the oldest
+14 days old, from sessions long gone); messages could be retired from the view
+but the file never shrank; completed task rows and superseded upserts made
+`board.jsonl` grow to hundreds of KB; and every compact/reminder checkpoint
+copied the WHOLE folded view into the session transcript (measured: a single
+321 KB `pi-tower-do-board` entry; 147 entries ≈ 2.77 MB in one session).
+
+**Decision.** Split the problem into four layers with distinct mechanisms:
+
+1. **Finding lifecycle + budget** (state machine, `MAX_TOWER_DO_OPEN_FINDINGS`
+   = 50 charged to every NON-closed finding, close/snooze reasons required,
+   claim defaults to the caller, liveness routes but never resolves).
+2. **View retirement** (`retainFindings`, `retainMessages` age valve): pure,
+   in-memory, never touches the file; `view=all` / `findingId` / `inbox all`
+   read the retired rows back.
+3. **Explicit log compaction** (`tower_do action:"gc"`, `tower` only): the
+   single-file last-wins rewrite with a `{kind:"compact"}` revision header,
+   content CAS and archive. Cross-process safety is a per-board directory
+   LEASE (`<board>.lock`, exclusivity proved by the holder's token, stale
+   tokens reaped by heartbeat age) that both `append` and `compact` take, plus
+   a CAS re-checked through a hard link taken just before the swap. No
+   userspace lease can exclude a holder paused past `STALE_LOCK_MS` inside the
+   rename window, so the compact re-proves the lease right after the rename
+   and, on a steal, reconciles the window under a fresh lease when the shape is
+   provable (`content + P + W`, P before W) and otherwise keeps the pre-compact
+   log as a `<board>.prev-*` evidence file and fails loud — never a blind
+   rollback, which could clobber writes the new holder made after the rename.
+4. **Bounded checkpoint digest**: `pi-tower-do-board-digest` replaces the full
+   view in the transcript; every field is bounded by a named constant.
+
+Also corrected two pre-existing clocks that made the old exits unreliable:
+`staleTaskOwners` now charges staleness to activity **on that task** (the old
+`lastSeen` was board-global, so one unrelated message immunized every stale
+row) at `TASK_CLAIM_STALE_MS` (6 h), separate from the 30 min presence hint.
+
+**Rejected.** A single age TTL over all record classes (hides actionable
+bug/vuln reports — the opposite of an exit); closing a finding because its
+reporter's session ended (liveness ≠ resolved); `retiredFindingIds` in the
+digest (O(history) in the one place that must be bounded); letting a snooze
+skip the budget (a free way to clear it, and then the digest is unbounded
+again); `board.base.jsonl` as a second file the old line-counting fold would
+have to reconcile (double counting at the crash midpoint); periodic automatic
+compaction (unverifiable audit loss — compaction is explicit, named, and
+archived).
+
+**Consequences.** `board.jsonl` can still grow in bytes until an explicit
+`gc`; `tower_do_status` discloses the log size and hints the command. The
+budget error names the oldest rows, so the backlog is actionable instead of
+invisible. The compact preserves `revision`, so no caller's `baseRevision` is
+invalidated by it. See CONTRACTS.md "Finding contracts" / "Log compaction" /
+"Checkpoint digest" and docs/plans/board-exit.md (landed).
+
 ## 2026-09 — a session label carries entropy; legacy labels alias their own session
 
 **Context.** The board identity for a session was `session-<first 8 chars of
@@ -210,7 +267,7 @@ The cut is therefore disclosed in a footer that repeats the revision and the
 board path (its bytes and its one line are reserved out of both caps), and
 paged reads of `board.jsonl` stay the complete path. The `board-prune` entry's
 ~10k log lines remain the trigger for row-level log compaction (last-wins under
-the mutation queue, receipts folded, never silently deleted) — not for row
+the board write lease, receipts folded, never silently deleted) — not for row
 deletion.
 
 ## 2026-09 — publish auth moves to trusted publishing (OIDC), no token
@@ -338,7 +395,7 @@ lines / 22KB at the time of the cull.
    folded `changedFiles` overlap, and `revision` = task-event count. View-layer
    retirement already exists for messages (`retainMessages`); it does not
    rewrite the log. If a board ever needs a byte bound, the design is
-   last-wins compaction under the mutation queue — revisit only at 10k+
+   last-wins compaction under the board write lease — revisit only at 10k+
    lines or when `fold`/`rawLines` show up in a profile.
 2. **`widget-keybinds`** (expand completed rows in the above-editor widget)
    fights the glance contract: remaining-work only, cap 3 unfinished,
@@ -369,8 +426,8 @@ answer, and only the orchestrator identity could act. Boards accumulated
 `pending` rows pinned by owners no session could ever displace.
 
 **Decision.** Ownership is a claim on availability, so it gets a liveness
-rule of its own: an owner idle past `OWNER_TAKEOVER_MS` (= 30 min,
-`SESSION_BREAK_GAP_MS`) may be displaced on a non-completed task — **adopt**
+rule of its own: an owner idle past `OWNER_TAKEOVER_MS` may be displaced on a
+non-completed task — **adopt**
 it (set `owner` to yourself, strictly nothing else) or **remove** it.
 Completed tasks keep the full guard (a receipt cannot be dropped or forged by
 a peer), and the sidecar heartbeat (session identity plus `as` aliases)
@@ -378,12 +435,19 @@ keeps an alive-but-heads-down owner from being raced. The exact mechanism,
 failure modes, and inert-on-bad-data rules are the contract in CONTRACTS.md
 § Stale-owner exception.
 
+**Superseded (2026-09).** The threshold is no longer 30 min: `OWNER_TAKEOVER_MS`
+is now an alias of `TASK_CLAIM_STALE_MS` (**6 h**), so the two cannot drift,
+and the 30 min `SESSION_BREAK_GAP_MS` serves only presence/session-break
+display. CONTRACTS.md § Stale-owner exception is authoritative.
+
 Properties: the threshold is far beyond the 10-minute display-only idle mark
 (`PRESENCE_IDLE_MS`) so a heads-down worker is never raced; a task assigned
 to a never-active owner is protected by its fresh `updatedAt` ("just
 assigned, not begun yet" stays unstarted — the unstarted/idle distinction
-derivePresence already makes), while an owner with prior activity is judged
-by that activity alone; adoption is ownership-only, so the every-field
+derivePresence already makes). Staleness is judged PER owner+task pair: a
+fresh `updatedAt` protects only its own row, and an owner's activity on one
+task never protects their other rows (exact label matching, never
+bucket-sibling activity). Adoption is ownership-only, so the every-field
 guard's promise survives (a peer can displace a dead claim, never silently
 rewrite content). Unowned pending rows are deliberately NOT expired —
 backlog that nobody claimed is work, not garbage; the exit mechanism keeps
@@ -487,7 +551,7 @@ how much of that this session caused, without a second unit (lines, commits).
   blob different from the baseline, or it appears in the window with a blob
   different from the baseline — the last one catches edits that were made
   *and* committed between two refreshes. Pre-dirty files this session never
-  edits do not count. A later commit can still show `mine N · dirty 0`.
+  edits do not count. A later commit can still show `files N · dirty 0`.
 
 External HEAD movement (pull / rebase / branch switch) never folds its
 roster into the session viewpoint: the previous HEAD not being an ancestor
@@ -504,7 +568,7 @@ Cost bound: refresh hashes at most 2000 dirty paths per settle; past the
 cap (or on a hashing failure) the session viewpoint pauses — dirty stays
 correct while the baseline re-seeds on a later refresh.
 
-Display: always-labeled `mine M · dirty N` (session viewpoint first; labels
+Display: always-labeled `files M · dirty N` (session viewpoint first; labels
 renamed from `sess`/`git` — cryptic viewpoint shorthands violated the same
 principle that killed `ΔN`: a reader must tell which number is which without
 docs), joined to the board progress line with a dim `│` (progress carries
