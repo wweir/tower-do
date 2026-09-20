@@ -14,7 +14,7 @@ import {
   writeFileSync,
 } from "node:fs";
 import { tmpdir } from "node:os";
-import { join } from "node:path";
+import { dirname, join } from "node:path";
 
 import { TowerBoard } from "../board.ts";
 import {
@@ -22,6 +22,7 @@ import {
   findAllUnresolvedDeps,
   formatBoardReminder,
   taskIsBlocked,
+  TOWER_DO_BOARD_DIGEST_TYPE,
   TOWER_DO_BOARD_TYPE,
   TOWER_DO_REMINDER_TYPE,
   writeBoardSnapshot,
@@ -990,6 +991,20 @@ async function layer2(): Promise<void> {
     bobSeesBroadcast.text.includes("standup sync"),
     bobSeesBroadcast.text.slice(0, 100),
   );
+  // A fully-read inbox performs NO write: the ack append (and its
+  // cross-process lease) is only for unacked messages, so a read-only state
+  // dir still serves an inbox and a peer mid-compact cannot stall a read.
+  const bobInboxBytes = readFileSync(boardFileFor(dir), "utf8").length;
+  const bobReread = await run("tower_do_talk", {
+    action: "inbox",
+    as: "bob",
+  } as never);
+  check(
+    "a fully-read inbox is a pure read (no ack append)",
+    readFileSync(boardFileFor(dir), "utf8").length === bobInboxBytes &&
+      !/newly acked/.test(bobReread.text),
+    `bytes ${String(bobInboxBytes)} -> ${String(readFileSync(boardFileFor(dir), "utf8").length)}`,
+  );
 
   // Finding filed by a reviewer identity, visible in status.
   await run("tower_do_talk", {
@@ -1569,7 +1584,9 @@ async function layer2(): Promise<void> {
           (message) => message.customType === TOWER_DO_REMINDER_TYPE,
         ),
         stripped: !msgs.some(
-          (message) => message.customType === TOWER_DO_BOARD_TYPE,
+          (message) =>
+            message.customType === TOWER_DO_BOARD_TYPE ||
+            message.customType === TOWER_DO_BOARD_DIGEST_TYPE,
         ),
         text: msgs.map((message) => message.content ?? "").join("\n"),
       });
@@ -1644,12 +1661,12 @@ async function layer2(): Promise<void> {
     );
   }
   const checkpoint = lastAppend?.data as
-    | { tasks?: Array<{ key: string }> }
+    | { openTasks?: Array<{ key: string }> }
     | undefined;
-  const checkpointKeys = (checkpoint?.tasks ?? []).map((task) => task.key);
+  const checkpointKeys = (checkpoint?.openTasks ?? []).map((task) => task.key);
   check(
     "compact checkpoint re-folds disk so cancelled todos do not come back",
-    lastAppend?.customType === TOWER_DO_BOARD_TYPE &&
+    lastAppend?.customType === TOWER_DO_BOARD_DIGEST_TYPE &&
       checkpointKeys.includes("live-todo") &&
       !checkpointKeys.includes("stale-todo"),
     checkpointKeys.join(","),
@@ -1678,14 +1695,14 @@ async function layer2(): Promise<void> {
       )) as
         | {
             message?: {
-              details?: { tasks?: Array<{ key: string }> };
+              details?: { openTasks?: Array<{ key: string }> };
             };
           }
         | undefined)
     : undefined;
-  const injectedKeys = (injectedBoard?.message?.details?.tasks ?? []).map(
-    (task) => task.key,
-  );
+  const injectedKeys = (
+    injectedBoard?.message?.details?.openTasks ?? []
+  ).map((task) => task.key);
   check(
     "before_agent_start re-folds so compact injection is not a stale cancel",
     injectedKeys.includes("post-compact") &&
@@ -1706,7 +1723,7 @@ async function layer2(): Promise<void> {
           getBranch: () => [
             {
               type: "custom",
-              customType: TOWER_DO_BOARD_TYPE,
+              customType: TOWER_DO_BOARD_DIGEST_TYPE,
               data: lastAppend.data,
             },
           ],
@@ -1714,6 +1731,17 @@ async function layer2(): Promise<void> {
       } as never,
     );
   }
+  // A digest-restored (missing board file) status must say it is showing a
+  // bounded checkpoint — rendering "this is an empty fold" next to a list of
+  // open tasks sends the operator looking for a board that is not empty.
+  const digestStatus = await run("tower_do_status", {} as never, compactDir);
+  check(
+    "a digest-restored status discloses the checkpoint, not an empty fold",
+    digestStatus.text.includes("bounded checkpoint") &&
+      !digestStatus.text.includes("this is an empty fold") &&
+      digestStatus.text.includes("live-todo"),
+    digestStatus.text.split("\n").slice(0, 4).join(" | "),
+  );
   const contextHandler = handlers.get("context");
   let reminder = "";
   if (contextHandler !== undefined) {
@@ -2125,6 +2153,485 @@ async function layer2(): Promise<void> {
       ) &&
       longDetail.text.split("\n").length <= 2000,
     (longDetail.text.split("\n").at(-1) ?? "").slice(0, 120),
+  );
+
+  // -------------------------------------------------------------------------
+  // Finding exit mechanism (Layer 1/2): reason-gated close, claim defaulting,
+  // atomic batch update, and `inbox all` reading view-retired messages.
+  // -------------------------------------------------------------------------
+  const findingIdOf = (text: string): string =>
+    (text.match(/\((f-[0-9a-f-]+)\)/) ?? [])[1] ?? "";
+
+  const filedA = await run("tower_do_talk", {
+    action: "finding",
+    kind: "bug",
+    severity: "high",
+    title: "close me",
+    summary: "summary",
+  } as never);
+  const idA = findingIdOf(filedA.text);
+  check("filing a finding returns its id", idA !== "", filedA.text.slice(0, 80));
+
+  const closeNoReason = await runThrow("tower_do_talk", {
+    action: "finding",
+    findingId: idA,
+    status: "done",
+  } as never);
+  check(
+    "closing a finding without a reason is rejected",
+    /requires a reason/.test(closeNoReason),
+    closeNoReason.slice(0, 80),
+  );
+
+  await run("tower_do_talk", {
+    action: "finding",
+    findingId: idA,
+    status: "accepted",
+  } as never);
+  const claimDetail = await run(
+    "tower_do_status",
+    { findingId: idA } as never,
+  );
+  check(
+    "claiming with no owner defaults to the caller",
+    claimDetail.text.includes("- owner: smoke-session"),
+    claimDetail.text.split("\n").slice(0, 6).join(" / "),
+  );
+
+  const filedB = await run("tower_do_talk", {
+    action: "finding",
+    kind: "improve",
+    severity: "low",
+    title: "batch b",
+    summary: "summary",
+  } as never);
+  const idB = findingIdOf(filedB.text);
+  const batched = await run("tower_do_talk", {
+    action: "finding",
+    findingIds: [idA, idB],
+    status: "done",
+    reason: "fixed in smoke",
+  } as never);
+  check(
+    "a batch close updates every id, each with its own event",
+    idA !== "" && batched.text.includes(idA) && batched.text.includes(idB),
+    batched.text.slice(0, 120),
+  );
+  const closedB = await run("tower_do_status", { findingId: idB } as never);
+  check(
+    "a closed finding records its reason",
+    closedB.text.includes("- reason: fixed in smoke"),
+    closedB.text.split("\n").slice(0, 7).join(" / "),
+  );
+  // Read BOTH ids back from the board: the batch text is built from the
+  // computed rows, so only the persisted state proves every id got its own
+  // event (an `events.slice(-1)` append would still render both ids).
+  const closedA = await run("tower_do_status", { findingId: idA } as never);
+  check(
+    "every batched id is persisted, not just the last",
+    closedA.text.includes("- status: done") &&
+      closedA.text.includes("- reason: fixed in smoke") &&
+      closedB.text.includes("- status: done"),
+    closedA.text.split("\n").slice(0, 7).join(" / "),
+  );
+  const filedS = await run("tower_do_talk", {
+    action: "finding",
+    kind: "idea",
+    title: "snooze wording",
+    summary: "check dashboard text",
+  } as never);
+  const idS = findingIdOf(filedS.text);
+  await run("tower_do_talk", {
+    action: "finding",
+    findingId: idS,
+    status: "snoozed",
+    reason: "defer in smoke",
+    snoozeUntil: Date.now() + 2 * 86_400_000,
+  } as never);
+  const snoozedView = await run("tower_do_status", { view: "all" } as never);
+  const snoozedLine = snoozedView.text.split("\n").find((line) => line.includes(`[${idS}]`)) ?? "";
+  check(
+    "snoozed finding renders days without a literal dollar or trailing space",
+    idS !== "" && /snoozed 2d more$/.test(snoozedLine) && !snoozedLine.includes("$"),
+    snoozedLine.slice(0, 120),
+  );
+
+  const mixedBatch = await runThrow("tower_do_talk", {
+    action: "finding",
+    findingId: idA,
+    findingIds: [idB],
+    status: "open",
+  } as never);
+  check(
+    "findingId and findingIds are mutually exclusive",
+    /not both/.test(mixedBatch),
+    mixedBatch.slice(0, 80),
+  );
+
+  // Creating a NEW finding must not silently swallow update-only fields: a
+  // caller that passes status/owner expects a claimed row, and filing an
+  // open, unowned one instead is the silent-wrong class this board prevents.
+  const createWithStatus = await runThrow("tower_do_talk", {
+    action: "finding",
+    kind: "bug",
+    title: "must not be created claimed",
+    summary: "summary",
+    status: "accepted",
+    owner: "smoke-session",
+  } as never);
+  check(
+    "status/owner on a finding CREATE is rejected, not silently ignored",
+    /apply to a finding UPDATE/.test(createWithStatus),
+    createWithStatus.slice(0, 90),
+  );
+
+  // A message old enough to leave the default view (unread, past the age
+  // valve) is still readable via inbox all, but the default inbox hides it.
+  const retiredAt = Date.now() - 30 * 24 * 60 * 60_000;
+  await new TowerBoard(boardFileFor(dir)).append([
+    {
+      kind: "message",
+      message: {
+        id: "m-recent-control",
+        to: "smoke-session",
+        from: "ghost",
+        subject: "recent",
+        body: "recent body",
+        at: Date.now(),
+      },
+      by: "ghost",
+      at: Date.now(),
+    },
+    {
+      kind: "message",
+      message: {
+        id: "m-age-retired",
+        to: "smoke-session",
+        from: "ghost",
+        subject: "old",
+        body: "old body",
+        at: retiredAt,
+      },
+      by: "ghost",
+      at: retiredAt,
+    },
+  ]);
+  const inboxDefault = await run("tower_do_talk", { action: "inbox" } as never);
+  check(
+    "the default inbox hides an age-retired message (positive control present)",
+    !inboxDefault.text.includes("m-age-retired") &&
+      inboxDefault.text.includes("m-recent-control"),
+    inboxDefault.text.slice(0, 80),
+  );
+  const inboxAll = await run("tower_do_talk", {
+    action: "inbox",
+    all: true,
+  } as never);
+  check(
+    "inbox all reads a view-retired message",
+    inboxAll.text.includes("m-age-retired"),
+    inboxAll.text.slice(0, 80),
+  );
+
+  // Layer 3/C: the dashboard discloses the log size and the finding budget.
+  const boardState = await run("tower_do_status", {} as never);
+  check(
+    "the dashboard prints the log State line",
+    /(^|\n)State: .*log \d+ line\(s\)/.test(boardState.text),
+    boardState.text.split("\n").find((line) => line.startsWith("State:")) ??
+      "(missing)",
+  );
+  check(
+    "the findings header discloses the non-closed budget",
+    /## Open findings \(\d+\/50 non-closed/.test(boardState.text),
+    boardState.text.split("\n").find((line) => line.startsWith("## Open findings")) ??
+      "(missing)",
+  );
+
+  // Layer 3 end-to-end: gc requires `tower`, preserves the revision, and a
+  // non-tower caller is rejected.
+  const gcDenied = await runThrow("tower_do", {
+    action: "gc",
+    tasks: [],
+  } as never);
+  check(
+    "gc is rejected without the tower identity",
+    /requires the orchestrator identity/.test(gcDenied),
+    gcDenied.slice(0, 90),
+  );
+  const revBeforeGc = (await run("tower_do_status", {} as never)).text.match(
+    /revision (\d+)/,
+  )?.[1];
+  const gcResult = await run("tower_do", {
+    action: "gc",
+    tasks: [],
+    as: "tower",
+  } as never);
+  const statusAfterGc = await run("tower_do_status", {} as never);
+  check(
+    "gc compacts the log, preserves the revision, and still folds",
+    /log compacted at revision \d+/.test(gcResult.text) &&
+      revBeforeGc !== undefined &&
+      new RegExp(`revision ${revBeforeGc}\\b`).test(statusAfterGc.text) &&
+      /compact rev /.test(statusAfterGc.text),
+    `${gcResult.text.slice(0, 80)} | ${statusAfterGc.text.split("\n").find((l) => l.startsWith("State:")) ?? "(no State line)"}`,
+  );
+
+  // Reopening (`status=open`) must not bypass the non-closed budget: the
+  // update path enforces the same cap as the create path.
+  const reopenDir = mkdtempSync(join(tmpdir(), "tower-do-reopen-"));
+  const reopenBoard = new TowerBoard(boardFileFor(reopenDir));
+  const findingRow = (
+    id: string,
+    status: "open" | "done",
+  ): Record<string, unknown> => ({
+    kind: "finding",
+    finding: {
+      id,
+      kind: "bug",
+      title: id,
+      severity: "low",
+      status,
+      summary: "s",
+      from: "seed",
+      at: Date.now(),
+    },
+    by: "seed",
+    at: Date.now(),
+  });
+  await reopenBoard.append([
+    ...Array.from({ length: 50 }, (_, i) =>
+      findingRow(`f-open-${String(i)}`, "open"),
+    ),
+    findingRow("f-closed", "done"),
+  ] as never);
+  const reopenRejected = await runThrow(
+    "tower_do_talk",
+    { action: "finding", findingId: "f-closed", status: "open" } as never,
+    reopenDir,
+  );
+  check(
+    "reopening a closed finding over the budget is rejected",
+    /over the budget/.test(reopenRejected),
+    reopenRejected.slice(0, 90),
+  );
+
+  // The other half of the same guard: a legacy board ALREADY over the cap must
+  // still be able to DRAIN. Closing is allowed while the total stays above 50
+  // (only a write that INCREASES the count is rejected), otherwise an
+  // over-cap board could never be brought back under the budget.
+  const drainDir = mkdtempSync(join(tmpdir(), "tower-do-drain-"));
+  const drainBoard = new TowerBoard(boardFileFor(drainDir));
+  await drainBoard.append([
+    ...Array.from({ length: 52 }, (_, i) =>
+      findingRow(`f-over-${String(i)}`, "open"),
+    ),
+  ] as never);
+  const drainOutcome = await runThrow(
+    "tower_do_talk",
+    { action: "finding", findingId: "f-over-0", status: "done", reason: "drain" } as never,
+    drainDir,
+  );
+  const drained = await run(
+    "tower_do_status",
+    { findingId: "f-over-0" } as never,
+    drainDir,
+  );
+  check(
+    "an over-cap legacy board can drain (closing above the cap is allowed)",
+    drainOutcome === "NO ERROR" &&
+      /- status: done/.test(drained.text) &&
+      /- reason: drain/.test(drained.text),
+    drainOutcome === "NO ERROR"
+      ? drained.text.split("\n").slice(0, 7).join(" / ")
+      : drainOutcome.slice(0, 140),
+  );
+
+  // `view=all` must ENUMERATE every row, not just lift the state filter: the
+  // default page cap applies to the same slice, so without an explicit
+  // view=all branch the disclosure "view=all lists every row" is false and the
+  // hidden ids are unreachable by any tool call. 52 rows here (> the 20-row
+  // page).
+  const drainAll = await run("tower_do_status", { view: "all" } as never, drainDir);
+  const listedFindings = drainAll.text
+    .split("\n")
+    .filter((line) => /^- \[f-over-\d+\]/.test(line)).length;
+  check(
+    "view=all enumerates every finding row, not just the default page",
+    listedFindings === 52 && !/more finding\(s\) not shown/.test(drainAll.text),
+    `listed=${String(listedFindings)}`,
+  );
+  const drainDefault = await run("tower_do_status", {} as never, drainDir);
+  check(
+    "the default finding view pages and points at view=all",
+    /more finding\(s\) not shown — view=all lists every row/.test(drainDefault.text),
+    drainDefault.text
+      .split("\n")
+      .find((line) => line.includes("more finding")) ?? "(none)",
+  );
+
+  // Takeover: a claim owned by a non-live identity is adoptable — the guard
+  // lets a non-owner through only when that owner has no fresh heartbeat, and
+  // the claim must then move to the adopter.
+  const takeoverDir = mkdtempSync(join(tmpdir(), "tower-do-takeover-"));
+  const takeoverBoard = new TowerBoard(boardFileFor(takeoverDir));
+  await takeoverBoard.append([
+    {
+      kind: "finding",
+      finding: {
+        id: "f-ghost",
+        kind: "bug",
+        title: "ghost claim",
+        severity: "low",
+        status: "accepted",
+        summary: "s",
+        owner: "ghost",
+        from: "ghost",
+        at: Date.now(),
+      },
+      by: "ghost",
+      at: Date.now(),
+    },
+  ] as never);
+  const takeoverLiveDir = join(dirname(boardFileFor(takeoverDir)), "live");
+  mkdirSync(takeoverLiveDir, { recursive: true });
+  writeFileSync(
+    join(takeoverLiveDir, "smoke-session.x.json"),
+    JSON.stringify({ identity: "smoke-session", at: Date.now() }),
+    "utf8",
+  );
+  await run(
+    "tower_do_talk",
+    { action: "finding", findingId: "f-ghost", status: "accepted" } as never,
+    takeoverDir,
+  );
+  const takeoverDetail = await run(
+    "tower_do_status",
+    { findingId: "f-ghost" } as never,
+    takeoverDir,
+  );
+  check(
+    "claiming a non-live owner's finding moves the owner to the claimer",
+    /- owner: smoke-session/.test(takeoverDetail.text) &&
+      !/- owner: ghost/.test(takeoverDetail.text),
+    takeoverDetail.text
+      .split("\n")
+      .filter((line) => line.startsWith("- owner"))
+      .join(","),
+  );
+
+  // Permission is EXACT, never aliased: a legacy `session-<time8>` and the
+  // current `session-<time8>-<rand8>` in the same bucket alias for DELIVERY
+  // (sameAgent) but must never grant write authority over the other's claim.
+  const exactDir = mkdtempSync(join(tmpdir(), "tower-do-exact-"));
+  const exactBoard = new TowerBoard(boardFileFor(exactDir));
+  const currentLabel = "session-01a0b444-abcdef12";
+  const legacyLabel = "session-01a0b444";
+  await exactBoard.append([
+    {
+      kind: "finding",
+      finding: {
+        id: "f-exact",
+        kind: "bug",
+        title: "exact permission",
+        severity: "low",
+        status: "accepted",
+        summary: "s",
+        owner: currentLabel,
+        from: currentLabel,
+        at: Date.now(),
+      },
+      by: currentLabel,
+      at: Date.now(),
+    },
+  ] as never);
+  const exactLiveDir = join(dirname(boardFileFor(exactDir)), "live");
+  mkdirSync(exactLiveDir, { recursive: true });
+  writeFileSync(
+    join(exactLiveDir, `${currentLabel}.x.json`),
+    JSON.stringify({ identity: currentLabel, at: Date.now() }),
+    "utf8",
+  );
+  const siblingRefusal = await runThrow(
+    "tower_do_talk",
+    {
+      action: "finding",
+      findingId: "f-exact",
+      status: "done",
+      reason: "stolen",
+      as: legacyLabel,
+    } as never,
+    exactDir,
+  );
+  check(
+    "a bucket-sibling label cannot change another session's live claim",
+    /claimed by/.test(siblingRefusal),
+    siblingRefusal.slice(0, 140),
+  );
+  const ownerUpdate = await run(
+    "tower_do_talk",
+    {
+      action: "finding",
+      findingId: "f-exact",
+      status: "done",
+      reason: "mine",
+      as: currentLabel,
+    } as never,
+    exactDir,
+  );
+  check(
+    "the exact owner can still close its own claim",
+    /f-exact/.test(ownerUpdate.text),
+    ownerUpdate.text.slice(0, 140),
+  );
+  // Read it back: the update text is built from the request, so only the
+  // persisted row proves the close actually happened.
+  const exactDetail = await run(
+    "tower_do_status",
+    { findingId: "f-exact" } as never,
+    exactDir,
+  );
+  check(
+    "the exact owner's close is persisted with its reason",
+    /- status: done/.test(exactDetail.text) &&
+      /- reason: mine/.test(exactDetail.text),
+    exactDetail.text.split("\n").slice(0, 7).join(" / "),
+  );
+
+  // Budget boundary: with 49 non-closed seeded, two concurrent reopens must
+  // not both land (the lease spans fold + count + append).
+  const budgetDir = mkdtempSync(join(tmpdir(), "tower-do-budget-"));
+  const budgetBoard = new TowerBoard(boardFileFor(budgetDir));
+  await budgetBoard.append([
+    ...Array.from({ length: 49 }, (_, i) =>
+      findingRow(`f-nc-${String(i)}`, "open"),
+    ),
+    findingRow("f-c1", "done"),
+    findingRow("f-c2", "done"),
+  ] as never);
+  const reopenResults = await Promise.allSettled([
+    run(
+      "tower_do_talk",
+      { action: "finding", findingId: "f-c1", status: "open" } as never,
+      budgetDir,
+    ),
+    run(
+      "tower_do_talk",
+      { action: "finding", findingId: "f-c2", status: "open" } as never,
+      budgetDir,
+    ),
+  ]);
+  const reopenOk = reopenResults.filter(
+    (result) => result.status === "fulfilled",
+  ).length;
+  const budgetStatus = await run("tower_do_status", {} as never, budgetDir);
+  const nonClosed = Number(
+    budgetStatus.text.match(/## Open findings \((\d+)\/50/)?.[1] ?? "-1",
+  );
+  check(
+    "concurrent reopens cannot exceed the finding budget",
+    reopenOk === 1 && nonClosed === 50,
+    `ok=${reopenOk} nonClosed=${nonClosed}`,
   );
 }
 

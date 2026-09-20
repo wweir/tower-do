@@ -41,6 +41,7 @@ import { Value } from "typebox/value";
 
 import { TowerBoard } from "../board.ts";
 import {
+  MAX_BLOCKER_CHARS,
   MAX_CHANGED_FILES,
   MAX_FINDING_LOCATION_CHARS,
   MAX_FINDING_SUGGESTED_FIX_CHARS,
@@ -50,6 +51,7 @@ import {
   MAX_MESSAGE_SUBJECT_CHARS,
   MAX_PATH_ENTRY_CHARS,
   MAX_SCOPE_GLOBS,
+  MAX_TASK_BLOCKERS,
   MAX_TASK_DEPENDENCIES,
   MAX_TASK_DESCRIPTION_CHARS,
   MAX_TASK_KEY_CHARS,
@@ -112,7 +114,7 @@ const ELEMENT_COUNT: Array<[string, number]> = [
   ["dependsOn", MAX_TASK_DEPENDENCIES],
   ["scope", MAX_SCOPE_GLOBS],
   ["changedFiles", MAX_CHANGED_FILES],
-  ["blockedBy", MAX_TASK_DEPENDENCIES],
+  ["blockedBy", MAX_TASK_BLOCKERS],
 ];
 /** Top-level named fields: the schema keeps the business value. */
 const TOP_LEVEL: Array<[string, string, number]> = [
@@ -538,6 +540,20 @@ async function main(): Promise<void> {
         ],
       }),
     /tasks\[0\]\.scope\[1\] \(astral\) is 257 characters \(max 256\)/,
+  );
+  await expectThrows(
+    "an over-long blockedBy entry is refused with the key and the entry index",
+    () =>
+      write({
+        baseRevision: current.revision,
+        tasks: [
+          {
+            key: "astral",
+            blockedBy: ["dep-x", "b".repeat(MAX_BLOCKER_CHARS + 1)],
+          },
+        ],
+      }),
+    /tasks\[0\]\.blockedBy\[1\] \(astral\) is 121 characters \(max 120\)/,
   );
   await expectThrows(
     "a malformed dependency key is refused with the depending task key",

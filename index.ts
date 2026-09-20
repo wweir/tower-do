@@ -13,7 +13,8 @@
  *  - scope: optional file-glob list describing what a task may touch; visible
  *    to everyone; only owner/tower may change it (the mission boundary).
  *  - negotiated handoff, not blind clobber: tower_do_talk delivers addressed
- *    messages (recipient must be a known owner or "all", self-send rejected)
+ *    messages (recipient must be "all", the orchestrator "tower", a current
+ *    task owner, or an identity with recent board activity; self-send rejected)
  *    and files structured findings; tower_do_status is the shared dashboard.
  *  - merge gate, simplified: the monotonic board `revision` is read from the
  *    file (tool-read, never self-reported) and backs the baseRevision guard —
@@ -68,12 +69,13 @@ import {
 } from "node:fs/promises";
 import { createHash, randomUUID } from "node:crypto";
 import { homedir } from "node:os";
-import { dirname, join, resolve } from "node:path";
+import { basename, dirname, join, resolve } from "node:path";
 import { Type } from "typebox";
 
 import {
   normalizeBoardConfig,
   TowerBoard,
+  type BoardEvent,
   type TowerDoConfig,
 } from "./board.ts";
 import {
@@ -86,17 +88,25 @@ import {
   zipHashObject,
 } from "./git-count.ts";
 import {
+  BOARD_COMPACT_HINT_BYTES,
+  BOARD_COMPACT_HINT_LINES,
   classifyTaskLayers,
+  checkpointDigest,
   cloneBoard,
   createEmptyBoard,
   DASHBOARD_FINDING_LINE_CHARS,
   DASHBOARD_ROW_BUDGET,
   DASHBOARD_SCOPE_CONFLICT_LINES,
   DEFAULT_IDENTITY,
+  deriveFindingState,
   derivePresence,
   findAllUnresolvedDeps,
+  findingBudgetRejection,
+  findingPressureOrder,
+  FINDING_CLOSE_GRACE_MS,
   FINDING_KINDS,
   FINDING_SEVERITIES,
+  FINDING_SNOOZE_MAX_MS,
   FINDING_STATUSES,
   formatActivityFeed,
   formatBoardProgress,
@@ -110,6 +120,7 @@ import {
   formatLedgerRow,
   formatLiveSegment,
   formatOtherKeysLine,
+  formatTakeoverWindow,
   formatPresenceLine,
   getAllTasks,
   isCallerLine,
@@ -126,6 +137,7 @@ import {
   parseLiveRecord,
   MAX_CHANGED_FILES,
   MAX_FINDING_LOCATION_CHARS,
+  MAX_FINDING_REASON_CHARS,
   MAX_FINDING_SUGGESTED_FIX_CHARS,
   MAX_FINDING_SUMMARY_CHARS,
   MAX_FINDING_TITLE_CHARS,
@@ -133,19 +145,24 @@ import {
   MAX_MESSAGE_BYTES,
   MAX_MESSAGE_SUBJECT_CHARS,
   MAX_SCOPE_GLOBS,
+  MAX_TASK_BLOCKERS,
   MAX_TASK_DEPENDENCIES,
   MAX_TASK_DESCRIPTION_CHARS,
   MAX_TASK_KEY_CHARS,
   MAX_TASK_SUBJECT_CHARS,
   MAX_TOWER_DO_ALIASES,
+  MAX_TOWER_DO_OPEN_FINDINGS,
   MAX_TOWER_DO_OPEN_TASKS,
   messagesToMe,
+  openFindingCount,
   parseActivityLine,
   relativeTime,
+  retainFindings,
   retainMessages,
   sliceScopeConflicts,
   sliceTaskDashboard,
   staleTaskOwners,
+  findingCountsFor,
   taskIsBlocked,
   identityListHas,
   identitySetHas,
@@ -155,6 +172,7 @@ import {
   TASK_KEY_PATTERN,
   textLength,
   transportLimit,
+  TOWER_DO_BOARD_DIGEST_TYPE,
   TOWER_DO_BOARD_TYPE,
   TOWER_DO_REMINDER_TYPE,
   TOWER_DO_STATUS_TOOL_NAME,
@@ -171,6 +189,7 @@ import {
   type FindingStatus,
   type LiveRecord,
   type TowerBoardView,
+  type TowerDoCheckpointDigest,
   type TowerDoFinding,
   type TowerDoMessage,
   type TowerDoStatus,
@@ -526,15 +545,27 @@ const TowerDoTaskSchema = Type.Object({
     Type.Array(Type.String(), {
       description:
         "Free-form blocker ids this task waits on — task, message, or finding ids; not validated against the board. Non-empty renders a non-completed task as blocked (task-status gating goes through dependsOn instead).",
-      maxItems: transportLimit(MAX_TASK_DEPENDENCIES),
+      maxItems: transportLimit(MAX_TASK_BLOCKERS),
     }),
   ),
 });
 
 const TowerDoParamsSchema = Type.Object({
+  action: Type.Optional(
+    StringEnum(["gc"] as const, {
+      description:
+        'Explicit log compaction (Layer 3). Requires the orchestrator identity "tower" and an empty tasks list. Rewrites board.jsonl as one compact header plus last-wins snapshot events under a content CAS (a concurrent peer append aborts it), archiving the previous log only after the CAS passes and immediately before the rename (an aborted compact leaves no archive). Never periodic; revision is preserved so baseRevision stays valid.',
+    }),
+  ),
+  dropSkipped: Type.Optional(
+    Type.Boolean({
+      description:
+        "gc only: discard log lines the fold cannot parse instead of refusing to compact. The dropped count is recorded in the compact header (audit metadata); the live `skipped` count then clears. Inspect the raw lines first.",
+    }),
+  ),
   tasks: Type.Array(TowerDoTaskSchema, {
     description:
-      `Complete authoritative task list to retain: every key you want kept must appear here, because any current key omitted from the list is removed. An omitted task owned by another agent (and not stale) makes the write fail rather than dropping it; replay peers' and unowned tasks you did not mean to remove. Existing keys may omit unchanged fields (they are preserved per field); new keys require subject and status. Capacity: at most ${MAX_TOWER_DO_OPEN_TASKS} non-completed tasks — completed rows are receipts, they replay free and never block a new plan; one write may introduce at most ${MAX_TOWER_DO_OPEN_TASKS} NEW completed rows (replaying an existing receipt is free, split larger batches across successive writes).`,
+      `Complete authoritative task list to retain: every key you want kept must appear here, because any current key omitted from the list is removed. An omitted task owned by another agent (and not stale) makes the write fail rather than dropping it; replay peers' and unowned tasks you did not mean to remove. Existing keys may omit unchanged fields (they are preserved per field), so send only what changes — a rejected payload is echoed back verbatim by the host, and a small replay keeps that echo cheap. New keys require subject and status. Capacity: at most ${MAX_TOWER_DO_OPEN_TASKS} non-completed tasks — completed rows are receipts, they replay free and never block a new plan; one write may introduce at most ${MAX_TOWER_DO_OPEN_TASKS} NEW completed rows (replaying an existing receipt is free, split larger batches across successive writes).`,
   }),
   baseRevision: Type.Optional(
     Type.Integer({
@@ -546,7 +577,7 @@ const TowerDoParamsSchema = Type.Object({
   as: Type.Optional(
     Type.String({
       description:
-        `Identity to act as (default: your session identity); the call is then owner-guarded as that identity. Pass a subagent id to record work on its behalf. Must be a single line, at most ${MAX_IDENTITY_CHARS} characters, and not the reserved broadcast recipient "all".`,
+        `Identity to act as (default: your session identity); the call is then owner-guarded as that identity. Pass a subagent id to record work on its behalf. Must be a single line, at most ${MAX_IDENTITY_CHARS} characters, and not the reserved broadcast recipient "all". Identities are self-declared labels (cooperative trust, no authentication), so the reserved "${TOWER_IDENTITY}" label gates compaction by convention, not by verification.`,
       maxLength: MAX_IDENTITY_CHARS,
     }),
   ),
@@ -555,7 +586,7 @@ const TowerDoParamsSchema = Type.Object({
 const TalkParamsSchema = Type.Object({
   action: StringEnum(["send", "inbox", "finding"] as const, {
     description:
-      "send delivers a message (requires to + subject + body); inbox lists AND acknowledges your messages (optional limit); finding files a structured finding (requires kind + title + summary) or updates one (requires findingId + status).",
+      "send delivers a message (requires to + subject + body); inbox lists AND acknowledges your messages (optional limit; all=true reads view-retired messages too); finding files a structured finding (requires kind + title + summary), updates one or many (findingId or findingIds + status), and requires a reason to close or snooze.",
   }),
   to: Type.Optional(
     Type.String({
@@ -619,12 +650,49 @@ const TalkParamsSchema = Type.Object({
     }),
   ),
   findingId: Type.Optional(
-    Type.String({ description: "finding: id to update (with status)" }),
+    Type.String({
+      description:
+        "finding: id to update (with status). Mutually exclusive with findingIds.",
+    }),
+  ),
+  findingIds: Type.Optional(
+    Type.Array(Type.String(), {
+      description:
+        "finding: ids to update in one atomic batch (each appends its own event). Mutually exclusive with findingId; status/reason/snoozeUntil apply to every id.",
+      maxItems: transportLimit(MAX_TOWER_DO_OPEN_FINDINGS),
+    }),
+  ),
+  owner: Type.Optional(
+    Type.String({
+      description:
+        "finding: accountability owner. Set together with status=accepted to claim; omitted on a claim defaults to you. A non-tower caller may pass only its OWN identity (only tower may name a different owner); a stale, non-live claim stays adoptable by another agent through status=accepted without owner.",
+      maxLength: transportLimit(MAX_IDENTITY_CHARS),
+    }),
+  ),
+  reason: Type.Optional(
+    Type.String({
+      description:
+        `finding: single-line reason. Required for status=done|rejected|snoozed — closing without a reason is the silent-wrong class this board prevents.`,
+      maxLength: transportLimit(MAX_FINDING_REASON_CHARS),
+    }),
+  ),
+  snoozeUntil: Type.Optional(
+    Type.Integer({
+      description:
+        `finding: epoch ms when status=snoozed returns to actionable. Must be in the future and at most ${Math.round(FINDING_SNOOZE_MAX_MS / 86_400_000)}d ahead.`,
+      minimum: 0,
+    }),
   ),
   status: Type.Optional(
-    StringEnum(["open", "accepted", "rejected", "done"] as const, {
+    StringEnum(["open", "accepted", "snoozed", "rejected", "done"] as const, {
       description:
-        "finding update: new status; requires findingId; ignored for send/inbox",
+        "finding update: new status; requires findingId or findingIds. done|rejected|snoozed require a reason; accepted claims (owner defaults to you); open reopens.",
+    }),
+  ),
+  all: Type.Optional(
+    Type.Boolean({
+      description:
+        "inbox only: include messages retired from the default view (fully-read past the budget, or unread past the age valve). The default view hides them; the board never deletes them.",
     }),
   ),
   limit: Type.Optional(
@@ -637,7 +705,7 @@ const TalkParamsSchema = Type.Object({
   as: Type.Optional(
     Type.String({
       description:
-        `Identity to act as (default: your session identity); the call is then attributed to that identity. Pass a subagent id to send or file as it. Must be a single line, at most ${MAX_IDENTITY_CHARS} characters, and not the reserved broadcast recipient "all".`,
+        `Identity to act as (default: your session identity); the call is then attributed to that identity. Pass a subagent id to send or file as it. Must be a single line, at most ${MAX_IDENTITY_CHARS} characters, and not the reserved broadcast recipient "all". Identities are self-declared labels (cooperative trust, no authentication).`,
       maxLength: MAX_IDENTITY_CHARS,
     }),
   ),
@@ -820,6 +888,11 @@ export default function towerDoExtension(pi: ExtensionAPI): void {
   };
   let contextCheckpointNeeded = false;
   let llmCallsSinceReminder = 0;
+  // Display-only fallback restored from a bounded digest when the board file is
+  // missing (Layer 4). Never used for writes: the write path folds the real
+  // file (missing = empty, revision 0), so no ghost baseRevision can pass the
+  // gate. Cleared as soon as the board file exists again.
+  let checkpointFallback: TowerBoardView | undefined;
   let widgetRegistered = false;
   let uiContext: ExtensionContext | undefined;
   let activeCwd: string | undefined;
@@ -1254,6 +1327,52 @@ export default function towerDoExtension(pi: ExtensionAPI): void {
   const liveDirFor = (cwd: string): string =>
     join(dirname(boards.entryFor(cwd).board.file), "live");
 
+  /** Identities with a fresh liveness record (Layer 1 routing), plus whether
+   * the scan was COMPLETE. A read failure (missing dir, mid-scan error) must
+   * not be read as "that owner is dead": callers treat an incomplete scan as
+   * "every known owner is live", mirroring the task guard's strict fallback.
+   * Liveness can only ever give a claim MORE standing, never resolve it. */
+  const readLiveOwners = async (
+    cwd: string,
+  ): Promise<{ owners: Set<string>; complete: boolean }> => {
+    const owners = new Set<string>();
+    try {
+      const dir = liveDirFor(cwd);
+      const nowMs = Date.now();
+      for (const name of await readdir(dir)) {
+        if (!name.endsWith(".json")) continue;
+        const record = parseLiveRecord(
+          await readFile(join(dir, name), "utf8"),
+        );
+        if (record === undefined) continue;
+        if (record.at < nowMs - LIVE_WINDOW_MS) continue;
+        for (const id of liveOwnerIdentities(record)) owners.add(id);
+      }
+      return { owners, complete: true };
+    } catch {
+      // No live dir yet, or an unreadable one: incomplete, so callers keep
+      // every claim protected rather than treating silence as death.
+      return { owners, complete: false };
+    }
+  };
+
+  /** Effective live set for derivation: on an incomplete scan every owner that
+   * appears on the board counts as live (strict guard, never loosened). */
+  const effectiveLiveOwners = (
+    view: TowerBoardView,
+    live: { owners: Set<string>; complete: boolean },
+  ): Set<string> => {
+    if (live.complete) return live.owners;
+    const all = new Set(live.owners);
+    for (const task of view.tasks) {
+      if (task.owner !== undefined) all.add(task.owner);
+    }
+    for (const finding of view.findings) {
+      if (finding.owner !== undefined) all.add(finding.owner);
+    }
+    return all;
+  };
+
   /** Filename-safe component (identities/session ids are human-chosen). */
   const sanitizeLiveName = (s: string): string =>
     s.replace(/[^A-Za-z0-9._-]/g, "_").slice(0, MAX_IDENTITY_CHARS) || "x";
@@ -1524,10 +1643,7 @@ export default function towerDoExtension(pi: ExtensionAPI): void {
       return;
     }
     if (!widgetRegistered) {
-      widgetRegistered = true;
-      uiContext.ui.setWidget(
-        WIDGET_KEY,
-        (tui: TUI, theme: Theme) => {
+      const factory = (tui: TUI, theme: Theme) => {
           widgetTui = tui;
           return {
             render: (width: number) => {
@@ -1672,9 +1788,19 @@ export default function towerDoExtension(pi: ExtensionAPI): void {
             invalidate: () => {},
             dispose: () => {},
           };
-        },
-        { placement: "aboveEditor" },
-      );
+        };
+      try {
+        // UI failure must never surface as a board-write failure: every caller
+        // reaches here after the write committed, and a thrown error would
+        // make the caller retry a write the board already accepted. Leaving the
+        // flag false lets a later refresh retry the registration.
+        uiContext.ui.setWidget(WIDGET_KEY, factory, {
+          placement: "aboveEditor",
+        });
+        widgetRegistered = true;
+      } catch {
+        widgetRegistered = false;
+      }
     }
   };
 
@@ -1702,7 +1828,16 @@ export default function towerDoExtension(pi: ExtensionAPI): void {
     as: string | undefined,
   ): Promise<{ board: TowerBoard; caller: string; view: TowerBoardView }> => {
     const entry = boards.entryFor(ctx.cwd);
-    const view = await foldRetained(ctx.cwd);
+    const folded = await foldRetained(ctx.cwd);
+    // Read paths show the last bounded checkpoint when the board file is gone;
+    // the fold of a missing file is an empty board and would hide the digest's
+    // open tasks. Writes ignore this view and re-fold the real file.
+    const boardFileExists = existsSync(entry.board.file);
+    if (boardFileExists) checkpointFallback = undefined;
+    const view =
+      !boardFileExists && checkpointFallback !== undefined
+        ? cloneBoard(checkpointFallback)
+        : folded;
     selfCtx = ctx;
     activeCwd = ctx.cwd;
     currentView = view;
@@ -1731,7 +1866,7 @@ export default function towerDoExtension(pi: ExtensionAPI): void {
     label: "TowerDo",
     description: `Maintain the shared multi-agent task board with one atomic update.
 - Full replacement at the task level: include every key to keep; any current key omitted from the list is removed (an omitted task owned by another agent is rejected instead of dropped — replay peers' and unowned tasks you did not mean to lose). Fields are per-field: omitted optional fields on an existing key are preserved, and new keys require subject and status.
-- Owner guard: a task with an owner can only be changed (any field) or removed by its owner or the "tower" identity. Exception: an owner idle for 30+ min (OWNER_TAKEOVER_MS) may be displaced on a non-completed task — adopt it by setting owner to yourself and changing nothing else in that write (any content edit in the same write is rejected; re-plan in a second write), or remove it; completed tasks stay guarded.
+- Owner guard: a task with an owner can only be changed (any field) or removed by its owner or the "tower" identity. Exception: an owner whose activity ON THAT TASK is older than ${formatTakeoverWindow()} (TASK_CLAIM_STALE_MS; unrelated board chatter does not protect a row) may be displaced on a non-completed task — adopt it by setting owner to yourself and changing nothing else in that write (any content edit in the same write is rejected; re-plan in a second write), or remove it; completed tasks stay guarded.
 - Dependencies gate status: in_progress/completed require every dependsOn entry to be completed, dependsOn keys must exist on the board or in this call, and cycles are rejected (blocked is exempt).
 - Set changedFiles only in the same write that completes a task; reopening a task without changedFiles voids the inherited receipt.
 - Content limits (subject ${MAX_TASK_SUBJECT_CHARS} / description ${MAX_TASK_DESCRIPTION_CHARS} characters) are enforced per task and a violation names the task key, so fix that one row instead of resending everything. An omitted field on an existing task is preserved (send only what changes); long-form evidence belongs in a tower_do_talk message or a finding, not in description.
@@ -1745,7 +1880,7 @@ export default function towerDoExtension(pi: ExtensionAPI): void {
       "When a task needs a plan of 3+ steps, define it yourself and call tower_do with subject + status before beginning substantive work.",
       "Include baseRevision (from tower_do_status) in every tower_do call; a stale revision is rejected so you never silently overwrite a peer's update.",
       "Mark a task completed only after implementation and verification succeed, attaching changedFiles (files you actually changed, repo-relative) in the same call. Use status blocked with a blockedBy note instead of leaving it hanging.",
-      "Claim shared tasks by setting owner and in_progress together. Only the owner or the orchestrator identity tower may change an owned task's fields or remove it — to remove or reassign another agent's task, message the owner via tower_do_talk instead of editing it directly. If a task's owner has been idle for 30+ minutes, you may adopt it (set owner to yourself and change nothing else in that write) or remove it while it is not completed; completed tasks stay with their owner.",
+      "Claim shared tasks by setting owner and in_progress together. Only the owner or the orchestrator identity tower may change an owned task's fields or remove it — to remove or reassign another agent's task, message the owner via tower_do_talk instead of editing it directly. If a task's owner has been idle on THAT task for " + formatTakeoverWindow() + "+ (unrelated board activity does not count), you may adopt it (set owner to yourself and change nothing else in that write) or remove it while it is not completed; completed tasks stay with their owner.",
       "Reconcile actual progress with the shared board before your final response, and do not issue a no-op tower_do call only to acknowledge a reminder.",
     ],
     parameters: TowerDoParamsSchema,
@@ -1753,11 +1888,56 @@ export default function towerDoExtension(pi: ExtensionAPI): void {
 
     async execute(_toolCallId, params, signal, _onUpdate, ctx) {
       throwIfAborted(signal, "TowerDo update");
+      if (params.action === "gc") {
+        // Explicit, never periodic: only the orchestrator may rewrite the
+        // shared log, and it must not carry task rows.
+        const gc = await prepare(ctx, params.as);
+        if (params.tasks.length > 0) {
+          throw new TowerDoValidationError(
+            'action="gc" compacts the log and takes no task rows — pass tasks: []',
+          );
+        }
+        if (gc.caller !== TOWER_IDENTITY) {
+          throw new TowerDoValidationError(
+            `action="gc" requires the orchestrator identity "${TOWER_IDENTITY}" (got "${gc.caller}") — compaction rewrites the shared log`,
+          );
+        }
+        // The only destructive path without an abort check until now: a
+        // cancelled call must not rewrite and archive the shared log. Checked
+        // again once the in-process queue is actually held (the wait for it
+        // can be long).
+        throwIfAborted(signal, "TowerDo gc");
+        const result = await withFileMutationQueue(gc.board.file, () => {
+          throwIfAborted(signal, "TowerDo gc");
+          return gc.board.compact({
+            by: gc.caller,
+            archive: true,
+            dropSkipped: params.dropSkipped === true,
+          });
+        });
+        currentView = await foldRetained(ctx.cwd);
+        updateWidget(ctx);
+        return {
+          content: [
+            {
+              type: "text",
+              text:
+                `TowerDo log compacted at revision ${String(result.revision)} — ` +
+                `${String(result.kept.tasks)} task(s), ${String(result.kept.messages)} message(s), ${String(result.kept.findings)} finding(s) kept; ` +
+                `${(result.bytesBefore / 1024).toFixed(0)}KB → ${(result.bytesAfter / 1024).toFixed(0)}KB` +
+                (result.archived === undefined
+                  ? ""
+                  : `\narchived: ${result.archived}`),
+            },
+          ],
+          details: { caller: gc.caller, gc: result },
+        };
+      }
       const { board, caller } = await prepare(ctx, params.as);
       return withFileMutationQueue(board.file, async () => {
-        // Re-fold INSIDE the mutation queue: the revision guard and diff must
-        // see the freshest events, or a same-process call that appended
-        // between prepare() and the queue would be silently clobbered.
+        const { details, activity } = await board.withWriteLock(async (appendLocked) => {
+        // Re-fold inside both queues: the revision guard must observe peer
+        // appends before it decides whether the full replacement is stale.
         throwIfAborted(signal, "TowerDo update");
         const freshView = await foldRetained(ctx.cwd);
         throwIfAborted(signal, "TowerDo update");
@@ -1825,13 +2005,15 @@ export default function towerDoExtension(pi: ExtensionAPI): void {
           staleOwners,
         );
         throwIfAborted(signal, "TowerDo update");
-        await board.append(details.taskEvents);
+        await appendLocked(details.taskEvents);
+        return { details, activity };
+        });
         currentView = cloneBoard(details.view);
         llmCallsSinceReminder = 0;
         updateWidget(ctx);
         // Presence footnote: surface owners who own unfinished tasks but have
         // no recent activity, so a coordinator sees who may be stalled. The
-        // Same parsed activity as the takeover check above — full history
+        // same parsed activity as the takeover check above — full history
         // makes the idle mark strictly more accurate than the old 200-line
         // tail.
         const now = Date.now();
@@ -1856,7 +2038,7 @@ export default function towerDoExtension(pi: ExtensionAPI): void {
                 )
                 .join(
                   ", ",
-                )} — message them (tower_do_talk), adopt their task via tower_do (set owner to yourself, 30+ min idle), or re-claim via tower`;
+                )} — message them (tower_do_talk), adopt their task via tower_do (set owner to yourself after ${formatTakeoverWindow()} of per-task inactivity), or re-claim via tower`;
         return {
           content: [{ type: "text", text: base + footnote }],
           details: {
@@ -1943,12 +2125,13 @@ export default function towerDoExtension(pi: ExtensionAPI): void {
     name: TOWER_DO_TALK_TOOL_NAME,
     label: "TowerDo Talk",
     description:
-      'Cross-agent communication on the shared tower-do board. action=send delivers an inbox message to "all", the orchestrator identity "tower", a current task owner, or anyone with recent board activity (self-send rejected); taskKey optionally threads it under a task. action=inbox lists messages addressed to you or "all", newest first, and ACKS the ones it shows (marks them read; acked messages can be retired) — use tower_do_status to read messages without acking. action=finding files a structured out-of-scope finding (bug|improve|vuln|idea) with severity/location/suggestedFix, or updates a finding\'s status via findingId + status. Use findings instead of silently editing other-owned tasks.',
+      'Cross-agent communication on the shared tower-do board. action=send delivers an inbox message to "all", the orchestrator identity "tower", a current task owner, or anyone with recent board activity (self-send rejected); taskKey optionally threads it under a task. action=inbox lists messages addressed to you or "all", newest first, and ACKS the ones it shows (marks them read; acked messages can be retired) — use tower_do_status to read messages without acking. action=finding files a structured out-of-scope finding (bug|improve|vuln|idea) with severity/location/suggestedFix, or updates one or many (findingId or findingIds + status): accepted claims it (owner defaults to you), done|rejected|snoozed require a reason, snoozed needs a future snoozeUntil, and open reopens. Non-closed findings are budgeted (50); a snooze still occupies a slot, so close (done|rejected) to free one before filing past the cap. Every open finding is listed oldest-debt-first. Use findings instead of silently editing other-owned tasks.',
     promptSnippet:
       "Send addressed messages or file findings on the shared multi-agent board",
     promptGuidelines: [
       'Use tower_do_talk to communicate with task owners on the shared board instead of editing owned tasks directly; the recipient must be "all", "tower", a current task owner, or someone with recent board activity (e.g. a peer whose tasks are all completed).',
       "Use action=finding (not direct edits) when you discover an out-of-scope problem — file it with kind/severity/summary/suggestedFix so the owning agent and reviewers can route it.",
+      "Findings have a lifecycle, not just a create: claim one you take on (status=accepted, owner defaults to you), and close it (done/rejected) or snooze it with a reason when you are finished — a live owner sitting on a claimed finding past the grace period is blocked from filing new ones, and the non-closed budget is 50.",
       "Keep message bodies brief and reference files by path; the board persists everything, so pointer-style notes keep context lean.",
       "Prefer tower_do_status over action=inbox when you only need to read messages: inbox acknowledges what it shows, status does not.",
     ],
@@ -2009,6 +2192,12 @@ export default function towerDoExtension(pi: ExtensionAPI): void {
           ...(params.taskKey === undefined ? {} : { taskKey: params.taskKey }),
         };
         await withFileMutationQueue(board.file, async () => {
+        // The lease spans the fold, the existence/recipient checks, the
+        // audience snapshot and the append: `append` alone takes the lease
+        // AFTER those checks, so a peer could delete the task in between and
+        // the persisted message would carry a dangling taskKey (the same
+        // reason tower_do and the finding paths use withWriteLock).
+        await board.withWriteLock(async (appendLocked) => {
           throwIfAborted(signal, "TowerDo talk");
           const fresh = await foldRetained(ctx.cwd);
           throwIfAborted(signal, "TowerDo talk");
@@ -2028,7 +2217,10 @@ export default function towerDoExtension(pi: ExtensionAPI): void {
           // owner but exactly who hand-off coordination needs to reach.
           let recentActivity = new Set<string>();
           try {
-            const raw = await board.rawTail(200);
+            // FULL log, not a bounded tail: a 200-line window can fall behind
+            // a churny fleet and turn a recently active peer into an "unknown
+            // recipient" — the same reason the takeover gate reads rawLines().
+            const raw = await board.rawLines();
             const parsed: ActivityEntry[] = [];
             for (const line of raw) {
               const entry = parseActivityLine(line);
@@ -2065,7 +2257,7 @@ export default function towerDoExtension(pi: ExtensionAPI): void {
               : { audience }),
           };
           throwIfAborted(signal, "TowerDo talk");
-          await board.append([
+          await appendLocked([
             { kind: "message", message, by: caller, at: now },
           ]);
           currentView = cloneBoard({
@@ -2074,6 +2266,7 @@ export default function towerDoExtension(pi: ExtensionAPI): void {
           });
           llmCallsSinceReminder = 0;
           updateWidget(ctx);
+        });
         });
         return {
           content: [
@@ -2092,54 +2285,47 @@ export default function towerDoExtension(pi: ExtensionAPI): void {
         // Reading your inbox acks the messages shown (LWW readBy update): the
         // sender learns you saw them, and fully-read history can be retired.
         return withFileMutationQueue(board.file, async () => {
-          throwIfAborted(signal, "TowerDo talk");
-          const fresh = await foldRetained(ctx.cwd);
-          throwIfAborted(signal, "TowerDo talk");
-          const mine = messagesToMe(fresh, caller)
+        throwIfAborted(signal, "TowerDo talk");
+        // `all` reads the full fold (view-retired messages included); the
+        // default reads the retained view, so an inbox never resurfaces what
+        // the board deliberately retired from the display layer.
+        const readFold = async (): Promise<TowerBoardView> =>
+          params.all ? await board.fold() : await foldRetained(ctx.cwd);
+        const myInbox = (view: TowerBoardView): TowerDoMessage[] =>
+          messagesToMe(view, caller)
             .sort((a, b) => b.at - a.at)
             .slice(0, limit);
+        const inboxResult = (
+          fresh: TowerBoardView,
+          mine: TowerDoMessage[],
+          ackedIds: ReadonlySet<string>,
+        ): {
+          content: { type: "text"; text: string }[];
+          details: { caller: string; inbox: TowerDoMessage[] };
+        } => {
           if (mine.length === 0) {
             return {
               content: [
-                {
-                  type: "text",
-                  text: `TowerDo inbox empty for ${caller}.`,
-                },
+                { type: "text" as const, text: `TowerDo inbox empty for ${caller}.` },
               ],
               details: { caller, inbox: [] },
             };
           }
-          const unacked = mine.filter(
-            (message) => !identityListHas(message.readBy, caller),
-          );
-          if (unacked.length > 0) {
-            throwIfAborted(signal, "TowerDo talk");
-            await board.append(
-              unacked.map((message) => ({
-                kind: "message" as const,
-                message: {
-                  ...message,
-                  readBy: readByWith(message.readBy, caller),
-                },
-                by: caller,
-                at: now2,
-              })),
-            );
-          }
-          const updatedMessages = mine.map((message) =>
-            identityListHas(message.readBy, caller)
-              ? message
-              : { ...message, readBy: readByWith(message.readBy, caller) },
-          );
+          const withAcks = (message: TowerDoMessage): TowerDoMessage =>
+            ackedIds.has(message.id) && !identityListHas(message.readBy, caller)
+              ? { ...message, readBy: readByWith(message.readBy, caller) }
+              : message;
+          const updatedMessages = mine.map(withAcks);
           currentView = cloneBoard({
             ...fresh,
-            messages: fresh.messages.map((message) =>
-              unacked.some((unackedMessage) => unackedMessage.id === message.id)
-                ? {
-                    ...message,
-                    readBy: readByWith(message.readBy, caller),
-                  }
-                : message,
+            // `all` must not leak retired history back into the shared view:
+            // re-apply the retention projection before publishing it to the
+            // widget/status/reminder paths.
+            messages: retainMessages(
+              fresh.messages.map(withAcks),
+              fresh,
+              MESSAGE_RETENTION,
+              now2,
             ),
           });
           llmCallsSinceReminder = 0;
@@ -2151,61 +2337,289 @@ export default function towerDoExtension(pi: ExtensionAPI): void {
           return {
             content: [
               {
-                type: "text",
-                text: `TowerDo inbox for ${caller} (${mine.length}${unacked.length > 0 ? `, ${unacked.length} newly acked` : ""}):\n${lines.join("\n")}`,
+                type: "text" as const,
+                text: `TowerDo inbox for ${caller} (${String(mine.length)}${ackedIds.size > 0 ? `, ${String(ackedIds.size)} newly acked` : ""}):\n${lines.join("\n")}`,
               },
             ],
             details: { caller, inbox: updatedMessages },
           };
+        };
+        // Fast path: with nothing of mine unacked this is a PURE READ, so it
+        // must not take the cross-process write lease — a read-only state dir
+        // still has to serve an inbox, and a peer mid-compact must not stall a
+        // read for up to LOCK_WAIT_MS.
+        const peek = await readFold();
+        throwIfAborted(signal, "TowerDo talk");
+        const peekMine = myInbox(peek);
+        if (
+          !peekMine.some((message) => !identityListHas(message.readBy, caller))
+        ) {
+          return inboxResult(peek, peekMine, new Set());
+        }
+        // There IS something to ack: the fold, the ack set and the append must
+        // be one atomic step across processes, or two peers acking the same
+        // message lose one `readBy` entry to last-write-wins.
+        return board.withWriteLock(async (appendLocked) => {
+          throwIfAborted(signal, "TowerDo talk");
+          const fresh = await readFold();
+          throwIfAborted(signal, "TowerDo talk");
+          const unacked = myInbox(fresh).filter(
+            (message) => !identityListHas(message.readBy, caller),
+          );
+          if (unacked.length > 0) {
+            throwIfAborted(signal, "TowerDo talk");
+            await appendLocked(
+              unacked.map((message) => ({
+                kind: "message" as const,
+                message: {
+                  ...message,
+                  readBy: readByWith(message.readBy, caller),
+                },
+                by: caller,
+                at: now2,
+              })),
+            );
+          }
+          return inboxResult(
+            fresh,
+            myInbox(fresh),
+            new Set(unacked.map((message) => message.id)),
+          );
+        });
         });
       }
 
-      // action === finding
-      if (params.findingId !== undefined) {
-        const updated = await withFileMutationQueue(board.file, async () => {
-          throwIfAborted(signal, "TowerDo talk");
-          // Re-fold inside the queue: the finding may have changed since the
-          // pre-queue fold in prepare().
-          const fresh = await foldRetained(ctx.cwd);
-          throwIfAborted(signal, "TowerDo talk");
-          const existing = fresh.findings.find(
-            (finding) => finding.id === params.findingId,
+      // action === finding (update one or a batch)
+      if (params.findingId !== undefined && params.findingIds !== undefined) {
+        throw new TowerDoValidationError(
+          "finding update accepts either findingId or findingIds, not both",
+        );
+      }
+      const targetIds =
+        params.findingIds !== undefined
+          ? [
+              ...new Set(
+                params.findingIds.map((id) => id.trim()).filter(Boolean),
+              ),
+            ]
+          : params.findingId !== undefined
+            ? [params.findingId]
+            : undefined;
+      if (targetIds !== undefined) {
+        if (targetIds.length === 0) {
+          throw new TowerDoValidationError(
+            "findingIds must name at least one finding",
           );
-          if (existing === undefined) {
+        }
+        if (targetIds.length > MAX_TOWER_DO_OPEN_FINDINGS) {
+          throw new TowerDoValidationError(
+            `findingIds names ${String(targetIds.length)} findings (max ${String(MAX_TOWER_DO_OPEN_FINDINGS)}) — split the batch across successive calls`,
+          );
+        }
+        if (!FINDING_STATUSES.has(params.status ?? "")) {
+          throw new TowerDoValidationError(
+            "finding update requires status in open|accepted|snoozed|rejected|done",
+          );
+        }
+        const nextStatus = params.status as FindingStatus;
+        const reason = params.reason?.trim();
+        // Closing/held without a reason is the silent-wrong class the board
+        // exists to prevent: the transition must say why.
+        if (
+          (nextStatus === "done" ||
+            nextStatus === "rejected" ||
+            nextStatus === "snoozed") &&
+          !reason
+        ) {
+          throw new TowerDoValidationError(
+            `finding status=${nextStatus} requires a reason (single line, max ${MAX_FINDING_REASON_CHARS} chars)`,
+          );
+        }
+        if (reason && /[\r\n\u2028\u2029]/.test(reason)) {
+          throw new TowerDoValidationError(
+            "finding reason must be a single line",
+          );
+        }
+        if (reason && textLength(reason) > MAX_FINDING_REASON_CHARS) {
+          throw new TowerDoValidationError(
+            `finding reason is ${textLength(reason)} characters (max ${MAX_FINDING_REASON_CHARS}) — shorten it`,
+          );
+        }
+        let snoozeUntil: number | undefined;
+        if (nextStatus === "snoozed") {
+          snoozeUntil = params.snoozeUntil ?? now + FINDING_SNOOZE_MAX_MS;
+          if (!Number.isSafeInteger(snoozeUntil) || snoozeUntil <= now) {
             throw new TowerDoValidationError(
-              `unknown finding ${params.findingId}`,
+              "finding snoozeUntil must be a future epoch-ms value",
             );
           }
-          if (!FINDING_STATUSES.has(params.status ?? "")) {
+          if (snoozeUntil > now + FINDING_SNOOZE_MAX_MS) {
             throw new TowerDoValidationError(
-              "finding update requires status in open|accepted|rejected|done",
+              `finding snoozeUntil is more than ${String(Math.round(FINDING_SNOOZE_MAX_MS / 86_400_000))}d ahead — a snooze defers a finding, it never resolves it`,
             );
           }
-          const next: TowerDoFinding = {
-            ...existing,
-            status: params.status as FindingStatus,
-            at: now,
-          };
-          throwIfAborted(signal, "TowerDo talk");
-          await board.append([
-            { kind: "finding", finding: next, by: caller, at: now },
-          ]);
-          currentView = cloneBoard({
-            ...fresh,
-            findings: fresh.findings.map((f) => (f.id === next.id ? next : f)),
-          });
-          updateWidget(ctx);
-          return next;
-        });
+        }
+        const explicitOwner = params.owner?.trim();
+        if (explicitOwner && /[\r\n\u2028\u2029]/.test(explicitOwner)) {
+          throw new TowerDoValidationError(
+            "finding owner must be a single line",
+          );
+        }
+        if (explicitOwner && textLength(explicitOwner) > MAX_IDENTITY_CHARS) {
+          throw new TowerDoValidationError(
+            `finding owner is ${textLength(explicitOwner)} characters (max ${MAX_IDENTITY_CHARS}) — shorten it`,
+          );
+        }
+        if (
+          explicitOwner &&
+          // Permission is EXACT, never aliased: `sameAgent` would hand a
+          // bucket sibling (a different session inside the same 65.5s label
+          // bucket) authority over someone else's claim.
+          explicitOwner !== caller &&
+          caller !== TOWER_IDENTITY
+        ) {
+          throw new TowerDoValidationError(
+            `finding owner may only be reassigned by ${TOWER_IDENTITY} (got "${explicitOwner}")`,
+          );
+        }
+        const updatedFindings = await board.withWriteLock(
+          async (appendLocked) => {
+            throwIfAborted(signal, "TowerDo talk");
+            // Re-fold inside the lease: the findings may have changed since
+            // the pre-queue fold in prepare(). The lease spans the fold, the
+            // budget check and the append, so a concurrent process cannot
+            // slip an extra non-closed finding between them.
+            const fresh = await foldRetained(ctx.cwd);
+            throwIfAborted(signal, "TowerDo talk");
+            const byId = new Map(
+              fresh.findings.map((finding) => [finding.id, finding]),
+            );
+            const missing = targetIds.filter((id) => !byId.has(id));
+            if (missing.length > 0) {
+              throw new TowerDoValidationError(
+                `unknown finding ${missing.join(", ")}`,
+              );
+            }
+            const liveRead = await readLiveOwners(ctx.cwd);
+            const events: BoardEvent[] = [];
+            const next: TowerDoFinding[] = [];
+            for (const id of targetIds) {
+              const existing = byId.get(id)!;
+              // Accountability guard: a LIVE claim belongs to its owner (or
+              // tower). A stale/dead claim is adoptable — liveness only
+              // decides who may act, never whether the finding is resolved.
+              // EXACT label match: CONTRACTS.md "permission is exact, only
+              // delivery and display alias" — a legacy/current bucket sibling
+              // must not be able to change this claim.
+              if (
+                existing.owner !== undefined &&
+                existing.owner !== caller &&
+                caller !== TOWER_IDENTITY &&
+                (!liveRead.complete || liveRead.owners.has(existing.owner))
+              ) {
+                throw new TowerDoValidationError(
+                  `finding ${id} is claimed by "${existing.owner}" (live) — only its owner or ${TOWER_IDENTITY} may change it`,
+                );
+              }
+              const effectiveOwner =
+                nextStatus === "accepted"
+                  ? (explicitOwner ??
+                    (existing.owner === undefined
+                      ? caller
+                      : existing.owner === caller ||
+                          caller === TOWER_IDENTITY
+                        ? existing.owner
+                        : // Reaching here means the guard let a non-owner,
+                          // non-tower caller through because the claim was not
+                          // live: this is a takeover, so the claimer owns it.
+                          caller))
+                  : nextStatus === "open"
+                    ? undefined
+                    : existing.owner;
+              const row: TowerDoFinding = {
+                ...existing,
+                status: nextStatus,
+                at: now,
+              };
+              if (effectiveOwner === undefined) delete row.owner;
+              else row.owner = effectiveOwner;
+              if (reason === undefined) delete row.reason;
+              else row.reason = reason;
+              if (nextStatus === "snoozed" && snoozeUntil !== undefined) {
+                row.snoozeUntil = snoozeUntil;
+              } else {
+                delete row.snoozeUntil;
+              }
+              next.push(row);
+              events.push({
+                kind: "finding",
+                finding: row,
+                by: caller,
+                at: now,
+              });
+            }
+            throwIfAborted(signal, "TowerDo talk");
+            // Reopening (`status=open`) a closed finding adds a non-closed row,
+            // so the update path must enforce the same budget the create path
+            // does — otherwise close/reopen cycles bypass the cap.
+            const byIdNextProbe = new Map(
+              next.map((finding) => [finding.id, finding]),
+            );
+            const mergedFindings = fresh.findings.map(
+              (finding) => byIdNextProbe.get(finding.id) ?? finding,
+            );
+            const beforeOpen = openFindingCount(fresh.findings);
+            const afterOpen = openFindingCount(mergedFindings);
+            // Only an increase can breach the budget — and only a reopen can
+            // increase it. Blocking any over-cap update would make a legacy
+            // board (e.g. the 73-open motivating case) impossible to drain:
+            // closing one row from 52 leaves 51, still > 50, and must be
+            // allowed.
+            if (
+              afterOpen > beforeOpen &&
+              afterOpen > MAX_TOWER_DO_OPEN_FINDINGS
+            ) {
+              throw new TowerDoValidationError(
+                `this update would grow non-closed findings over the budget (${String(MAX_TOWER_DO_OPEN_FINDINGS)}): ${String(beforeOpen)} -> ${String(afterOpen)}. A snooze still occupies a slot, so close one (done|rejected) first — tower_do_talk action=finding findingIds=[…] status=done|rejected reason=…`,
+              );
+            }
+            await appendLocked(events);
+            const byIdNext = new Map(
+              next.map((finding) => [finding.id, finding]),
+            );
+            currentView = cloneBoard({
+              ...fresh,
+              findings: fresh.findings.map(
+                (finding) => byIdNext.get(finding.id) ?? finding,
+              ),
+            });
+            updateWidget(ctx);
+            return next;
+          },
+        );
+        const ids = updatedFindings.map((finding) => finding.id);
         return {
           content: [
             {
               type: "text",
-              text: `TowerDo finding ${updated.id} updated → ${updated.status}`,
+              text:
+                ids.length === 1
+                  ? `TowerDo finding ${ids[0]} updated → ${nextStatus}`
+                  : `TowerDo findings updated → ${nextStatus}: ${ids.join(", ")}`,
             },
           ],
-          details: { caller, findingId: updated.id, status: updated.status },
+          details: { caller, findingIds: ids, status: nextStatus },
         };
+      }
+      if (
+        params.status !== undefined ||
+        params.owner !== undefined ||
+        params.reason !== undefined ||
+        params.snoozeUntil !== undefined
+      ) {
+        throw new TowerDoValidationError(
+          "status/owner/reason/snoozeUntil apply to a finding UPDATE (pass findingId or findingIds); a new finding is always filed open — file it, then claim it via status=accepted",
+        );
       }
       const kind = params.kind as FindingKind | undefined;
       if (!kind || !FINDING_KINDS.has(kind)) {
@@ -2265,11 +2679,28 @@ export default function towerDoExtension(pi: ExtensionAPI): void {
         from: caller,
         at: now,
       };
-      await withFileMutationQueue(board.file, async () => {
+      await board.withWriteLock(async (appendLocked) => {
         throwIfAborted(signal, "TowerDo talk");
         const fresh = await foldRetained(ctx.cwd);
         throwIfAborted(signal, "TowerDo talk");
-        await board.append([{ kind: "finding", finding, by: caller, at: now }]);
+        // Exit mechanism (Layer 1): the budget is charged to every non-closed
+        // finding, and a live owner with an overdue claim must close it first.
+        // Both bars carry an executable remedy in the message. The lease held
+        // by withWriteLock makes the count-and-append atomic across processes.
+        const liveOwners = effectiveLiveOwners(
+          fresh,
+          await readLiveOwners(ctx.cwd),
+        );
+        const rejection = findingBudgetRejection(
+          fresh.findings,
+          now,
+          liveOwners,
+          caller,
+        );
+        if (rejection !== undefined) {
+          throw new TowerDoValidationError(rejection);
+        }
+        await appendLocked([{ kind: "finding", finding, by: caller, at: now }]);
         currentView = cloneBoard({
           ...fresh,
           findings: [...fresh.findings, finding],
@@ -2410,13 +2841,39 @@ export default function towerDoExtension(pi: ExtensionAPI): void {
       const allMyMessages = messagesToMe(view, caller).sort((a, b) => b.at - a.at);
       const myMessages = allMyMessages.slice(0, DASHBOARD_LIST_LIMIT);
       const myUnread = unreadMessagesToMe(view, caller).length;
-      const allOpenFindings = view.findings
-        .filter(
-          (finding) =>
-            finding.status === "open" || finding.status === "accepted",
-        )
-        .sort((a, b) => b.at - a.at);
-      const openFindings = allOpenFindings.slice(0, DASHBOARD_LIST_LIMIT);
+      // Finding exit mechanism (Layer 1/2): liveness decides claimed vs
+      // actionable, every non-closed row is budget, and the page is ordered by
+      // PRESSURE (oldest overdue first) so the dashboard and the budget error
+      // name the same rows. `view=all` widens to every row including snoozed
+      // and closed-within-grace; the default list is the actionable/claimed
+      // set and the rest are counts plus a disclosure.
+      const liveOwners = effectiveLiveOwners(
+        view,
+        await readLiveOwners(ctx.cwd),
+      );
+      // A digest-restored view carries no closed rows, so a fresh summarize
+      // would report `closed: 0 / retired: 0` as fact; the helper takes those
+      // two from the checkpoint and keeps the live states fresh.
+      const findingCounts = findingCountsFor(view, now, liveOwners);
+      const findingOpenCount = openFindingCount(view.findings);
+      // Layer 2 outer bound first (closed past the grace are retired), then the
+      // default state filter (actionable/claimed). `view=all` ignores both.
+      const visibleFindings = retainFindings(view.findings, now);
+      const findingRows =
+        params.view === "all"
+          ? findingPressureOrder(view.findings, now, liveOwners)
+          : findingPressureOrder(
+              visibleFindings.filter((finding) => {
+                const state = deriveFindingState(finding, now, liveOwners);
+                return state === "actionable" || state === "claimed";
+              }),
+              now,
+              liveOwners,
+            );
+      const openFindings =
+        params.view === "all"
+          ? findingRows
+          : findingRows.slice(0, DASHBOARD_LIST_LIMIT);
       // P1: derived scope × changedFiles advisory. Pure read, rendered as a
       // dedicated section (not per-row suffix) so long scope lists don't
       // explode every task line.
@@ -2483,8 +2940,23 @@ export default function towerDoExtension(pi: ExtensionAPI): void {
           `- id: ${finding.id}`,
           `- kind/severity: ${finding.kind} / ${finding.severity}`,
           `- status: ${finding.status}`,
-          `- from: ${finding.from} (${new Date(finding.at).toISOString()})`,
         ];
+        detail.push(
+          view.incomplete === true
+            ? "- from: unavailable (restored from a bounded checkpoint — no timestamp or author is kept)"
+            : `- from: ${finding.from} (${new Date(finding.at).toISOString()})`,
+        );
+        if (finding.owner !== undefined) {
+          detail.push(`- owner: ${finding.owner}`);
+        }
+        if (finding.reason !== undefined) {
+          detail.push(`- reason: ${finding.reason}`);
+        }
+        if (finding.snoozeUntil !== undefined) {
+          detail.push(
+            `- snoozeUntil: ${new Date(finding.snoozeUntil).toISOString()}`,
+          );
+        }
         if (finding.location !== undefined) {
           detail.push(`- location: ${finding.location}`);
         }
@@ -2532,8 +3004,15 @@ export default function towerDoExtension(pi: ExtensionAPI): void {
           `TowerDo task ${task.key} — revision ${view.revision} (board file: ${board.file})`,
           `- subject: ${task.subject}`,
           `- status: ${task.status}${ownerNote}`,
-          `- updatedAt: ${relativeTime(now, task.updatedAt)} (${new Date(task.updatedAt).toISOString()})`,
+          view.incomplete === true
+            ? "- updatedAt: unavailable (restored from a bounded checkpoint — no timestamps are kept)"
+            : `- updatedAt: ${relativeTime(now, task.updatedAt)} (${new Date(task.updatedAt).toISOString()})`,
         ];
+        if (view.incomplete === true) {
+          detail.push(
+            "⚠ board file is missing — this detail comes from the last bounded checkpoint (open fields only); full content is unavailable.",
+          );
+        }
         if (task.dependsOn.length > 0) {
           const unresolved = findAllUnresolvedDeps(task, view);
           detail.push(
@@ -2582,6 +3061,63 @@ export default function towerDoExtension(pi: ExtensionAPI): void {
         `TowerDo shared board — identity ${caller}, revision ${view.revision}`,
       );
       lines.push(`Board file: ${board.file}`);
+      if (view.incomplete === true) {
+        lines.push(
+          "⚠ this view is a bounded checkpoint from a previous session's transcript (open tasks + finding titles only; full content unavailable) — the board file was missing when it was restored. Writes treat a missing file as an empty board.",
+        );
+      } else if (!existsSync(board.file)) {
+        lines.push(
+          "⚠ the board file is missing — this is an empty fold. Writes treat the missing file as an empty board.",
+        );
+      }
+      // Board exit / log observability (Layer C): make "which board is growing"
+      // a fact instead of something the user has to find in ~/.pi/tower-do.
+      let logLines = 0;
+      let logBytes = 0;
+      let compactRev: number | undefined;
+      try {
+        const size = statSync(board.file).size;
+        const allLines = await board.rawLines();
+        logLines = allLines.length;
+        logBytes = size;
+        try {
+          const head: unknown = JSON.parse(allLines[0] ?? "null");
+          if (
+            head !== null &&
+            typeof head === "object" &&
+            (head as { kind?: unknown }).kind === "compact" &&
+            typeof (head as { revision?: unknown }).revision === "number"
+          ) {
+            compactRev = (head as { revision: number }).revision;
+          }
+        } catch {
+          // Legacy log without a compact header.
+        }
+      } catch {
+        // Missing/unreadable board: leave the counters at zero.
+      }
+      if (logLines > 0 || logBytes > 0) {
+        lines.push(
+          `State: ${basename(dirname(board.file))} · log ${String(logLines)} line(s) / ${(logBytes / 1024).toFixed(0)}KB` +
+            (compactRev === undefined
+              ? ""
+              : ` · compact rev ${String(compactRev)}`),
+        );
+      }
+      const logIsLarge =
+        logLines >= BOARD_COMPACT_HINT_LINES ||
+        logBytes >= BOARD_COMPACT_HINT_BYTES;
+      if (logIsLarge || view.skipped > 0) {
+        lines.push(
+          (logIsLarge
+            ? `Log is large (${String(logLines)} lines, ${(logBytes / (1024 * 1024)).toFixed(1)}MB)`
+            : `Log holds unfoldable data (${String(logLines)} lines, ${(logBytes / (1024 * 1024)).toFixed(1)}MB)`) +
+            (view.skipped > 0
+              ? `${logIsLarge ? " and" : ""} ${String(view.skipped)} line(s) cannot be folded`
+              : "") +
+            ' — compact explicitly with tower_do action:"gc" (tower only; archives the old log only after the CAS passes, immediately before the rename). Never automatic.',
+        );
+      }
       // D4: board liveness at a glance. revision is monotonic but silent —
       // a coordinator needs to know how stale the board is and who last
       // moved it (pure read derivation from the activity tail, zero writes).
@@ -2812,11 +3348,13 @@ export default function towerDoExtension(pi: ExtensionAPI): void {
 
       lines.push("");
       lines.push(
-        `## Open findings (${openFindings.length}${
-          allOpenFindings.length > openFindings.length
-            ? ` of ${allOpenFindings.length}`
-            : ""
-        })`,
+        `${params.view === "all" ? "## Findings" : "## Open findings"} (${String(findingOpenCount)}/${String(MAX_TOWER_DO_OPEN_FINDINGS)} non-closed · ` +
+          `${String(findingCounts.actionable)} actionable · ${String(findingCounts.claimed)} claimed · ` +
+          `${String(findingCounts.snoozed)} snoozed · ${String(findingCounts.closed)} closed<${String(Math.round(FINDING_CLOSE_GRACE_MS / 86_400_000))}d` +
+          (findingCounts.retired > 0
+            ? ` · ${String(findingCounts.retired)} retired`
+            : "") +
+          ")",
       );
       for (const finding of openFindings) {
         const location =
@@ -2828,11 +3366,45 @@ export default function towerDoExtension(pi: ExtensionAPI): void {
           finding.summary.split("\n")[0] ?? "",
           DASHBOARD_FINDING_LINE_CHARS,
         );
+        const state = deriveFindingState(finding, now, liveOwners);
+        const age = Math.max(0, Math.floor((now - finding.at) / 86_400_000));
+        // A digest-only fallback carries no real timestamps (`at` is 0), so an
+        // age/overdue tag would read as decades old — omit it instead.
+        const tag =
+          view.incomplete === true
+            ? ""
+            : state === "snoozed"
+              ? ` snoozed ${String(
+                  Math.max(
+                    0,
+                    Math.ceil(((finding.snoozeUntil ?? now) - now) / 86_400_000),
+                  ),
+                )}d more`
+              : state === "claimed"
+                ? ` claimed by ${finding.owner ?? "?"} ${String(age)}d`
+                : now - finding.at > FINDING_CLOSE_GRACE_MS
+                  ? ` ${String(age)}d overdue`
+                  : ` ${String(age)}d`;
+        const owner =
+          finding.owner === undefined ? "" : ` (owed to ${finding.owner})`;
+        const from = finding.from === "" ? "" : ` (${finding.from})`;
         lines.push(
-          `- [${finding.id}] [${finding.severity}/${finding.kind}] ${finding.title} (${finding.from})${location} — ${summary}`,
+          `- [${finding.id}] [${finding.severity}/${finding.kind}] ${finding.title}${from}${owner}${location} — ${summary}${tag}`,
         );
       }
       if (openFindings.length === 0) lines.push("(none)");
+      if (findingRows.length > openFindings.length) {
+        lines.push(
+          `  … +${String(findingRows.length - openFindings.length)} more finding(s) not shown — view=all lists every row (oldest debt first)`,
+        );
+      }
+      if (findingCounts.retired > 0) {
+        lines.push(
+          view.incomplete === true
+            ? `  … ${String(findingCounts.retired)} closed finding(s) retired beyond ${String(Math.round(FINDING_CLOSE_GRACE_MS / 86_400_000))}d — not in this checkpoint (the board file is missing; their full text is unavailable)`
+            : `  … ${String(findingCounts.retired)} closed finding(s) retired beyond ${String(Math.round(FINDING_CLOSE_GRACE_MS / 86_400_000))}d — view=all lists them, findingId reads full text`,
+        );
+      }
 
       lines.push("");
       lines.push("## Recent activity (newest first)");
@@ -2945,12 +3517,23 @@ export default function towerDoExtension(pi: ExtensionAPI): void {
     // resurrect finished work in the UI.
     if (existsSync(entry.board.file)) {
       currentView = await foldRetained(ctx.cwd);
+      checkpointFallback = undefined;
     } else {
       // Always replace the in-memory view: a previous session's currentView
       // must not leak into this one when the board file is gone. getBranch
       // is root-to-leaf, so take the last valid checkpoint (see
-      // latestBoardCheckpoint), not the first.
+      // latestBoardCheckpoint), not the first. A digest checkpoint restores as
+      // an `incomplete` display view (open tasks + finding titles only); keep
+      // it so status/inbox show what is still known instead of an empty fold.
       const checkpoint = latestBoardCheckpoint(ctx.sessionManager.getBranch());
+      // Pin the fallback to revision 0 as well: the write gate folds the
+      // missing file at revision 0, so a read path that advertised the
+      // digest's revision would hand the caller a baseRevision every write
+      // then rejects.
+      checkpointFallback =
+        checkpoint?.incomplete === true
+          ? cloneBoard({ ...checkpoint, revision: 0 })
+          : undefined;
       currentView =
         checkpoint === undefined
           ? createEmptyBoard()
@@ -3014,18 +3597,20 @@ export default function towerDoExtension(pi: ExtensionAPI): void {
   });
 
   pi.on("context", async (event, ctx) => {
-    // Compact / before_agent_start inject TOWER_DO_BOARD_TYPE snapshots that
-    // persist in the session transcript. They must not keep cancelled todos
-    // in the LLM context after a peer writes; always strip them. Replacing
-    // with a fresh reminder is a separate cadence (REMINDER_INTERVAL) — a
-    // leftover snapshot must not skip the counter and re-inject every call.
+    // Compact / before_agent_start inject board snapshots (legacy full view or
+    // the bounded digest) that persist in the session transcript. They must
+    // not keep cancelled todos in the LLM context after a peer writes; always
+    // strip them. Replacing with a fresh reminder is a separate cadence
+    // (REMINDER_INTERVAL) — a leftover snapshot must not skip the counter and
+    // re-inject every call.
     const isBoardContext = (message: {
       role?: string;
       customType?: string;
     }): boolean =>
       message.role === "custom" &&
       (message.customType === TOWER_DO_REMINDER_TYPE ||
-        message.customType === TOWER_DO_BOARD_TYPE);
+        message.customType === TOWER_DO_BOARD_TYPE ||
+        message.customType === TOWER_DO_BOARD_DIGEST_TYPE);
     const messages = event.messages.filter(
       (message) => !isBoardContext(message),
     );
@@ -3067,30 +3652,39 @@ export default function towerDoExtension(pi: ExtensionAPI): void {
 
   pi.on("session_compact", async (event, ctx) => {
     // Fold + checkpoint under the same mutation queue as tower_do so a
-    // concurrent cancel cannot land between the snapshot and appendEntry.
+    // concurrent cancel cannot land between the fold and appendEntry. The
+    // transcript payload is the bounded DIGEST (Layer 4): open tasks + finding
+    // titles + O(1) counts, never the whole view.
     const compactEntry = boards.entryFor(ctx.cwd);
-    let snapshot = cloneBoard(currentView);
+    const identity = sessionIdentity(ctx.cwd, pi, ctx);
+    const buildDigest = async (): Promise<TowerDoCheckpointDigest> =>
+      checkpointDigest(
+        currentView,
+        Date.now(),
+        effectiveLiveOwners(currentView, await readLiveOwners(ctx.cwd)),
+        identity,
+      );
+    let digest: TowerDoCheckpointDigest;
     if (existsSync(compactEntry.board.file)) {
-      await withFileMutationQueue(compactEntry.board.file, async () => {
+      digest = await withFileMutationQueue(compactEntry.board.file, async () => {
         currentView = await foldRetained(ctx.cwd);
-        snapshot = cloneBoard(currentView);
-        pi.appendEntry(TOWER_DO_BOARD_TYPE, snapshot);
+        const next = await buildDigest();
+        pi.appendEntry(TOWER_DO_BOARD_DIGEST_TYPE, next);
+        return next;
       });
     } else {
-      pi.appendEntry(TOWER_DO_BOARD_TYPE, snapshot);
+      digest = await buildDigest();
+      pi.appendEntry(TOWER_DO_BOARD_DIGEST_TYPE, digest);
     }
     if (event.willRetry || ctx.hasPendingMessages()) {
       contextCheckpointNeeded = false;
       llmCallsSinceReminder = REMINDER_ARMED;
       pi.sendMessage(
         {
-          customType: TOWER_DO_BOARD_TYPE,
-          content: formatBoardReminder(
-            snapshot,
-            sessionIdentity(ctx.cwd, pi, ctx),
-          ),
+          customType: TOWER_DO_BOARD_DIGEST_TYPE,
+          content: formatBoardReminder(currentView, identity),
           display: false,
-          details: snapshot,
+          details: digest,
         },
         { deliverAs: "steer" },
       );
@@ -3112,12 +3706,17 @@ export default function towerDoExtension(pi: ExtensionAPI): void {
         });
       }
     }
+    const identity = sessionIdentity(cwd, pi, selfCtx);
+    const live =
+      cwd === undefined
+        ? new Set<string>()
+        : effectiveLiveOwners(currentView, await readLiveOwners(cwd));
     return {
       message: {
-        customType: TOWER_DO_BOARD_TYPE,
-        content: formatBoardReminder(currentView, sessionIdentity(cwd, pi, selfCtx)),
+        customType: TOWER_DO_BOARD_DIGEST_TYPE,
+        content: formatBoardReminder(currentView, identity),
         display: false,
-        details: cloneBoard(currentView),
+        details: checkpointDigest(currentView, Date.now(), live, identity),
       },
     };
   });
@@ -3134,6 +3733,7 @@ export default function towerDoExtension(pi: ExtensionAPI): void {
     selfCtx = undefined;
     activeCwd = undefined;
     currentView = createEmptyBoard();
+    checkpointFallback = undefined;
     resetGitCounts();
     contextCheckpointNeeded = false;
     llmCallsSinceReminder = 0;
