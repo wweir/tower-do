@@ -25,6 +25,7 @@ import { TowerBoard } from "../board.ts";
 import {
   createEmptyBoard,
   derivePresence,
+  messagesToMe,
   formatActivityEntry,
   formatActivityFeed,
   formatPresenceLine,
@@ -132,11 +133,17 @@ async function layer1(): Promise<void> {
   );
   check(
     "messagesToMe still sees own broadcasts (read semantics distinct)",
-    // messagesToMe counts everything addressed to you from others; here bob
-    // sees the broadcast and alice sees both bob's msg AND her own? no — own
-    // broadcast filtered by from===identity in messagesToMe too. alice → all
-    // is from alice so filtered; bob → alice shown.
-    view.messages.length === 2,
+    // Alice's `to: "all"` broadcast reaches BOB (m-aaa), while alice's own view
+    // excludes it (from === identity) and shows only the message addressed to
+    // her (m-bbb). Asserted on messagesToMe itself — the sibling checks above
+    // only count unread rows, so a regression in the broadcast filter would
+    // slip past them.
+    messagesToMe(view, "bob").map((m) => m.id).join(",") === "m-aaa" &&
+      messagesToMe(view, "alice").map((m) => m.id).join(",") === "m-bbb",
+    JSON.stringify({
+      bob: messagesToMe(view, "bob").map((m) => m.id),
+      alice: messagesToMe(view, "alice").map((m) => m.id),
+    }),
   );
 
   // Broadcast retirement needs the OTHER owners to read, not the sender.
@@ -353,7 +360,10 @@ function layer2(): void {
   );
   check(
     "presence sorts most-recent first",
-    presence[0]?.identity === "alice" || presence[0]?.identity === "carol",
+    // alice (60s ago) must outrank carol (720s ago); the old `|| carol` made
+    // this pass with the two active entries swapped.
+    presence[0]?.identity === "alice",
+    presence.map((p) => p.identity).join(","),
   );
 
   // --- feed rendering: session-break separators + latest-write summary ---
@@ -692,6 +702,34 @@ async function layer4(): Promise<void> {
     "orphan retires under a selective budget, unread survives",
     budgeted.length === 1 && budgeted[0]?.id === "m-live-keep",
     `kept ${budgeted.map((m) => m.id).join(",")}`,
+  );
+  // `tower` is the reserved orchestrator identity and owns no task by design, so
+  // a reachability proxy based purely on TASK OWNERSHIP classified every
+  // message addressed to it as "nobody can ever read this" — while its own
+  // inbox still reported it unread. Under a retention budget the unread
+  // message was then retired before genuinely-read ones, which is exactly the
+  // "unread traffic survives" guarantee the budget exists to keep.
+  const towerMsg = msg({
+    id: "m-tower-unread",
+    to: "tower",
+    from: "eve",
+    subject: "needs the orchestrator",
+    at: now + 2,
+  });
+  check(
+    "an unread message to tower is never 'fully read'",
+    !isMessageFullyRead(towerMsg, view) &&
+      unreadMessagesToMe({ ...view, messages: [towerMsg] }, "tower").length === 1,
+  );
+  const towerBudgeted = retainMessages(
+    [towerMsg, msg({ id: "m-read-any", to: "dave", from: "eve", subject: "x", at: now + 3, readBy: ["dave"] })],
+    view,
+    1,
+  );
+  check(
+    "...so a budget retires the read message, not the unread one",
+    towerBudgeted.some((m) => m.id === "m-tower-unread"),
+    `kept ${towerBudgeted.map((m) => m.id).join(",")}`,
   );
   check(
     "live addressed message still waits for recipient ack",

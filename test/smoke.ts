@@ -20,7 +20,11 @@ import { TowerBoard } from "../board.ts";
 import {
   createEmptyBoard,
   findAllUnresolvedDeps,
+  FINDING_SNOOZE_MAX_MS,
   formatBoardReminder,
+  MAX_FINDING_REASON_CHARS,
+  MAX_MESSAGE_BYTES,
+  MAX_TOWER_DO_ALIASES,
   taskIsBlocked,
   TOWER_DO_BOARD_DIGEST_TYPE,
   TOWER_DO_BOARD_TYPE,
@@ -1193,6 +1197,55 @@ async function layer2(): Promise<void> {
     allAs.slice(0, 80),
   );
 
+  // Documented protocol bounds that had no coverage at all. Each is a
+  // rejection the contract states explicitly, and an untested bound is the one
+  // that silently drifts when a constant is retuned.
+  const bigBody = await runThrow("tower_do_talk", {
+    action: "send",
+    to: "all",
+    subject: "big",
+    body: "x".repeat(MAX_MESSAGE_BYTES + 1),
+    as: "alice",
+  } as never);
+  check(
+    "a message body over 32 KiB is rejected",
+    /body too large/.test(bigBody),
+    bigBody.slice(0, 90),
+  );
+  // File one finding of our own: the shared `idA` fixture is created further
+  // down, and these bounds are independent of it.
+  const boundFiled = await run("tower_do_talk", {
+    action: "finding",
+    kind: "bug",
+    title: "bound fixture",
+    summary: "s",
+    as: "alice",
+  } as never);
+  const boundId =
+    (boundFiled.text.match(/\((f-[0-9a-f-]+)\)/) ?? [])[1] ?? "";
+  const longReason = await runThrow("tower_do_talk", {
+    action: "finding",
+    findingId: boundId,
+    status: "done",
+    reason: "r".repeat(MAX_FINDING_REASON_CHARS + 1),
+  } as never);
+  check(
+    "a finding reason over the cap is rejected",
+    /reason is \d+ characters/.test(longReason),
+    longReason.slice(0, 90),
+  );
+  const pastSnooze = await runThrow("tower_do_talk", {
+    action: "finding",
+    findingIds: [boundId],
+    status: "snoozed",
+    reason: "later",
+    snoozeUntil: Date.now() + FINDING_SNOOZE_MAX_MS + 86_400_000,
+  } as never);
+  check(
+    "a snooze beyond the 30d cap is rejected",
+    /more than 30d ahead/.test(pastSnooze),
+    pastSnooze.slice(0, 90),
+  );
   // Invalid status filter is a loud error, not a silent empty board.
   const badFilter = await runThrow("tower_do_status", {
     status: "done",
@@ -2632,6 +2685,29 @@ async function layer2(): Promise<void> {
     "concurrent reopens cannot exceed the finding budget",
     reopenOk === 1 && nonClosed === 50,
     `ok=${reopenOk} nonClosed=${nonClosed}`,
+  );
+
+  // LAST in the shared instance on purpose: reaching the cap consumes this
+  // session's whole alias budget, so every assertion that needs another `as`
+  // must already have run. The cap must fail LOUD rather than silently dropping
+  // the label (CONTRACTS.md). `inbox` records the alias in `prepare()` without
+  // writing, so the probe cannot trip the task owner guard en route.
+  let aliasError = "";
+  for (let i = 0; i <= MAX_TOWER_DO_ALIASES; i += 1) {
+    try {
+      await run("tower_do_talk", {
+        action: "inbox",
+        as: `alias-${String(i)}`,
+      } as never);
+    } catch (error) {
+      aliasError = error instanceof Error ? error.message : String(error);
+      break;
+    }
+  }
+  check(
+    "the alias cap fails loud instead of dropping the label",
+    /at most \d+ aliases/.test(aliasError),
+    aliasError.slice(0, 90),
   );
 }
 

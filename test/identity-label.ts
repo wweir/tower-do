@@ -27,7 +27,8 @@ import {
   readByWith,
   sameAgent,
   sessionLabel,
-  staleTaskOwners,
+  claimKey,
+  staleTaskClaims,
   unreadMessagesToMe,
   writeBoardSnapshot,
   MAX_IDENTITY_CHARS,
@@ -133,10 +134,13 @@ check(
   !sameAgent(labelA, labelB),
 );
 check(
-  "bucket siblings' legacy label is not the same agent as the other's current label",
-  !sameAgent(legacyOf(SIBLING_A), labelB) === false &&
-    sameAgent(legacyOf(SIBLING_A), labelB),
-  "(a legacy label is ambiguous for its bucket — documented)",
+  "a legacy label reaches EITHER bucket sibling's current label (documented over-delivery)",
+  // The legacy `session-<time8>` form cannot name one member of its bucket, so
+  // the relation is deliberately permissive: it may over-deliver mail (never
+  // worse than the pre-0.4.1 reach), which is why it is delivery-only and never
+  // used for permission. The previous title claimed the opposite of this.
+  sameAgent(legacyOf(SIBLING_A), labelB),
+  "(over-delivery is documented in CONTRACTS.md)",
 );
 check(
   "different buckets are different agents",
@@ -205,7 +209,7 @@ check(
       tasks: [{ key: "work", subject: "task", owner: labelA }],
     },
     labelA,
-    new Set([legacyOf(SIBLING_A)]),
+    new Set([claimKey(legacyOf(SIBLING_A), "work")]),
   ).view.tasks[0]?.owner === labelA,
 );
 expectThrows(
@@ -257,17 +261,17 @@ const activity: ActivityEntry[] = [
 ];
 check(
   "a current-label heartbeat does NOT speak for a legacy owner (exact staleness)",
-  staleTaskOwners(
+  staleTaskClaims(
     activity,
     [legacyTask],
     Date.now(),
     30 * 60_000,
     new Set([labelA]),
-  ).has(legacyOf(SIBLING_A)),
+  ).has(claimKey(legacyOf(SIBLING_A), legacyTask.key)),
 );
 check(
   "a legacy owner is protected by a heartbeat under its own label",
-  staleTaskOwners(
+  staleTaskClaims(
     activity,
     [legacyTask],
     Date.now(),
@@ -277,28 +281,28 @@ check(
 );
 check(
   "…and the same query still reports stale when nobody is live",
-  staleTaskOwners(
+  staleTaskClaims(
     activity,
     [legacyTask],
     Date.now(),
     30 * 60_000,
     new Set(),
-  ).has(legacyOf(SIBLING_A)),
+  ).has(claimKey(legacyOf(SIBLING_A), legacyTask.key)),
 );
 const currentTask: TowerDoTask = { ...legacyTask, owner: labelA };
 check(
   "a bucket sibling's liveness does NOT protect a current-label owner (the fix)",
-  staleTaskOwners(
+  staleTaskClaims(
     activity,
     [currentTask],
     Date.now(),
     30 * 60_000,
     new Set([labelB]),
-  ).has(labelA),
+  ).has(claimKey(labelA, currentTask.key)),
 );
 check(
   "a current-label owner is protected by its own liveness",
-  staleTaskOwners(
+  staleTaskClaims(
     activity,
     [currentTask],
     Date.now(),

@@ -28,6 +28,7 @@ import {
   isFindingClosed,
   latestBoardCheckpoint,
   MAX_FINDING_TITLE_CHARS,
+  MAX_IDENTITY_CHARS,
   MAX_TASK_SUBJECT_CHARS,
   MAX_TOWER_DO_OPEN_FINDINGS,
   MAX_TOWER_DO_OPEN_TASKS,
@@ -37,6 +38,7 @@ import {
   readPersistedMessage,
   retainFindings,
   summarizeFindings,
+  textLength,
   TOWER_DO_BOARD_DIGEST_TYPE,
   type TowerBoardView,
   type TowerDoFinding,
@@ -536,6 +538,54 @@ function digestFieldBounds(): void {
     "a digest finding with a newline in the owner is refused",
     !restores((data) => {
       data.findings[0]!.owner = "a\nb";
+    }),
+  );
+
+  // The WRITER must never emit a digest its own READER rejects: the fold does
+  // not bound a finding's id/title/owner (a legacy or hand-written row may
+  // carry more), so an over-long one would otherwise make the reader discard
+  // the ENTIRE checkpoint and a session with a missing board file would
+  // silently restore an empty board. Every emitted field is truncated to the
+  // bound instead.
+  const longView: TowerBoardView = {
+    ...view,
+    findings: [
+      finding({
+        // Over-long in EVERY bounded field, or the truncation of one is not
+        // actually exercised (a short `id` passed even with the bound removed).
+        id: "f-" + "i".repeat(MAX_IDENTITY_CHARS + 40),
+        title: "t".repeat(MAX_FINDING_TITLE_CHARS + 40),
+        status: "accepted",
+        owner: "o".repeat(MAX_IDENTITY_CHARS + 40),
+      }),
+    ],
+  };
+  const longDigest = checkpointDigest(longView, NOW, live, "alice");
+  const longRow = longDigest.findings[0]!;
+  check(
+    "the digest writer respects every bound its reader enforces",
+    textLength(longRow.title) <= MAX_FINDING_TITLE_CHARS &&
+      textLength(longRow.id) <= MAX_IDENTITY_CHARS &&
+      (longRow.owner === undefined ||
+        textLength(longRow.owner) <= MAX_IDENTITY_CHARS) &&
+      latestBoardCheckpoint([
+        { type: "custom", customType: TOWER_DO_BOARD_DIGEST_TYPE, data: longDigest },
+      ]) !== undefined,
+    JSON.stringify({
+      title: textLength(longRow.title),
+      owner: longRow.owner === undefined ? 0 : textLength(longRow.owner),
+      restored:
+        latestBoardCheckpoint([
+          { type: "custom", customType: TOWER_DO_BOARD_DIGEST_TYPE, data: longDigest },
+        ]) !== undefined,
+    }),
+  );
+  // A digest whose own counts disagree with its rows is corrupt: accepting it
+  // would restore a task count the writer could never have produced.
+  check(
+    "a digest whose open count contradicts its byStatus tally is refused",
+    !restores((data) => {
+      (data as { counts: { tasks: { open: number } } }).counts.tasks.open = 999;
     }),
   );
 }

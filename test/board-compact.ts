@@ -49,8 +49,9 @@ import { join } from "node:path";
 
 import { TowerBoard, LOCK_WAIT_MS, STALE_LOCK_MS } from "../board.ts";
 import {
+  claimKey,
   parseActivityLine,
-  staleTaskOwners,
+  staleTaskClaims,
   writeBoardSnapshot,
   type ActivityEntry,
 } from "../state.ts";
@@ -662,18 +663,18 @@ async function main(): Promise<void> {
   );
   check(
     "pre-compact: a later tower edit does not keep the owner's row alive",
-    staleTaskOwners(await parseAll(), (await clockBoard.fold()).tasks, now).has(
-      "alice",
+    staleTaskClaims(await parseAll(), (await clockBoard.fold()).tasks, now).has(
+      claimKey("alice", "k"),
     ),
   );
   await clockBoard.compact({ by: "tower" });
   check(
     "post-compact: the owner's stale activity clock is preserved",
-    staleTaskOwners(
+    staleTaskClaims(
       await parseAll(),
       (await clockBoard.fold()).tasks,
       now,
-    ).has("alice"),
+    ).has(claimKey("alice", "k")),
   );
 
   // A dead holder's lease is stolen; an active one is not (token + heartbeat).
@@ -1107,6 +1108,12 @@ async function main(): Promise<void> {
   // Non-finite timestamps (`1e999` → Infinity) must not survive a fold: an
   // Infinity `at`/`updatedAt` permanently defeats every time-based exit. The
   // literal is written raw because JSON.stringify(Infinity) is `null`.
+  // A task event whose `at` is unusable is NOT salvaged with `Date.now()`:
+  // that `at` IS the ownership clock (the fold falls back to it for a missing
+  // `updatedAt`, and `staleTaskClaims` reads it), so fabricating one makes the
+  // fold non-deterministic between reads AND reports a corrupt line as
+  // permanently fresh, so the takeover window never opens. It is skipped and
+  // disclosed instead (CONTRACTS.md "unfolded log lines are disclosed").
   const infDir = mkdtempSync(join(tmpdir(), "tower-do-nonfinite-"));
   const infFile = join(infDir, "board.jsonl");
   await writeFileSync(
@@ -1114,12 +1121,24 @@ async function main(): Promise<void> {
     '{"kind":"task","op":"upsert","key":"k","task":{"key":"k","subject":"s","status":"pending","dependsOn":[],"blockedBy":[]},"by":"alice","at":1e999}\n',
     "utf8",
   );
-  const infFold = await new TowerBoard(infFile).fold();
+  const infBoard = new TowerBoard(infFile);
+  const infFold = await infBoard.fold();
+  const infFoldAgain = await infBoard.fold();
   check(
-    "a non-finite task event timestamp never reaches the folded view",
-    infFold.tasks.length === 1 &&
-      Number.isFinite(infFold.tasks[0]?.updatedAt ?? Number.NaN),
-    JSON.stringify(infFold.tasks.map((task) => task.updatedAt)),
+    "a non-finite task event timestamp is skipped, not salvaged with now()",
+    infFold.tasks.length === 0 &&
+      infFold.skipped === 1 &&
+      JSON.stringify(infFold) === JSON.stringify(infFoldAgain),
+    JSON.stringify({ tasks: infFold.tasks.length, skipped: infFold.skipped }),
+  );
+  // The clock must agree with the presence/activity derivation, which rejects
+  // the same line: otherwise the row is invisible to presence yet permanent in
+  // the fold.
+  check(
+    "...and the activity parser rejects the same line (one clock, not two)",
+    parseActivityLine(
+      '{"kind":"task","op":"upsert","key":"k","task":{"key":"k","subject":"s","status":"pending","dependsOn":[],"blockedBy":[]},"by":"alice","at":1e999}',
+    ) === undefined,
   );
 
   // A waiter must outlast one FULL staleness window: otherwise two writers that

@@ -10,12 +10,19 @@
  * roll back its concurrent update with a stale snapshot, because content
  * fields were unguarded. This file locks the fix.
  *
+ * It also locks the takeover exception to the ROW: staleness is derived per
+ * owner+task, so an owner stalled on one row must stay protected on the row it
+ * is still touching (a live sibling is not adoptable or removable).
+ *
  * Run: bun test/owner-guard.ts
  */
 import {
+  claimKey,
   createEmptyBoard,
+  isStaleClaim,
+  normalizeIdentity,
   parseActivityLine,
-  staleTaskOwners,
+  staleTaskClaims,
   writeBoardSnapshot,
   type ActivityEntry,
   type TowerDoStatus,
@@ -409,7 +416,7 @@ async function main(): Promise<void> {
     }),
     handTask({ key: "open", subject: "o" }),
   ];
-  const stale = staleTaskOwners(
+  const stale = staleTaskClaims(
     [
       activityEntry("A", NOW - 7 * 60 * MIN, "idle"),
       activityEntry("B", NOW - 1 * MIN, "fresh"),
@@ -418,8 +425,13 @@ async function main(): Promise<void> {
     NOW,
   );
   check(
-    "staleTaskOwners marks a task whose own activity is old; fresh activity and a fresh assignment are protected",
-    stale.has("A") && stale.has("C") && !stale.has("B") && !stale.has("D"),
+    "staleTaskClaims marks a claim whose own activity is old; fresh activity and a fresh assignment are protected",
+    stale.has(claimKey("A", "idle")) &&
+      stale.has(claimKey("C", "never")) &&
+      !stale.has(claimKey("B", "fresh")) &&
+      !stale.has(claimKey("D", "assigned")) &&
+      // A completed row is never a displaceable claim at all.
+      !stale.has(claimKey("A", "done")),
     [...stale].join(","),
   );
 
@@ -427,7 +439,7 @@ async function main(): Promise<void> {
   // immunize a stale row — the bug the per-task clock exists to fix.
   check(
     "unrelated global activity does not immunize a stale task",
-    staleTaskOwners(
+    staleTaskClaims(
       [activityEntry("A", NOW - 1 * MIN, "some-other-task", "message")],
       [
         handTask({
@@ -439,11 +451,11 @@ async function main(): Promise<void> {
         }),
       ],
       NOW,
-    ).has("A"),
+    ).has(claimKey("A", "a-row")),
   );
   check(
     "activity on the task itself within the window protects it",
-    staleTaskOwners(
+    staleTaskClaims(
       [activityEntry("A", NOW - 1 * MIN, "a-row", "task")],
       [
         handTask({
@@ -460,7 +472,7 @@ async function main(): Promise<void> {
 
   // Liveness tiebreaker: an owner whose process still heartbeats is never
   // stale, however quiet it has been on the board.
-  const withLive = staleTaskOwners(
+  const withLive = staleTaskClaims(
     [
       activityEntry("A", NOW - 7 * 60 * MIN, "idle"),
       activityEntry("B", NOW - 1 * MIN, "fresh"),
@@ -477,7 +489,7 @@ async function main(): Promise<void> {
   );
   check(
     "liveOwners alias protects an as-label owner with stale board activity",
-    staleTaskOwners(
+    staleTaskClaims(
       [activityEntry("coder-1", NOW - 7 * 60 * MIN, "child")],
       [
         handTask({
@@ -498,14 +510,14 @@ async function main(): Promise<void> {
   // the updatedAt fallback is only sound when the log exists.
   check(
     "empty activity log disables the takeover exception entirely",
-    staleTaskOwners([], tasksForDerivation, NOW).size === 0,
+    staleTaskClaims([], tasksForDerivation, NOW).size === 0,
   );
 
   // The clock is per task: a fresh `updatedAt` protects only that row, so an
   // owner quiet on ONE task is still stale for its other stale rows.
   check(
     "a fresh row does not protect the owner's other stale rows",
-    staleTaskOwners(
+    staleTaskClaims(
       [activityEntry("E", NOW - 7 * 60 * MIN, "e-old")],
       [
         handTask({
@@ -523,7 +535,7 @@ async function main(): Promise<void> {
         }),
       ],
       NOW,
-    ).has("E"),
+    ).has(claimKey("E", "e-old")),
   );
 
   // Real parser wiring: `parseActivityLine` must expose the structured taskKey
@@ -541,7 +553,7 @@ async function main(): Promise<void> {
   check(
     "parseActivityLine exposes the structured taskKey",
     parsedActivity?.taskKey === "real-key" &&
-      staleTaskOwners(
+      staleTaskClaims(
         [parsedActivity],
         [
           handTask({
@@ -585,7 +597,7 @@ async function main(): Promise<void> {
     "A",
   );
   const idleView = idleBoard.view;
-  const STALE = new Set(["A"]); // A idle; B fresh
+  const STALE = new Set([claimKey("A", "stale-task")]); // that claim is idle; B fresh
 
   // Takeover: C adopts the idle owner's in_progress task by claiming it.
   const adopted = writeBoardSnapshot(
@@ -715,7 +727,7 @@ async function main(): Promise<void> {
         "C",
         STALE,
       ),
-    /completed task stays with its owner/,
+    /a completed task stays with its owner — only that owner or an as: "tower" write that replays the rows to keep may drop it/,
   );
   expectThrows(
     "idle owner's completed task cannot have its owner swapped by a peer",
@@ -827,6 +839,180 @@ async function main(): Promise<void> {
         STALE,
       ),
     /adopt it by setting owner to yourself/,
+  );
+
+  // The exception is per ROW, never per owner: a single long-idle claim must not
+  // hand a peer the owner's freshly touched sibling. Charging staleness to
+  // owner+task key and then asking about the OWNER is the same data loss as
+  // deleting the live row directly, so both guard sites ask about the key.
+  const mixedBoard = writeBoardSnapshot(
+    createEmptyBoard(),
+    {
+      tasks: [
+        // Both owned by A: one stalled, one just touched.
+        { key: "a-stalled", subject: "s", status: "in_progress", owner: "A" },
+        { key: "a-live", subject: "l", status: "in_progress", owner: "A" },
+      ],
+    },
+    "A",
+  ).view;
+  const MIXED = new Set([claimKey("A", "a-stalled")]);
+
+  check(
+    "a live sibling claim is not displaceable by the owner's stalled row",
+    isStaleClaim(MIXED, "A", "a-stalled") &&
+      !isStaleClaim(MIXED, "A", "a-live"),
+  );
+  expectThrows(
+    "a peer cannot adopt a fresh row beside the owner's stalled one",
+    () =>
+      writeBoardSnapshot(
+        mixedBoard,
+        {
+          tasks: [
+            { key: "a-stalled", subject: "s", status: "in_progress", owner: "A" },
+            { key: "a-live", subject: "l", status: "in_progress", owner: "C" },
+          ],
+          baseRevision: mixedBoard.revision,
+        },
+        "C",
+        MIXED,
+      ),
+    /owned by "A"/,
+  );
+  // Removal is the same question, so it gets the same answer: the stalled row
+  // goes (already covered above), the fresh one stays.
+  const mixedDropped = writeBoardSnapshot(
+    mixedBoard,
+    {
+      tasks: [
+        { key: "a-live", subject: "l", status: "in_progress", owner: "A" },
+      ],
+      baseRevision: mixedBoard.revision,
+    },
+    "C",
+    MIXED,
+  );
+  check(
+    "…but the stalled row itself is still removable (the exception is not dead)",
+    mixedDropped.change.removed.join(",") === "a-stalled",
+    mixedDropped.change.removed.join(","),
+  );
+  expectThrows(
+    "a peer cannot remove the fresh row beside the owner's stalled one",
+    () =>
+      writeBoardSnapshot(
+        mixedBoard,
+        {
+          tasks: [
+            {
+              key: "a-stalled",
+              subject: "s",
+              status: "in_progress",
+              owner: "A",
+            },
+          ],
+          baseRevision: mixedBoard.revision,
+        },
+        "C",
+        MIXED,
+      ),
+    /owned by "A"/,
+  );
+
+  // Two distinct values must never compare equal. `taskEquals` used to join
+  // list fields with NUL before comparing, so ["a","b"] and ["a\0b"] were
+  // "equal": a real content edit (or a scope change) was silently dropped as a
+  // no-op, and the same collision made the adoption guard read a content edit
+  // as a pure owner swap.
+  const nulBoard = writeBoardSnapshot(
+    createEmptyBoard(),
+    { tasks: [{ key: "n", subject: "s", status: "pending", scope: ["a", "b"] }] },
+    "A",
+  ).view;
+  const nulEdit = writeBoardSnapshot(
+    nulBoard,
+    {
+      tasks: [{ key: "n", subject: "s", status: "pending", scope: ["a\u0000b"] }],
+      baseRevision: nulBoard.revision,
+    },
+    "A",
+  );
+  check(
+    "a NUL-bearing scope entry is a real edit, not a NUL-join no-op",
+    nulEdit.change.updated.join(",") === "n" &&
+      nulEdit.view.tasks[0]?.scope?.[0] === "a\u0000b",
+    JSON.stringify(nulEdit.change),
+  );
+  // An identity must not carry the separator claimKey joins on, or two distinct
+  // (owner, task) pairs could collapse into one key in the takeover set.
+  expectThrows(
+    "a NUL inside an identity is rejected (claimKey would collide)",
+    () => normalizeIdentity("a\u0000b", "owner"),
+    /must not contain a NUL/,
+  );
+
+  // Documented invariants with NO prior coverage (CONTRACTS.md "task shape":
+  // dependsOn "must resolve against the full board + this batch; cycles
+  // rejected"), so the rejection paths had no regression net at all.
+  expectThrows(
+    "an indirect dependency cycle is rejected",
+    () =>
+      writeBoardSnapshot(
+        createEmptyBoard(),
+        {
+          tasks: [
+            { key: "a", subject: "a", status: "pending", dependsOn: ["b"] },
+            { key: "b", subject: "b", status: "pending", dependsOn: ["a"] },
+          ],
+        },
+        "A",
+      ),
+    /dependency cycle detected/,
+  );
+  expectThrows(
+    "a self-dependency is rejected",
+    () =>
+      writeBoardSnapshot(
+        createEmptyBoard(),
+        { tasks: [{ key: "a", subject: "a", status: "pending", dependsOn: ["a"] }] },
+        "A",
+      ),
+    /cannot depend on itself/,
+  );
+  expectThrows(
+    "a dependency on a key that exists nowhere is rejected",
+    () =>
+      writeBoardSnapshot(
+        createEmptyBoard(),
+        { tasks: [{ key: "a", subject: "a", status: "pending", dependsOn: ["ghost"] }] },
+        "A",
+      ),
+    /references missing task ghost/,
+  );
+
+  // A no-op full-list replay must not drift the row's clock or the revision:
+  // the takeover window reads `updatedAt`, and the revision gate is what peers
+  // pass back as baseRevision.
+  const replayBoard = writeBoardSnapshot(
+    createEmptyBoard(),
+    { tasks: [{ key: "r", subject: "s", status: "pending" }] },
+    "A",
+  ).view;
+  const replayed = writeBoardSnapshot(
+    replayBoard,
+    {
+      tasks: [{ key: "r", subject: "s", status: "pending" }],
+      baseRevision: replayBoard.revision,
+    },
+    "A",
+  );
+  check(
+    "an unchanged replay keeps the row's updatedAt and the revision",
+    replayed.change.updated.length === 0 &&
+      replayed.view.revision === replayBoard.revision &&
+      replayed.view.tasks[0]?.updatedAt === replayBoard.tasks[0]?.updatedAt,
+    JSON.stringify(replayed.change),
   );
 
   // --- summary ---

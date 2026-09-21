@@ -71,7 +71,7 @@ export const MAX_FINDING_REASON_CHARS = 256;
 export const MESSAGE_PENDING_RETIRE_MS = 14 * 24 * 60 * 60_000;
 /** Ownership-takeover window for non-completed tasks, separate from the 30 min
  * presence/idle hint: ownership dies on the task-relevant activity clock, not
- * on unrelated board chatter (see staleTaskOwners). */
+ * on unrelated board chatter (see staleTaskClaims). */
 export const TASK_CLAIM_STALE_MS = 6 * 60 * 60_000;
 /** `tower_do_status` hint thresholds for the explicit `gc` compact — a hint,
  * never an automatic trigger: rewriting the log must be a named, auditable
@@ -404,6 +404,15 @@ export function normalizeIdentity(
   const identity = value?.trim();
   if (!identity) throw new TowerDoValidationError(`${location} is required`);
   assertSingleLine(identity, location);
+  // NUL is the separator in `claimKey` (and board.ts's task clock), so an
+  // identity carrying one could collide with another (owner, task) pair. Task
+  // keys cannot contain NUL (their pattern is lowercase ASCII), so rejecting it
+  // on the identity side is enough to keep those keys injective.
+  if (identity.includes("\u0000")) {
+    throw new TowerDoValidationError(
+      `${location} must not contain a NUL character`,
+    );
+  }
   const identityLength = textLength(identity);
   if (identityLength > MAX_IDENTITY_CHARS)
     throw new TowerDoValidationError(
@@ -521,9 +530,9 @@ export function writeBoardSnapshot(
   current: TowerBoardView,
   input: TowerDoSnapshotInput,
   caller: string,
-  /** Owners eligible for takeover (staleTaskOwners); empty keeps the guard
-   * strict — the default is what every non-board-aware caller wants. */
-  staleOwners: ReadonlySet<string> = new Set(),
+  /** Displaceable claims (staleTaskClaims), keyed owner+NUL+task; empty keeps
+   * the guard strict — the default is what every non-board-aware caller wants. */
+  staleClaims: ReadonlySet<string> = new Set(),
 ): TowerDoWriteDetails {
   if (
     input.baseRevision !== undefined &&
@@ -645,10 +654,12 @@ export function writeBoardSnapshot(
   // Tower: workers may remove only their own (or unowned) tasks; the
   // orchestrator may remove any. Without this, a partial-list update or a
   // stray `tasks: []` would silently delete another agent's task.
-  // Stale-owner exception: an owner idle past OWNER_TAKEOVER_MS may have its
-  // unfinished work removed by anyone (adoption via update is the gentler
-  // path, but a hopeless task should not need an adopter first). Completed
-  // tasks keep the full guard — a receipt cannot be dropped by a peer.
+  // Stale-claim exception: a row whose own claim is idle past
+  // OWNER_TAKEOVER_MS may be removed by anyone (adoption via update is the
+  // gentler path, but a hopeless task should not need an adopter first).
+  // Completed tasks keep the full guard — a receipt cannot be dropped by a
+  // peer. The exception is asked PER ROW: an owner may be dead on one task and
+  // alive on another, so a row-level set is what keeps a live sibling safe.
   for (const removed of removedTasks) {
     // EXACT label match, not `sameAgent`: a legacy `session-<time8>` label
     // cannot name one member of its 65.5 s bucket, so aliasing it here would
@@ -660,11 +671,14 @@ export function writeBoardSnapshot(
       caller !== removed.owner &&
       caller !== TOWER_IDENTITY
     ) {
-      if (staleOwners.has(removed.owner) && removed.status !== "completed")
+      if (
+        isStaleClaim(staleClaims, removed.owner, removed.key) &&
+        removed.status !== "completed"
+      )
         continue;
       throw new TowerDoValidationError(
         `task ${removed.key} is owned by "${removed.owner}" — only its owner or ${TOWER_IDENTITY} may remove it` +
-          staleOwnerHint(removed, staleOwners),
+          staleClaimHint(removed, staleClaims),
       );
     }
   }
@@ -713,16 +727,17 @@ export function writeBoardSnapshot(
     // fields (removal is guarded separately above). We only reach this point
     // when taskEquals found a real field change, so a plain ownership check
     // suffices — the every-field comparison already happened.
-    // Stale-owner exception (takeover/adopt): strictly an ownership
+    // Stale-claim exception (takeover/adopt): strictly an ownership
     // displacement — the candidate must equal the existing task except for
     // owner === caller. Any content edit (subject/status/deps/scope/…) of a
     // stalled task stays rejected; the adopter re-plans in a second write
     // once it owns the task. This keeps the every-field guard's promise
     // intact: a peer can displace a dead ownership, never silently rewrite
-    // someone's content or forge a receipt.
+    // someone's content or forge a receipt. Per row, like the removal guard:
+    // adopting away a row the owner touched a minute ago is the same data loss
+    // as deleting it, so both sites ask about THIS key.
     const adoptingStale =
-      existing.owner !== undefined &&
-      staleOwners.has(existing.owner) &&
+      isStaleClaim(staleClaims, existing.owner, existing.key) &&
       existing.status !== "completed" &&
       task.owner === caller &&
       taskEquals(
@@ -740,7 +755,7 @@ export function writeBoardSnapshot(
       throw new TowerDoValidationError(
         `task ${task.key} is owned by "${existing.owner}" — workers may update only their own tasks ` +
           `(${TOWER_IDENTITY} may update any)` +
-          staleOwnerHint(existing, staleOwners),
+          staleClaimHint(existing, staleClaims),
       );
     }
     updated.push(task.key);
@@ -774,8 +789,10 @@ export function writeBoardSnapshot(
     schemaVersion: TOWER_DO_SCHEMA_VERSION,
     revision: changed ? current.revision + taskEvents.length : current.revision,
     tasks: nextTasks,
-    messages: current.messages,
-    findings: current.findings,
+    // Fresh arrays: the returned view must not alias the caller's board (a
+    // caller mutating the result would otherwise mutate the input view).
+    messages: [...current.messages],
+    findings: [...current.findings],
     skipped: current.skipped,
   };
 
@@ -807,17 +824,28 @@ function cloneNormalizedTask(
   };
 }
 
+/** Element-wise list equality. Compared element by element rather than by
+ * joining with a separator: a join is only injective when the separator cannot
+ * appear in a value, and these lists hold arbitrary caller text. */
+function listEquals(
+  left: readonly string[] | undefined,
+  right: readonly string[] | undefined,
+): boolean {
+  const a = left ?? [];
+  const b = right ?? [];
+  return a.length === b.length && a.every((value, index) => value === b[index]);
+}
+
 function taskEquals(left: TowerDoTask, right: TowerDoTask): boolean {
   return (
     left.subject === right.subject &&
     left.status === right.status &&
     left.description === right.description &&
     left.owner === right.owner &&
-    left.dependsOn.join("\u0000") === right.dependsOn.join("\u0000") &&
-    (left.scope ?? []).join("\u0000") === (right.scope ?? []).join("\u0000") &&
-    (left.changedFiles ?? []).join("\u0000") ===
-      (right.changedFiles ?? []).join("\u0000") &&
-    left.blockedBy.join("\u0000") === right.blockedBy.join("\u0000")
+    listEquals(left.dependsOn, right.dependsOn) &&
+    listEquals(left.scope, right.scope) &&
+    listEquals(left.changedFiles, right.changedFiles) &&
+    listEquals(left.blockedBy, right.blockedBy)
   );
 }
 
@@ -1552,16 +1580,20 @@ export function checkpointDigest(
     .map((finding) => {
       const state = deriveFindingState(finding, now, liveOwners);
       return {
-        id: finding.id,
+        // Truncated to exactly what `readBoardDigest` accepts. The fold does
+        // NOT bound these fields, so a legacy row with an over-long title would
+        // otherwise make the writer emit a checkpoint its own reader rejects —
+        // silently losing the ENTIRE digest instead of one display field.
+        id: truncateToAtMost(finding.id, MAX_IDENTITY_CHARS),
         severity: finding.severity,
         kind: finding.kind,
-        title: finding.title,
+        title: truncateToAtMost(finding.title, MAX_FINDING_TITLE_CHARS),
         // Owner and snooze deadline are carried ONLY for the state they belong
         // to. An `accepted` finding whose owner died derives `actionable`, and
         // carrying the dead claim's owner would round-trip into the impossible
         // `open`+`owner` shape (the live fold always clears an owner on open).
         ...(state === "claimed" && finding.owner !== undefined
-          ? { owner: finding.owner }
+          ? { owner: truncateToAtMost(finding.owner, MAX_IDENTITY_CHARS) }
           : {}),
         state,
         ...(state === "snoozed" && finding.snoozeUntil !== undefined
@@ -1662,6 +1694,15 @@ export function readBoardDigest(
     typeof countsRecord.tasks.open !== "number" ||
     !Number.isSafeInteger(countsRecord.tasks.open) ||
     countsRecord.tasks.open < 0
+  ) {
+    return undefined;
+  }
+  // The count and the per-status tally must agree: a digest whose `open`
+  // disagrees with its own `byStatus` is corrupt/foreign, and accepting it
+  // would restore a view the writer could never have produced.
+  if (
+    countsRecord.tasks.open !==
+    byStatus.pending + byStatus.in_progress + byStatus.blocked
   ) {
     return undefined;
   }
@@ -1927,13 +1968,19 @@ export function isMessageFullyRead(
     if (!pendingStillHere) return true;
     return false;
   }
-  // Addressed message: fully read once the recipient acks. If the recipient
-  // is no longer an owner on the board (they left / the board was rebuilt),
-  // nobody can ever read it — treat it as fully read so orphan messages do
-  // not accumulate in the folded view forever. Reachability is proxied by
-  // TASK OWNERSHIP (CONTRACTS.md "undeliverable/orphaned messages
-  // auto-retire"); a recipient admitted only for recent board activity may
-  // therefore retire earlier than the age valve, which stays the bound.
+  // Addressed message: fully read once the recipient acks. `tower` is the
+  // reserved orchestrator identity and owns no task by design, so the
+  // ownership proxy below would classify every message to it as undeliverable
+  // and let the retention budget drop one that is still unread. Its read state
+  // is the ack list alone.
+  if (message.to === TOWER_IDENTITY) return identityListHas(readBy, message.to);
+  // Anyone else: if the recipient is no longer an owner on the board (they
+  // left / the board was rebuilt), nobody can ever read it — treat it as fully
+  // read so orphan messages do not accumulate in the folded view forever.
+  // Reachability is proxied by TASK OWNERSHIP (CONTRACTS.md
+  // "undeliverable/orphaned messages auto-retire"); a recipient admitted only
+  // for recent board activity may therefore retire earlier than the age valve,
+  // which stays the bound.
   const recipientStillHere = view.tasks.some(
     (task) => task.owner !== undefined && sameAgent(task.owner, message.to),
   );
@@ -2318,7 +2365,7 @@ export function parseActivityLine(line: string): ActivityEntry | undefined {
 /** Compact relative time for activity/presence lines (test-friendly). */
 export function relativeTime(now: number, at: number): string {
   const delta = Math.max(0, now - at);
-  if (delta < 45_000) return "just now";
+  if (delta < 60_000) return "just now";
   const minutes = Math.floor(delta / 60_000);
   if (minutes < 90) return `${minutes}m ago`;
   const hours = Math.floor(minutes / 60);
@@ -2496,7 +2543,7 @@ export function derivePresence(
 }
 
 /** Idle threshold after which the owner of a non-completed task becomes
- * adoptable/removable by anyone (see staleTaskOwners). Deliberately separate
+ * adoptable/removable by anyone (see staleTaskClaims). Deliberately separate
  * from SESSION_BREAK_GAP_MS (30 min), which now serves presence/idle display
  * only: ownership must not look dead just because a 30-minute session break
  * happened, and it must not survive 30 minutes of unrelated chatter either. */
@@ -2516,21 +2563,30 @@ export function formatTakeoverWindow(
 }
 
 /**
- * Owners eligible for takeover: an owner of at least one non-completed task
- * whose activity **on that task** is older than `idleMs`. Unrelated board
+ * Every displaceable claim on the board: `owner\u0000taskKey` pairs whose claim
+ * is dead. Staleness is charged to activity **on that task**: unrelated board
  * activity (messages, or work on other task keys) does NOT immunize a stale
  * row — the former `lastSeen` was board-global, so one status update anywhere
  * protected every stale task that owner held. When the owner has no activity
  * on the task, the task's own `updatedAt` is the clock, so a freshly assigned
- * row stays protected ("just assigned, not begun yet"). Pure read derivation;
- * never writes to the board.
+ * row stays protected ("just assigned, not begun yet").
+ *
+ * The unit is the CLAIM, never the owner. Returning a per-taskKey set is what
+ * keeps the derivation and its consumers in step: a set of owner labels cannot
+ * express "this owner is dead on this row but alive on that one", so an owner
+ * holding one long-idle row plus one freshly touched row would be reported
+ * wholesale and have BOTH displaced — silently losing the live row, the very
+ * outcome the per-task clock exists to prevent. Consumers (`isStaleClaim`) must
+ * therefore ask about the exact row they are about to touch.
+ *
+ * Pure read derivation; never writes to the board.
  *
  * `dependsOn`/`blockedBy` references are not visible in an `ActivityEntry`
  * (its `detail` is the task key for task events), so relevance is "this owner
  * wrote this task event". A dependency edit is a change to the depended-on
  * row, which that row's own owner clock already covers.
  */
-export function staleTaskOwners(
+export function staleTaskClaims(
   entries: readonly ActivityEntry[],
   tasks: readonly TowerDoTask[],
   now: number,
@@ -2553,7 +2609,7 @@ export function staleTaskOwners(
   const taskActivity = new Map<string, number>();
   for (const entry of entries) {
     if (entry.kind !== "task" || entry.taskKey === undefined) continue;
-    const key = `${entry.by}\u0000${entry.taskKey}`;
+    const key = claimKey(entry.by, entry.taskKey);
     const prior = taskActivity.get(key);
     if (prior === undefined || entry.at > prior)
       taskActivity.set(key, entry.at);
@@ -2570,10 +2626,28 @@ export function staleTaskOwners(
     )
       continue;
     const quietSince =
-      taskActivity.get(`${task.owner}\u0000${task.key}`) ?? task.updatedAt;
-    if (now - quietSince > idleMs) stale.add(task.owner);
+      taskActivity.get(claimKey(task.owner, task.key)) ?? task.updatedAt;
+    if (now - quietSince > idleMs) stale.add(claimKey(task.owner, task.key));
   }
   return stale;
+}
+
+/** Key of one claim in the `staleTaskClaims` set — the exact (owner, task)
+ * pair the guard is about to touch, so a stale row can never speak for a
+ * sibling row the same owner is still working on. NUL is the separator
+ * because it cannot appear in a validated identity or task key. */
+export function claimKey(owner: string, taskKey: string): string {
+  return `${owner}\u0000${taskKey}`;
+}
+
+/** Is THIS row's claim displaceable? `owner` defaults to the row's own owner,
+ * so a caller can ask about a stored task without unpacking it. */
+export function isStaleClaim(
+  staleClaims: ReadonlySet<string>,
+  owner: string | undefined,
+  taskKey: string,
+): boolean {
+  return owner !== undefined && staleClaims.has(claimKey(owner, taskKey));
 }
 
 /** Remediation hint attached to a full open-task budget (see writeBoardSnapshot):
@@ -2582,16 +2656,23 @@ export function staleTaskOwners(
 const OPEN_TASK_BUDGET_HINT =
   ' — free a slot by omitting your own or an unowned task, or compact a finished board with an as: "tower" write that replays only the rows to keep';
 
-/** Actionable hint appended to owner-guard errors when the owner is stale:
- * the rejection stays, but the caller learns the one legal move they have. */
-function staleOwnerHint(
+/** What a caller can still do about a row it is not allowed to touch.
+ *
+ * Both guard sites call this, and which branches can be reached differs: the
+ * removal guard `continue`s for a stale non-completed row, so a rejection there
+ * is always a completed row or a live claim; the update guard additionally
+ * rejects adoption-with-edits on a stale row. `status` therefore decides the
+ * remedy and the stale-claim set only decides whether there is one to name — a
+ * completed row never enters that set (a receipt is not displaceable), so its
+ * text must not depend on it. */
+function staleClaimHint(
   task: TowerDoTask,
-  staleOwners: ReadonlySet<string>,
+  staleClaims: ReadonlySet<string>,
 ): string {
-  if (task.owner === undefined || !staleOwners.has(task.owner)) return "";
   if (task.status === "completed")
-    return " (owner idle, but a completed task stays with its owner — receipt integrity)";
-  return ` (owner idle ${formatTakeoverWindow()}+ (per-task activity): adopt it by setting owner to yourself, or remove it)`;
+    return ' (a completed task stays with its owner — only that owner or an as: "tower" write that replays the rows to keep may drop it; a peer cannot forge a receipt)';
+  if (!isStaleClaim(staleClaims, task.owner, task.key)) return "";
+  return ` (owner idle past the ${formatTakeoverWindow()} takeover window: adopt it by setting owner to yourself and changing nothing else, then edit in a second write — or remove it)`;
 }
 
 /** Heartbeat cadence for the per-session liveness sidecar (`live/<sessionId>.json`, see index.ts): each session rewrites its own record on this cadence. */
@@ -2954,6 +3035,17 @@ export function truncateChars(value: string, max: number): string {
   return chars.length <= max ? value : `${chars.slice(0, max).join("")}…`;
 }
 
+/** Truncate to AT MOST `max` code points, ellipsis included. `truncateChars`
+ * is display-oriented and returns `max + 1` when it cuts, so it cannot be used
+ * where the result must satisfy a validated `<= max` bound (a checkpoint digest
+ * field must be re-readable by `readBoardDigest`). */
+export function truncateToAtMost(value: string, max: number): string {
+  const chars = [...value];
+  if (chars.length <= max) return value;
+  if (max <= 1) return chars.slice(0, Math.max(0, max)).join("");
+  return `${chars.slice(0, max - 1).join("")}…`;
+}
+
 /** Longest rendered `summary` prefix for one open finding in the dashboard.
  * A finding's `summary` is up to 4000 characters and the list is not the place
  * to read it — the full text is one `findingId` lookup away. The surrounding
@@ -3013,15 +3105,23 @@ export function formatDashboardHiddenNote(
 const DASHBOARD_SECTION_RANK: readonly string[] = [
   "## Mine",
   "## Needs you",
+  // `view=all` renders the findings section as `## Findings`, the folded view
+  // as `## Open findings`; they are one section under two titles, and both must
+  // rank above history or a finite budget spends itself on `## Completed`.
   "## Open findings",
+  "## Findings",
   "## Messages for",
+  "## Who is around",
   "## Scope conflicts",
   "## Others",
   "## Completed",
   "## Recent activity",
 ];
 
-const DASHBOARD_MUST_SEE_SECTIONS = 4;
+/** Sections that keep a heading plus one content line before the rest of the
+ * budget is spent (the two findings spellings count as one concept, so this is
+ * 5 titles for the 4 action sections). */
+const DASHBOARD_MUST_SEE_SECTIONS = 5;
 
 function dashboardSectionRank(title: string): number {
   const index = DASHBOARD_SECTION_RANK.findIndex((prefix) =>
@@ -3114,7 +3214,10 @@ export function foldDashboardSections(
       kept.push(section.rows[row]);
     }
   }
-  kept.push(...notes);
+  // Disclosures are kept last, but the budget is absolute: when the caller
+  // passes a budget smaller than the note count, the notes that fit survive and
+  // the remainder is cut (the reservation above cannot hold them all).
+  kept.push(...notes.slice(0, Math.max(0, budget - kept.length)));
   return kept;
 }
 

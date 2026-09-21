@@ -161,7 +161,7 @@ import {
   retainMessages,
   sliceScopeConflicts,
   sliceTaskDashboard,
-  staleTaskOwners,
+  staleTaskClaims,
   findingCountsFor,
   taskIsBlocked,
   identityListHas,
@@ -1866,7 +1866,7 @@ export default function towerDoExtension(pi: ExtensionAPI): void {
     label: "TowerDo",
     description: `Maintain the shared multi-agent task board with one atomic update.
 - Full replacement at the task level: include every key to keep; any current key omitted from the list is removed (an omitted task owned by another agent is rejected instead of dropped — replay peers' and unowned tasks you did not mean to lose). Fields are per-field: omitted optional fields on an existing key are preserved, and new keys require subject and status.
-- Owner guard: a task with an owner can only be changed (any field) or removed by its owner or the "tower" identity. Exception: an owner whose activity ON THAT TASK is older than ${formatTakeoverWindow()} (TASK_CLAIM_STALE_MS; unrelated board chatter does not protect a row) may be displaced on a non-completed task — adopt it by setting owner to yourself and changing nothing else in that write (any content edit in the same write is rejected; re-plan in a second write), or remove it; completed tasks stay guarded.
+- Owner guard: a task with an owner can only be changed (any field) or removed by its owner or the "tower" identity. Exception: a non-completed task whose OWN activity is older than ${formatTakeoverWindow()} (TASK_CLAIM_STALE_MS; unrelated board chatter does not protect a row, and an owner's activity on another task never protects this one) may be displaced row by row — adopt it by setting owner to yourself and changing nothing else in that write (any content edit in the same write is rejected; re-plan in a second write), or remove it; completed tasks stay guarded.
 - Dependencies gate status: in_progress/completed require every dependsOn entry to be completed, dependsOn keys must exist on the board or in this call, and cycles are rejected (blocked is exempt).
 - Set changedFiles only in the same write that completes a task; reopening a task without changedFiles voids the inherited receipt.
 - Content limits (subject ${MAX_TASK_SUBJECT_CHARS} / description ${MAX_TASK_DESCRIPTION_CHARS} characters) are enforced per task and a violation names the task key, so fix that one row instead of resending everything. An omitted field on an existing task is preserved (send only what changes); long-form evidence belongs in a tower_do_talk message or a finding, not in description.
@@ -1955,8 +1955,8 @@ export default function towerDoExtension(pi: ExtensionAPI): void {
             .map((line) => parseActivityLine(line))
             .filter((entry): entry is ActivityEntry => entry !== undefined);
         } catch {
-          // Unreadable log → empty activity, which `staleTaskOwners` maps to
-          // "no stale owners" (strict guard); the write must still land.
+          // Unreadable log → empty activity, which `staleTaskClaims` maps to
+          // "no stale claims" (strict guard); the write must still land.
         }
         // Liveness tiebreaker: an owner whose process still heartbeats is
         // never stale, however quiet on the board. Read failure → treat
@@ -1990,8 +1990,8 @@ export default function towerDoExtension(pi: ExtensionAPI): void {
           // No/unreadable live dir → no liveness data → no takeover.
         }
         // An empty activity list (unreadable / empty log) already means "no
-        // stale owners" inside the derivation — strict guard, never loosened.
-        const staleOwners = staleTaskOwners(
+        // stale claims" inside the derivation — strict guard, never loosened.
+        const staleClaims = staleTaskClaims(
           activity,
           freshView.tasks,
           Date.now(),
@@ -2002,7 +2002,7 @@ export default function towerDoExtension(pi: ExtensionAPI): void {
           freshView,
           { tasks: params.tasks, baseRevision: params.baseRevision },
           caller,
-          staleOwners,
+          staleClaims,
         );
         throwIfAborted(signal, "TowerDo update");
         await appendLocked(details.taskEvents);

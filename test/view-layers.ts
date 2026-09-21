@@ -536,6 +536,50 @@ check(
     foldedCrowded.includes("… +53 more row(s) hidden by the 200-row budget"),
   foldedCrowded.join(" / "),
 );
+// The renderer emits TWO findings spellings: the folded view uses
+// "## Open findings" and `view=all` uses "## Findings", and presence is
+// "## Who is around". Every one of them is an action section and must outrank
+// history, or a finite budget spends itself on `## Completed` and the reader
+// never sees the findings they were told to triage.
+const foldedAllFindings = foldDashboardSections(
+  [
+    "head-1",
+    "head-2",
+    "## Who is around (2)",
+    "- alice — just now",
+    "## Findings (3/50 non-closed · 2 actionable · 0 claimed · 0 snoozed · 1 closed<7d)",
+    "- f1",
+    "## Completed (9)",
+    "- c1, c2, c3, c4, c5",
+    "## Recent activity (newest first)",
+    "- a1",
+  ],
+  6,
+);
+check(
+  "view=all action sections (## Findings, ## Who is around) outrank history",
+  foldedAllFindings.some((line) => line.startsWith("## Findings")) &&
+    foldedAllFindings.some((line) => line.startsWith("## Who is around")) &&
+    !foldedAllFindings.some((line) => line.startsWith("## Completed")),
+  foldedAllFindings.join(" / "),
+);
+// Disclosures are kept, but the budget is absolute: with more notes than the
+// budget the result must still fit. The renderer can emit up to four.
+const foldedNoteOverflow = foldDashboardSections(
+  [
+    "## Mine (2)",
+    "- m1",
+    "  … +40 more row(s) hidden by the 200-row budget",
+    "  … +68 more conflict(s) not shown — view=all lists every one",
+    "  … 3 closed finding(s) retired beyond 7d — view=all lists them, findingId reads full text",
+  ],
+  2,
+);
+check(
+  "disclosure notes cannot exceed the fold budget",
+  foldedNoteOverflow.length <= 2,
+  `${String(foldedNoteOverflow.length)} lines: ${foldedNoteOverflow.join(" / ")}`,
+);
 const foldedDetail = foldDashboardSections(
   Array.from({ length: 30 }, (_, i) => `line-${String(i)}`),
   16,

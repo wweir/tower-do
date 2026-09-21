@@ -103,8 +103,14 @@ function readEvent(candidate: unknown): BoardEvent | undefined {
       return undefined;
     const key = typeof candidate.key === "string" ? candidate.key : undefined;
     const by = typeof candidate.by === "string" ? candidate.by : "?";
-    const at = isEpochMs(candidate.at) ? candidate.at : Date.now();
-    return { kind: "task", op: candidate.op, key, by, at };
+    // No `Date.now()` fallback: a task event's `at` IS the identity/ownership
+    // clock (the fold falls back to it for a missing `updatedAt`, and
+    // `staleTaskClaims` reads the result). Fabricating it would both make the
+    // fold non-deterministic — a different `updatedAt` on every read — and
+    // report a corrupt line as fresh, so the takeover window would never open.
+    // `parseActivityLine` rejects the same line; the two clocks must agree.
+    if (!isEpochMs(candidate.at)) return undefined;
+    return { kind: "task", op: candidate.op, key, by, at: candidate.at };
   }
   if (candidate.kind === "message" && isRecord(candidate.message)) {
     const message = readPersistedMessage(candidate.message);
@@ -378,13 +384,19 @@ export class TowerBoard {
       // `P` is only well-defined as a suffix of the exact bytes we CAS'd.
       if (!preserved.startsWith(raw)) return false;
       const pending = preserved.slice(raw.length);
-      if (pending.trim().length === 0) return true; // nothing was orphaned
+      // An empty `pending` does NOT prove the live file is ours: a peer that
+      // compacted (or rewrote) in the window can leave no append behind while
+      // the live board is a DIFFERENT compaction. Skip the rewrite, but only
+      // after proving the live shape under a fresh lease — otherwise the
+      // caller reports "reconciled" and drops `prev` while its own compaction
+      // is not even live.
       return await this.withLock(async (lease) => {
         const live = await readFile(this.file, "utf8");
         // Pure appends on top of our compaction are the only provable shape;
         // a peer compaction (or any rewrite) is not recoverable this way.
         if (!live.startsWith(content)) return false;
         const after = live.slice(content.length);
+        if (pending.trim().length === 0) return true; // nothing was orphaned
         const tmp = `${this.file}.reconcile-${randomUUID().slice(0, 8)}`;
         try {
           const handle = await open(tmp, "w");
@@ -863,6 +875,17 @@ export class TowerBoard {
         await options.testHooks?.beforeCasCheck?.();
         await assertUnchanged();
         await options.testHooks?.beforeRename?.();
+        // Archive BEFORE the [final-CAS, rename] window opens. That window is
+        // where a lease-ignoring older writer's append can still slip in, and
+        // the CAS exists to keep it one syscall wide — a whole-file archive
+        // write inside it would widen the very race it covers. The flag is set
+        // BEFORE the write so a partial archive is removed on any later abort
+        // (a compaction that never swapped must leave no archive claiming it
+        // did).
+        if (archived !== undefined) {
+          archivedWritten = true;
+          await writeFile(archived, raw, "utf8");
+        }
         // PRESERVE the pre-compact inode before the swap (hard link): if the
         // lease is stolen in the rename window — this holder paused past
         // STALE_LOCK_MS between the proof below and the rename — a peer's
@@ -893,14 +916,6 @@ export class TowerBoard {
             throw new TowerDoValidationError(
               "compaction aborted: a peer appended to the board since the fold — re-read and retry",
             );
-          }
-          // Archive LAST before the swap: the CAS just proved `raw` is still
-          // the live content, and an abort before the rename must leave no
-          // archive behind. The flag is set BEFORE the write so a partial
-          // archive is removed on any later abort too.
-          if (archived !== undefined) {
-            archivedWritten = true;
-            await writeFile(archived, raw, "utf8");
           }
           await options.testHooks?.beforeSwap?.();
           // The path must still name the preserved inode. A peer that
