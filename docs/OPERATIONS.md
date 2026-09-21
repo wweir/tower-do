@@ -50,10 +50,35 @@ runs the compile + test gate, `npm publish`, and then creates a GitHub
 Release for the tag — all automatically. This is the **only** release path —
 no manual `npm publish` or `gh release create`.
 
+The tag must sit **on the release commit** — the one that changes
+`package.json`'s version and nothing else. `git tag` defaults to `HEAD`, so
+tagging after any further commit silently points the tag at a tree whose
+`package.json` still carries the OLD version, and the job fails at the version
+gate with the work already pushed. Land the release commit last, tag that
+commit explicitly, and never `git push --tags` from a dirty/ahead HEAD.
+
 ```bash
-# bump version in package.json, commit, then:
-git tag vX.Y.Z && git push origin main --tags
+# 1. version bump ONLY — one commit, one file:
+#    package.json: "version": "X.Y.Z"
+git add package.json
+git commit -m "chore(release): vX.Y.Z"
+
+# 2. tag THAT commit (HEAD right now), then push both:
+git tag vX.Y.Z
+git push origin main
+git push origin vX.Y.Z
+
+# verify before pushing anything (both must agree):
+git log -1 --format=%s vX.Y.Z                 # chore(release): vX.Y.Z
+git show vX.Y.Z:package.json | grep version   # "version": "X.Y.Z"
 ```
+
+If a tag is already pushed by mistake, delete it before recreating it —
+**but only while npm has no such version** (`curl -s -o /dev/null -w '%{http_code}'
+https://registry.npmjs.org/tower-do/X.Y.Z` → `404`). A tag whose release
+succeeded must never be force-moved: cut the next version instead. A stale,
+never-published duplicate also has to be removed, or it becomes the previous
+tag the release notes walk back to and the real work is left out of the notes.
 
 - The repo ships TypeScript sources directly (`main: ./index.ts`, no build
   step), so the "compile" gate is `bunx tsc --noEmit -p tsconfig.json`.
