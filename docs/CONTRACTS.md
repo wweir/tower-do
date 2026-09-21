@@ -190,12 +190,18 @@ another owner's content or roll back a concurrent update. The re-fold,
 cross-process write lease; a peer cannot commit another replacement between
 the guard and append.
 
-### Stale-owner exception (takeover)
+### Stale-claim exception (takeover)
 
-An owner of a non-completed task whose activity **on that task** is older than
-`TASK_CLAIM_STALE_MS` (= `OWNER_TAKEOVER_MS`, 6 h) — or who never started at
-all and whose task has sat untouched that long — is *displaceable*
-(`staleTaskOwners`, pure derivation over board activity + task timestamps).
+A non-completed task whose activity **on that task** is older than
+`TASK_CLAIM_STALE_MS` (= `OWNER_TAKEOVER_MS`, 6 h) — or which was never started
+and has sat untouched that long — is *displaceable* (`staleTaskClaims`, pure
+derivation over board activity + task timestamps; `isStaleClaim` asks about one
+row). The unit is the **claim**, not the owner: the derivation and both guard
+sites key on `owner+task`, so an owner with one stalled row and one freshly
+touched row is displaceable on the first and protected on the second. Charging
+staleness per task and then applying it per owner would hand a peer the live
+sibling — the same data loss as deleting it.
+
 Unrelated board activity (messages, or work on other task keys) does NOT
 protect a row: the clock is per owner+task. The 30 min `SESSION_BREAK_GAP_MS`
 now only groups the activity feed / presence hints, never ownership:
@@ -216,10 +222,19 @@ now only groups the activity feed / presence hints, never ownership:
   exception, it never loosens it.
 
 Completed tasks keep the full guard even when their owner is idle — a delivery
-receipt cannot be dropped or forged by a peer. A fresh assignment is protected
-(an owner with no activity whose task `updatedAt` is recent is "just assigned,
-not begun yet", not stalled); a missing/unreadable activity log disables the
-exception (no stale owners) rather than loosening the guard.
+receipt cannot be dropped or forged by a peer, and a completed row never enters
+the claim set at all (so its rejection carries no takeover hint). A fresh
+assignment is protected (an owner with no activity whose task `updatedAt` is
+recent is "just assigned, not begun yet", not stalled); a missing/unreadable
+activity log disables the exception (no stale claims) rather than loosening the
+guard. The hint on a rejected write is chosen by the row's `status`, never by
+the claim set. Completed rows get the receipt text (a peer cannot drop or forge
+the receipt; only the owner, or an `as: "tower"` write that simply replays the
+rows to keep, can). A stale non-completed row is only
+ever rejected by the *update* guard — a write that is not the pure ownership
+swap, i.e. adoption carrying a content edit, or a content edit without
+adoption — and gets the adopt-then-edit remedy. A row whose own claim is live
+gets no hint at all: there is no legal move to name.
 
 ## Message contracts
 
@@ -239,7 +254,11 @@ exception (no stale owners) rather than loosening the guard.
   Reachability is proxied by TASK OWNERSHIP, because retention is a pure
   function of the folded view: a recipient admitted only for recent board
   activity may therefore retire earlier than the age valve — the age valve is
-  always the bound.
+  always the bound. The reserved `tower` is the one exception: it owns no task
+  by design, so ownership cannot proxy its reachability and a message to it
+  counts as read only when `tower` **acks** it. Applying the ownership proxy to
+  `tower` would classify an unread message as undeliverable and let the budget
+  retire it — the exact failure the budget exists to prevent.
 - `send` (taskKey existence, recipient validation, audience snapshot) and
   `inbox` (fold + read receipts) run their read-modify-append INSIDE the write
   lease: a concurrent peer cannot delete the task between the check and the
@@ -339,7 +358,11 @@ exit is explicit and auditable:
   become a hard failure.
 - **Rename window**: no userspace lease can exclude a holder paused past
   `STALE_LOCK_MS` between the final proof and the rename, so the compact
-  re-proves the lease right AFTER the rename. Immediately before the swap it
+  re-proves the lease right AFTER the rename. The archive write sits BEFORE the
+  final CAS, deliberately outside the `[final CAS, rename]` window: that window
+  must stay as narrow as possible for the one residual append race, and a
+  whole-file write inside it would widen the very window the CAS exists to
+  close. Immediately before the swap it
   also verifies the path still names the preserved inode: a peer that replaced
   the board (compacted) in the window makes the compact abort with the peer's
   board live, instead of silently swapping it away. On a steal it fails LOUD
@@ -376,7 +399,12 @@ never used for writes (the write path folds the real file, missing = empty,
 revision 0). A restored entry is re-validated per ROW, not only in count: keys
 must match the task-key pattern and the rendered subject/title/owner/id fields
 are length- and single-line-bounded, so a forged entry cannot materialize an
-unbounded or newline-injecting view. `closed`/`retired` travel through a
+unbounded or newline-injecting view. The WRITER obeys the same bounds it
+validates (over-long `id`/`title`/`owner` are truncated to exactly `≤ max`): the
+fold does not bound them, so emitting one raw would make the reader discard the
+WHOLE checkpoint and a session with a missing board file would restore an empty
+board. The declared `counts.tasks.open` must also equal the sum of its
+`byStatus` non-completed counts, so a forged count cannot contradict the rows. `closed`/`retired` travel through a
 re-checkpoint: a digest-only view carries no closed rows, so re-size-summarizing
 it would persist zero in place of the checkpoint's counts.
 
@@ -451,18 +479,18 @@ bun install            # devDeps (bun-types + typescript) — typecheck/tests on
 bunx tsc --noEmit -p tsconfig.json      # strict + noUnused, zero errors
 bun run test/smoke.ts               # end-to-end: 3 tools, persistence, scoping, changedFiles disk round-trip, reminder cadence vs snapshot strip, dashboard truncation footer
 bun run test/config.ts              # config fail-loud + reserved identity (11 cases)
-bun run test/owner-guard.ts         # every-field owner guard + per-task stale-owner takeover (25 cases)
-bun run test/presence-retention.ts  # read receipts / retirement / presence / caller-line match / checkpoints (66)
-bun run test/finding-exit.ts        # finding lifecycle/budget/view-retirement + bounded checkpoint digest + writer-side digest guards + digest round-trip + forged-digest field bounds + non-finite timestamps (43 cases)
+bun run test/owner-guard.ts         # every-field owner guard + per-claim stale takeover + dependency-cycle and no-op-replay guards (35 cases)
+bun run test/presence-retention.ts  # read receipts / retirement / presence / caller-line match / checkpoints (68)
+bun run test/finding-exit.ts        # finding lifecycle/budget/view-retirement + bounded checkpoint digest + writer-side digest guards + digest round-trip + forged-digest field bounds + non-finite timestamps (51 cases)
 bun run test/changed-files.ts       # P0 receipt invariants (12 cases)
 bun run test/scope-conflicts.ts     # P1 glob + conflict derivation (17 cases)
 bun run test/git-count.ts           # widget git-segment pure derivations (31 cases)
 bun run test/live-sessions.ts       # widget live-segment liveness window + sidecar-record parsing (30 cases)
 bun run test/board-progress.ts      # widget board-progress remaining-work glance (8 cases)
 bun run test/task-cap.ts            # open-task budget + fabricated-receipt bound (19 cases)
-bun run test/board-compact.ts       # explicit log compaction: revision preserved, entity survival, owner-clock + lease/CAS atomicity, token-scoped stale reaping, lease exclusivity + abort cleanup, task revision gate, steal-in-rename-window (loud abort + provable reconcile, else evidence; no blind rollback), both-window P/W reconcile ordering, structural-failure fail-loud (43 cases)
+bun run test/board-compact.ts       # explicit log compaction: revision preserved, entity survival, owner-clock + lease/CAS atomicity, token-scoped stale reaping, lease exclusivity + abort cleanup, task revision gate, steal-in-rename-window (loud abort + provable reconcile, else evidence; no blind rollback), both-window P/W reconcile ordering, structural-failure fail-loud (50 cases)
 bun run test/home-isolation.ts      # static guard: every index.ts-loading suite isolates HOME before import and imports dynamically (9 cases)
-bun run test/view-layers.ts         # layered unfinished view (mine/needs/others) + key ledger + recency order + reminder + folded TUI sections + dashboard budget slice/note (74 cases)
+bun run test/view-layers.ts         # layered unfinished view (mine/needs/others) + key ledger + recency order + reminder + folded TUI sections + dashboard budget slice/note (76 cases)
 bun run test/limits.ts              # arg schema vs fold: derived bounds, transport guard, key-bearing errors, list-cap ordering, per-entry caps, code-point metric (61 cases)
 bun run test/identity-scope.ts      # session scoping: a nested in-process session never re-labels its parent (reminder + status identity), bucket siblings stay distinct (6 cases)
 bun run test/identity-label.ts       # identity labels: bucket siblings stay distinct; permission exact, delivery aliased, legacy rows adoptable via the idle window (39 cases)

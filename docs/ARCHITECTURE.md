@@ -54,10 +54,18 @@ semantics:
   as an empty board; any other read error throws (an unreadable file must not
   look like a cleared board).
   `rawLines()` / `rawTail()` always throw on I/O error — display callers
-  degrade; the stale-owner gate reads `rawLines()` (full log) so a bounded
+  degrade; the stale-claim gate reads `rawLines()` (full log) so a bounded
   tail can never misreport an active owner as idle.
 - The revision a write returns **exactly equals a re-fold** of the file
   (one bump per task event), so a caller can verify the write landed.
+- A line the fold cannot turn into an event (corrupt JSON, a foreign shape, or a
+  task event with no usable `at`/`updatedAt`) is counted in `view.skipped` and
+  disclosed — NEVER salvaged with `Date.now()`. For a task event the timestamp
+  IS the ownership clock (the fold falls back to it, and `staleTaskClaims`
+  reads the result), so fabricating one would make the fold non-deterministic
+  between reads and report a corrupt line as permanently fresh, defeating the
+  takeover window. The activity parser rejects the same line, so presence and
+  the fold read one clock, not two.
 
 ### Log compaction (explicit)
 
@@ -117,7 +125,7 @@ exactly one file `~/.pi/tower-do/<project>/live/<identity>.<sessionId>.json`
 on clean exit. The count is a pure read derivation (`liveSessionCount` in
 `state.ts`): distinct identities with a record fresh within 2 minutes, plus
 self. Optional `aliases` are extra owner labels the session has written as
-(`as: "coder-1"`): they populate the stale-owner gate's liveness set (a
+(`as: "coder-1"`): they populate the stale-claim gate's liveness set (a
 parent still heartbeating protects its subagent's claim) but never inflate
 `live N`. Own-file snapshots are serialized per session, so an older write
 cannot land after a newer one and drop an alias. `fs.watch`
@@ -142,14 +150,16 @@ activity tail — they never mutate the file, and callers cannot "write" them:
 - **Presence** (`Who is around`): per-identity last-seen from parsed activity
   lines; three states — active / `⚠ idle` (>10 min quiet) / (not started).
   Real idle owners of unfinished tasks are footnoted on `tower_do` receipts.
-- **Stale owners** (`staleTaskOwners`): owner labels whose activity **on that
-  task** (or, for a never-active owner, the task's `updatedAt`) is older than
-  `TASK_CLAIM_STALE_MS` and who have no fresh sidecar heartbeat/alias. The old
-  board-global `lastSeen` let one unrelated message immunize every stale row;
-  the clock is now per owner+task key. Feeds the owner-guard's takeover
-  exception (contract in CONTRACTS.md) — a permission gate, not a display:
-  `tower_do` reads the full activity log and the sidecar dir, and any read
-  failure yields no stale owners (strict guard).
+- **Stale claims** (`staleTaskClaims`): the `owner+task` pairs whose activity
+  **on that task** (or, for a never-active owner, the task's `updatedAt`) is
+  older than `TASK_CLAIM_STALE_MS` and whose owner has no fresh sidecar
+  heartbeat/alias. The old board-global `lastSeen` let one unrelated message
+  immunize every stale row; the clock is now per owner+task key. The set is
+  keyed by that same pair, and `isStaleClaim` asks about one row, so an owner
+  stalled on one task stays protected on the task it is still touching. Feeds
+  the owner-guard's takeover exception (contract in CONTRACTS.md) — a
+  permission gate, not a display: `tower_do` reads the full activity log and
+  the sidecar dir, and any read failure yields no stale claims (strict guard).
 - **Finding state** (`deriveFindingState`): `actionable` / `claimed` /
   `snoozed` / `closed`, derived from status + `snoozeUntil` + liveness. The
   view retires closed rows past the grace (`retainFindings`) and pages by

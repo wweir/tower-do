@@ -40,9 +40,22 @@ copied the WHOLE folded view into the session transcript (measured: a single
    view in the transcript; every field is bounded by a named constant.
 
 Also corrected two pre-existing clocks that made the old exits unreliable:
-`staleTaskOwners` now charges staleness to activity **on that task** (the old
+`staleTaskClaims` now charges staleness to activity **on that task** (the old
 `lastSeen` was board-global, so one unrelated message immunized every stale
 row) at `TASK_CLAIM_STALE_MS` (6 h), separate from the 30 min presence hint.
+The derivation is per **claim** (`owner+task`), and so are its consumers: it
+used to return owner labels while the guard applied them per owner, which let
+one long-idle row expose the same owner's freshly touched row to takeover or
+removal — the per-task clock's own failure mode, in the permission layer. The
+same pass fixed the rejection hint, whose completed branch keyed on the
+owner-level set instead of the row: it fired whenever the owner happened to be
+stalled on some *other* row (a completed row never enters the set, so the
+condition was never about the row being rejected), annotating a receipt as
+"owner idle" and naming no usable remedy. The other branch's "adopt it … or
+remove it" was sound for a genuinely stalled row but, with an owner-level set,
+got appended to rejections of rows the owner had touched a minute earlier. The
+remedy is now chosen by the row's `status`, and the claim set only decides
+whether that row's claim is dead.
 
 **Rejected.** A single age TTL over all record classes (hides actionable
 bug/vuln reports — the opposite of an exit); closing a finding because its
@@ -300,8 +313,8 @@ manual approval per release was not wanted.
 **Context.** `session_compact` / `before_agent_start` persist a
 `TOWER_DO_BOARD_TYPE` custom message in the transcript. The `context` hook
 strips those (and `TOWER_DO_REMINDER_TYPE`) so a peer cancel cannot linger
-in the LLM window. The same `hadBoardContext` flag also skipped
-`REMINDER_INTERVAL`: once a snapshot was in the window, every subsequent
+in the LLM window. The same `hadBoardContext` flag (since removed; the
+current mechanism is `llmCallsSinceReminder`) also skipped `REMINDER_INTERVAL`: once a snapshot was in the window, every subsequent
 LLM call re-injected a fresh reminder.
 
 **Decision.** Strip is unconditional; cadence always counts the call. A
@@ -433,12 +446,12 @@ Completed tasks keep the full guard (a receipt cannot be dropped or forged by
 a peer), and the sidecar heartbeat (session identity plus `as` aliases)
 keeps an alive-but-heads-down owner from being raced. The exact mechanism,
 failure modes, and inert-on-bad-data rules are the contract in CONTRACTS.md
-§ Stale-owner exception.
+§ Stale-claim exception.
 
 **Superseded (2026-09).** The threshold is no longer 30 min: `OWNER_TAKEOVER_MS`
 is now an alias of `TASK_CLAIM_STALE_MS` (**6 h**), so the two cannot drift,
 and the 30 min `SESSION_BREAK_GAP_MS` serves only presence/session-break
-display. CONTRACTS.md § Stale-owner exception is authoritative.
+display. CONTRACTS.md § Stale-claim exception is authoritative.
 
 Properties: the threshold is far beyond the 10-minute display-only idle mark
 (`PRESENCE_IDLE_MS`) so a heads-down worker is never raced; a task assigned

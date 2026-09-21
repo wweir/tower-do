@@ -106,7 +106,7 @@ liveness 只把 `accepted` 打回 `actionable`（可被接管）。提出者 ses
 
 ## Layer 1b — task / message 语义修正（仍属「谁该动」，不是删文件）
 
-**task 接管阈值拆开。** `OWNER_TAKEOVER_MS`（30min）只服务 presence / idle 显示。接管改用 `TASK_CLAIM_STALE_MS = 6h`，且 `lastSeen` 是 **该 owner 在该 task key 上的事件活动**（`staleTaskOwners` 按 `by + taskKey` 取最大 `at`；活动条目不带 `dependsOn`/`blockedBy` 信息，依赖编辑算作被依赖行自身的更新），否则退回 `task.updatedAt`。全局「刚发过一条无关消息」不再给名下所有陈旧 task 免疫。完成行仍不可被 peer 丢掉。
+**task 接管阈值拆开。** `OWNER_TAKEOVER_MS`（30min）只服务 presence / idle 显示。接管改用 `TASK_CLAIM_STALE_MS = 6h`，且 `lastSeen` 是 **该 owner 在该 task key 上的事件活动**（`staleTaskClaims` 按 `by + taskKey` 取最大 `at`；活动条目不带 `dependsOn`/`blockedBy` 信息，依赖编辑算作被依赖行自身的更新），否则退回 `task.updatedAt`。全局「刚发过一条无关消息」不再给名下所有陈旧 task 免疫。完成行仍不可被 peer 丢掉。
 
 **message 视图退休加一条年龄阀，仍不改文件。** 保留全已读超出 `MESSAGE_RETENTION` 的退休。未全读超过 `MESSAGE_PENDING_RETIRE_MS = 14d` 的，从默认 inbox/dashboard 移入「retired-in-view」，披露条数。`inbox all`（或等价开关）读退役区；退役 id 集合每次 fold **确定性重算**，只存在于内存与本次输出，**不进 checkpoint**。孤儿广播仍按现契约退休。
 
@@ -250,7 +250,7 @@ CheckpointDigest
 - 旧 finding 行（无 `owner`）fold 不进 `skipped`。
 - 1000 closed finding + 1000 completed task：digest JSON 字节数与 10 条时相同；digest 顶层与 `counts` 内不得再有其它数组字段。
 - `restore` 仅 digest：披露不可写全量，不产出可当 `baseRevision` 用的幽灵板。
-- `staleTaskOwners`：无关全局活动不免疫；同 task 活动或 `updatedAt` 才算。
+- `staleTaskClaims`：无关全局活动不免疫；同 task 活动或 `updatedAt` 才算。
 - compact：`fold().revision` 等于 compact 前；CAS 冲突中止且 live 不变；rename 前崩溃 live 不变；`skipped > 0` 默认拒绝。
 - `inbox all` 能读到视图退休的消息；默认 inbox 读不到。
 
@@ -260,7 +260,7 @@ HOME 隔离断言放现有测试文件，不算新套件。
 
 1. 常量 + `deriveFindingState` / 预算检查 / `retainFindings` + `test/finding-exit.ts`。
 2. `tower_do_talk` 字段（`owner`/`reason`/`snoozeUntil`/`findingIds`/`inbox all`）与 dashboard 排序/计数。
-3. `staleTaskOwners` 判定改造 + 既有 `test/owner-guard.ts`。
+3. `staleTaskClaims` 判定改造 + 既有 `test/owner-guard.ts`。
 4. `CheckpointDigest` 替换三处 clone；`latestBoardCheckpoint` 双类型；`restore` 披露。
 5. `fold()` 识别 `kind:"compact"` + `action: "gc"` CAS；`test/board-compact.ts`。
 6. 测试 HOME 隔离；`tower_do_status` 的 `state:` 行。
