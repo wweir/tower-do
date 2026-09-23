@@ -4,6 +4,58 @@
 > / reviews live in docs/plans + docs/reviews and get folded here when they
 > become durable rules.
 
+## 2026-09 — log cleanup is threshold-triggered, not advisory
+
+**Context.** The four-layer board exit bounded `board.jsonl` only with an
+*explicit* `tower_do action:"gc"` and documented that as deliberate ("never
+automatic"). In practice it never ran: `~/.pi/tower-do` held 17 boards — one at
+1185 lines / 1.2MB (155 tasks, 136 completed, 70 non-closed findings) — and not
+a single `archive/` directory existed. The one command the `tower_do_status`
+hint names also failed on the boards that most needed it: a legacy row whose
+`blockedBy` exceeds the retrofitted `MAX_BLOCKER_CHARS` makes the fold skip the
+whole row, and `skipped > 0` blocked the compact unless `dropSkipped` was
+passed. The archive the compact writes was never pruned either, so each `gc`
+copied the whole log forward — "the only bound on disk is an explicit gc" was
+false.
+
+**Decision.**
+
+1. **Threshold-triggered automatic compaction.** When a board log crosses the
+BYTE threshold (`BOARD_COMPACT_HINT_BYTES`, 1 MiB), the extension compacts it
+at a session/settle boundary (`session_start` / `session_tree` /
+`agent_settled`) under the SAME
+safety envelope as `gc` — the per-board cross-process lease, the content CAS
+and an archive of the verbatim pre-compact log — with the compact header's
+`by` naming the run. The line threshold (`BOARD_COMPACT_HINT_LINES`, 10k) stays
+a `tower_do_status` hint only: counting lines on the hot path would mean
+reading the whole file. It is not PERIODIC (no timer) and is as auditable as the
+explicit path, which is what the old rejection ("unverifiable audit loss")
+assumed it could not be.
+2. **The automatic path never drops unfoldable lines** (`dropSkipped` stays
+false). An unattended run must not discard data it cannot parse, and the
+archive holding it is itself pruned; such a board stays uncompacted and keeps
+disclosing `skipped > 0` plus the explicit `gc` remedy.
+3. **The explicit `gc` drops them by default** because it always archives the
+verbatim pre-compact log first, and it reports how many moved plus that the
+archive only survives the next `MAX_BOARD_ARCHIVES` compacts.
+`dropSkipped: false` keeps the strict refusal reachable.
+4. **Archive retention**: keep the newest `MAX_BOARD_ARCHIVES` (3) pre-compact
+logs per board and prune older ones after a successful swap.
+
+**Rejected.** A timer (periodicity was never the requirement — a size
+threshold at a session/settle boundary is); silent drops on the automatic path
+(archive retention would make that permanent loss); deleting completed rows to
+"clean the board" (they are the receipts the owner guard trusts and the
+`changedFiles` signal `findScopeConflicts` reads — `tower` may still drop them
+explicitly with a full-replacement write); leaving the archive unbounded (the
+cleanup would just relocate the growth).
+
+**Consequences.** `board.jsonl` self-bounds without a human noticing a hint;
+`tower_do_status` still discloses the size, the compact revision and the
+remedy. Completed-row *entities* stay unbounded on purpose — only the log's
+superseded events are reclaimed. See CONTRACTS.md "Log compaction" and
+OPERATIONS.md.
+
 ## 2026-09 — board exit: four layers, no single TTL
 
 **Context.** Boards accumulated without bound in four DIFFERENT ways, and every
@@ -24,7 +76,8 @@ copied the WHOLE folded view into the session transcript (measured: a single
 2. **View retirement** (`retainFindings`, `retainMessages` age valve): pure,
    in-memory, never touches the file; `view=all` / `findingId` / `inbox all`
    read the retired rows back.
-3. **Explicit log compaction** (`tower_do action:"gc"`, `tower` only): the
+3. **Log compaction** (`tower_do action:"gc"`, `tower` only; since the entry
+   above also threshold-triggered at a session/settle boundary): the
    single-file last-wins rewrite with a `{kind:"compact"}` revision header,
    content CAS and archive. Cross-process safety is a per-board directory
    LEASE (`<board>.lock`, exclusivity proved by the holder's token, stale
@@ -63,12 +116,15 @@ reporter's session ended (liveness ≠ resolved); `retiredFindingIds` in the
 digest (O(history) in the one place that must be bounded); letting a snooze
 skip the budget (a free way to clear it, and then the digest is unbounded
 again); `board.base.jsonl` as a second file the old line-counting fold would
-have to reconcile (double counting at the crash midpoint); periodic automatic
-compaction (unverifiable audit loss — compaction is explicit, named, and
-archived).
+have to reconcile (double counting at the crash midpoint); **periodic**
+automatic compaction (superseded by the threshold-triggered entry above: a size
+threshold at a session/settle boundary is not periodicity, and the archive makes
+it auditable).
 
-**Consequences.** `board.jsonl` can still grow in bytes until an explicit
-`gc`; `tower_do_status` discloses the log size and hints the command. The
+**Consequences.** `board.jsonl` can still grow in bytes until a compact, but
+that compact is no longer only manual: a log past the threshold is compacted at
+the next session/settle boundary (see the entry above); `tower_do_status`
+discloses the log size and names the explicit command. The
 budget error names the oldest rows, so the backlog is actionable instead of
 invisible. The compact preserves `revision`, so no caller's `baseRevision` is
 invalidated by it. See CONTRACTS.md "Finding contracts" / "Log compaction" /
@@ -279,9 +335,10 @@ several keys per line — the byte cap binds first — but it stays enforced.
 The cut is therefore disclosed in a footer that repeats the revision and the
 board path (its bytes and its one line are reserved out of both caps), and
 paged reads of `board.jsonl` stay the complete path. The `board-prune` entry's
-~10k log lines remain the trigger for row-level log compaction (last-wins under
-the board write lease, receipts folded, never silently deleted) — not for row
-deletion.
+~10k log lines remain a `tower_do_status` hint for row-level log compaction
+(now also threshold-triggered automatically at 1 MiB — see the entry at the top
+of this file; last-wins under the board write lease, receipts folded, never
+silently deleted) — not for row deletion.
 
 ## 2026-09 — publish auth moves to trusted publishing (OIDC), no token
 
@@ -409,7 +466,7 @@ lines / 22KB at the time of the cull.
    retirement already exists for messages (`retainMessages`); it does not
    rewrite the log. If a board ever needs a byte bound, the design is
    last-wins compaction under the board write lease — revisit only at 10k+
-   lines or when `fold`/`rawLines` show up in a profile.
+   lines (a status hint; the automatic trigger is the 1 MiB byte threshold) or when `fold`/`rawLines` show up in a profile.
 2. **`widget-keybinds`** (expand completed rows in the above-editor widget)
    fights the glance contract: remaining-work only, cap 3 unfinished,
    completed never appear. Completed already live in `tower_do_status`

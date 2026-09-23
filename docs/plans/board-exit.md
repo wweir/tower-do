@@ -7,6 +7,12 @@
 > [ARCHITECTURE.md](../ARCHITECTURE.md)的 compaction/digest 两节。本文件保留为
 > 实现记录与验收清单，不再作为变更来源；下一次改动以主文档和测试 gate 为准。
 >
+> **2026-09 后续改动（本文相关描述已过时）**：日志清理不再是「仅手动、
+> 从不自动」——超 1MiB 的 board 会在 session/settle 边界自动 compact；`gc`
+> 因为总是先归档，默认允许丢弃不可 fold 的旧行并报告条数；`archive/` 现在
+> 保留最新 `MAX_BOARD_ARCHIVES`（3）份。权威以 DECISIONS.md 顶部条目、
+> CONTRACTS.md "Log compaction" 与测试为准。
+>
 > 被否决的写法（`retiredFindingIds`、`board.base.jsonl` 双文件、把
 > `retainMessages` 当清理、按年龄自动关掉 open finding）不要再开。
 >
@@ -45,7 +51,8 @@
 ```
 
 - **Layer 2 不是清理。** `retainMessages` / 拟议的 `retainFindings` 只影响本次 fold 的显示副本。`tower_do_status` / inbox / reminder / widget / 写路径的 re-fold 都走它，所以退休行不回流到 LLM 窗口；`board.jsonl` 一字不动。
-- **Layer 3 才是磁盘有界。** 默认不跑。显式、有名、有 CAS、有崩溃中点。
+- **Layer 3 才是磁盘有界。** （原文：默认不跑；**2026-09 后续改动：超 1 MiB 会在
+  session/settle 边界自动跑，仍非周期性**）显式、有名、有 CAS、有崩溃中点。
 - **Layer 4 只止住新增 transcript。** 历史 session 文件不回收。
 
 原则：
@@ -150,7 +157,7 @@ Compact 是一次 **live 日志的 last-wins 重写**，带一条显式逻辑 re
 
 **compact 保留 folded view 的全部实体**（含 completed task、closed finding、未视图退休的 message）。它消灭的是同 key/id 的历史 upsert/ack，不是实体个数。实体个数由 Layer 1 预算 + Layer 2 视图退休约束；completed task 行继续按既有容量决策无界（收据 / `dependsOn`）。
 
-可选：compact 前把原文件 copy 到 `archive/board-rev<R>-<utc>.jsonl`。`fold()` **永不**读 archive。archive 只给人工审计和 `findingId` 的第三级回落。
+可选：compact 前把原文件 copy 到 `archive/board-rev<R>-<utc>-<rand>.jsonl`。`fold()` **永不**读 archive。archive 只给人工审计和 `findingId` 的第三级回落。
 
 ### 并发与崩溃（目录租约 + 硬链接 CAS + rename 窗口恢复）
 
@@ -159,14 +166,14 @@ Compact 是一次 **live 日志的 last-wins 重写**，带一条显式逻辑 re
 1. 取租约，读 live 并记录 `sourceSha256`，`fold()`。
 2. 写 `board.jsonl.tmp`（compact 行 + last-wins 行），`fsync`。
 3. 对旧 inode 做 hard `link` → `<board>.prev-<rand>`，**经该链接再读一遍**校验 CAS（检查的字节就是将被替换的字节）。
-4. CAS 通过后写 `archive/…`（中止则清理未见 swap 的 archive），随后在 `rename` 前校验 **路径仍是被保留的 inode**（`stat(this.file).ino === stat(prev).ino`）：peer 在窗口内 compact（换掉了新 inode）时必须中止而非静默覆盖；确认后 `rename(tmp, board.jsonl)`。
+4. 首次 CAS 通过、hard `link` 之前写 `archive/…`（中止则清理未见 swap 的 archive；**后续改动**：archive 写序固定在第一次 CAS 与 hard link/final CAS 之间，不进入 [final CAS, rename] 窗口），随后在 `rename` 前校验 **路径仍是被保留的 inode**（`stat(this.file).ino === stat(prev).ino`）：peer 在窗口内 compact（换掉了新 inode）时必须中止而非静默覆盖；确认后 `rename(tmp, board.jsonl)`。
 5. rename 后**再证明一次租约**：
    - 仍独占 ⇒ 删掉 `.prev-*` 链接，成功返回；
    - 被偷（持有者在窗口内被暂停超过 `STALE_LOCK_MS`）⇒ **fail loud**。若形状可证明（live 仍是本次 compaction 加追加、证据文件是 `raw` 加追加），重新取租约并 CAS 写回 `content + P + W`（P 在 W 前，保持真实时序的 LWW）；不可证明（例如 peer 在窗口内自己 compact 了）则保留 `.prev-*` 作为证据并在错误信息里给出路径。**绝不盲目回滚**——回滚可能覆盖新持有者在 rename 之后的写入。
 
 崩溃中点（任一步中止）：live 文件都不变（除 rename 之后），`.prev-*` / `.tmp` 只可能作为残留物存在，不影响 fold。禁止「先 truncate 再写」；禁止周期自动跑。
 
-授权：`tower_do` 增加 `action: "gc"`，仅 `as: "tower"`（或调用方身份本就是 `tower`）。`tower_do_status` 在行数 ≥ 10k 或体积 ≥ 1MB 或 `skipped > 0` 时提示这条命令，不自动执行。
+授权：`tower_do` 增加 `action: "gc"`，仅 `as: "tower"`（或调用方身份本就是 `tower`）。`tower_do_status` 在行数 ≥ 10k 或体积 ≥ 1MB 或 `skipped > 0` 时提示这条命令（**后续改动：体积 ≥ 1 MiB 时也会自动跑，见顶部横幅**）。
 
 **activity / stale-owner：** compact 丢掉中间 upsert，`rawTail` 变短。快照为每个 task 事件保留该 owner 在该 key 上的真实最后活动时间（`taskClock`），为每个 finding 保留最后一条事件的 `by`/`at`（`findingActor`），因此 gc 不会把 owner 的活动时钟重置或把 peer 的 finding 状态变更记到原始 filer 头上。
 
@@ -217,8 +224,8 @@ CheckpointDigest
 | `MAX_FINDING_REASON_CHARS` | 256 | 关闭/延期理由 |
 | `MESSAGE_PENDING_RETIRE_MS` | 14d | L2 未读视图退休 |
 | `TASK_CLAIM_STALE_MS` | 6h | L1b 接管，与 30min presence 分离 |
-| `BOARD_COMPACT_HINT_LINES` | 10_000 | L3 提示阈值，不是自动触发 |
-| `BOARD_COMPACT_HINT_BYTES` | 1 MiB | 同上 |
+| `BOARD_COMPACT_HINT_LINES` | 10_000 | L3 status 提示（后续：仅提示） |
+| `BOARD_COMPACT_HINT_BYTES` | 1 MiB | L3 status 提示 + **自动触发阈值**（后续改动） |
 | `TOWER_DO_BOARD_DIGEST_TYPE` | `pi-tower-do-board-digest` | L4 |
 
 `MESSAGE_RETENTION = 50`、`MAX_TOWER_DO_OPEN_TASKS = 50` 不变。

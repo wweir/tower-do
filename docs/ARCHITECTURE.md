@@ -67,18 +67,20 @@ semantics:
   takeover window. The activity parser rejects the same line, so presence and
   the fold read one clock, not two.
 
-### Log compaction (explicit)
+### Log compaction (explicit `gc` or threshold-triggered)
 
-`board.jsonl` may open with a `{kind:"compact"}` header (written only by
-`tower_do action:"gc"`, `tower` only). It carries the logical `revision` and
+`board.jsonl` may open with a `{kind:"compact"}` header. It is written by
+`tower_do action:"gc"` (`tower` only) or by the extension's automatic
+threshold-triggered run at a session/settle boundary (never periodic). It
+carries the logical `revision` and
 `snapshotLines`; the following snapshot lines rebuild the maps WITHOUT bumping
 the revision, so a refold after a compact reports the same revision (a
 caller's `baseRevision` is never invalidated) and appends after it stay
-monotonic. The rewrite is content-CAS-guarded (re-read the live sha through a
-hard link taken just before the swap, so the checked bytes are the ones the
-rename replaces) and archives the previous log under `archive/` only after the
-CAS passes, immediately before the rename; every crash point leaves the live
-file intact. A holder paused past the lease staleness limit inside that rename
+monotonic. The rewrite runs a first content check, then archives the previous
+log under `archive/`, then takes a hard link and re-checks the content through
+it (the final CAS, covering exactly the bytes the swap will replace) before the
+rename; the archive therefore sits outside the `[final CAS, rename]` window.
+Every crash point leaves the live file intact. A holder paused past the lease staleness limit inside that rename
 window cannot be excluded by a userspace lease, so the compact re-proves the
 lease right after the rename and, on a steal, reconciles the window's writes
 under a freshly taken lease when the shape is provable (`content + P + W`),
@@ -96,7 +98,10 @@ still-empty lease directory between a creator's `mkdir` and its token write.
 The compact keeps every surviving entity, including
 completed receipts and closed findings, and preserves each task owner's real
 last-activity timestamp — it folds superseded upserts/acks, it never deletes
-rows. See CONTRACTS.md "Log compaction".
+rows. It prunes the archive set to the newest `MAX_BOARD_ARCHIVES` logs. The
+automatic run never drops unfoldable legacy lines (only the explicit `gc`
+does, and it archives them and reports the count). See CONTRACTS.md "Log
+compaction".
 
 ### Checkpoint digest (bounded transcript payload)
 

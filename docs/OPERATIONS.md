@@ -153,8 +153,8 @@ When the open budget is full (`open 50/50`):
 2. **Compact a finished board** — when rows are all completed and owned by
 departed sessions, replay only the rows worth keeping under an explicit
 orchestrator identity: `tower_do` with `as: "tower"`. `tower` owns every task,
-so it may drop them; the dropped receipts survive in the JSONL history (until
-an explicit `gc` — see below), only the folded view shrinks. This is the
+so it may drop them; the dropped receipts survive in the JSONL history until a
+compact (see below), only the folded view shrinks. This is the
 documented, cooperative-trust escape hatch — it is unauthenticated, so treat a
 board compaction like any other shared-state maintenance and record it in a
 message (`tower_do_talk`) when peers are live.
@@ -163,19 +163,32 @@ Completed rows are never garbage-collected automatically: the owner guard
 exists to keep delivery receipts trustworthy, and the folded view already has
 display budgets (status slices at `limit`, widget shows remaining work only).
 Because a write must name the rows it keeps, the practical ceiling on history
-is what a reader can see; when the log itself matters, use the explicit `gc`
-below — never silent row deletion. See DECISIONS.md.
+is what a reader can see; when the log itself matters, it is compacted
+automatically once it crosses the size threshold (see below), or explicitly
+with `gc` — never silent row deletion. See DECISIONS.md.
 
 ### Log compaction (`tower_do action: "gc"`)
 
 The board log is append-only, so `retainMessages` / `retainFindings` (view
-projections) never shrink it. The only byte bound is an explicit compact:
+projections) never shrink it. Disk is bounded by one mechanism with two entry
+points — the explicit compact, and an automatic threshold-triggered one:
 
 ```
 tower_do  { "action": "gc", "tasks": [], "as": "tower" }
 ```
 
-- `tower` identity only; `tasks` must be empty. Never periodic.
+The extension also compacts a board whose log crosses
+`BOARD_COMPACT_HINT_BYTES` (1 MiB) at a session/settle boundary
+(`session_start`, `session_tree`, `agent_settled`), under the same lease, CAS
+and archive. The byte threshold is the automatic trigger (a cheap `stat`);
+`BOARD_COMPACT_HINT_LINES` (10k) is disclosed by `tower_do_status` only. It is
+never periodic (no timer) and never drops unfoldable lines — a board with any
+stays uncompacted and keeps disclosing `skipped > 0`. The explicit `gc` is how
+to compact now, and the only path that drops them (into the archive, reporting
+the count).
+
+- The explicit `gc` requires the `tower` identity and empty `tasks`. Never
+  periodic.
 - `append` and `compact` share a per-board `<board>.lock` lease (a directory
   holding the holder's token file), so a peer
   append cannot land inside the compaction window (a stale lease from a dead
@@ -189,9 +202,12 @@ tower_do  { "action": "gc", "tasks": [], "as": "tower" }
   INCLUDED — it folds superseded upserts/acks, it does not delete rows). The
   snapshot preserves each owner's real last activity on a task, so a gc does
   not flip the takeover clock.
-- The previous log is archived to `archive/board-rev<N>-<utc>.jsonl` — written
-  only after the CAS passes, immediately before the rename, so an aborted
-  compact never leaves an archive behind.
+- The previous log is archived to `archive/board-rev<N>-<utc>-<rand>.jsonl` — written
+  after the first content check but before the hard link and the final CAS,
+  deliberately outside the `[final CAS, rename]` window, so an aborted compact
+  never leaves an archive behind. After a successful swap the archive
+  set is pruned to the newest `MAX_BOARD_ARCHIVES` (3) logs, so the cleanup
+  does not itself accumulate whole-log copies.
 - Content CAS: the live sha is re-checked immediately before the rename (read through a hard link taken just before the swap, so the checked bytes are exactly the ones the rename replaces), and the pre-rename guard also verifies the path still names that preserved inode — a peer that replaced the board (compaction) in the window makes the compact abort instead of silently swapping the peer's board away. A mismatch aborts with the live file untouched, and every crash point leaves the old file intact. The lease is
   re-proven right after the rename: a holder paused past the staleness limit
   inside that window fails loud, and when the shape is provable the compact
@@ -200,11 +216,15 @@ tower_do  { "action": "gc", "tasks": [], "as": "tower" }
   provable the pre-compact log is kept as a `board.jsonl.prev-*` evidence file
   named in the error. Nothing is ever rolled back blindly.
 - `revision` is preserved (the header carries it), so `baseRevision` stays
-  valid. Unfoldable lines block it unless `dropSkipped: true` is passed
-  (recorded in the header as audit metadata; the live `skipped` count clears).
+  valid. Unfoldable legacy lines: the raw API refuses unless `dropSkipped` is
+  passed, but the `gc` action passes it by default (it always archives the
+  verbatim pre-compact log, and the tool result reports how many lines moved).
+  An automatic run never does — such a board stays uncompacted and keeps
+  disclosing `skipped > 0`.
 - `tower_do_status` prints `State: <slug> · log N line(s) / XKB [· compact
-  rev M]` and hints the command at `BOARD_COMPACT_HINT_LINES` (10k) /
-  `BOARD_COMPACT_HINT_BYTES` (1 MiB) or when `skipped > 0`.
+  rev M]` and discloses the size (plus the explicit `gc` command) at
+  `BOARD_COMPACT_HINT_LINES` (10k) / `BOARD_COMPACT_HINT_BYTES` (1 MiB) or when
+  `skipped > 0`.
 - Known limit: the snapshot keeps each entity's ORIGINATING activity — the
   task owner's real clock, and for findings the last event's actor — so a gc
   does not flip the takeover clock or credit a peer's finding status change to

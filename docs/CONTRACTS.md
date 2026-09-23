@@ -309,24 +309,31 @@ exit is explicit and auditable:
   `all=true` reads the retired set from the full fold; the retired set is
   recomputed per fold and must never enter a checkpoint.
 
-## Log compaction (Layer 3, explicit only)
+## Log compaction (Layer 3 — explicit or threshold-triggered)
 
 - The board log is append-only; `retainMessages`/`retainFindings` are view
-  projections and never shrink the file. The ONLY bound on disk is an explicit
-  `tower_do action:"gc"` (orchestrator identity `tower` only, empty `tasks`),
-  which rewrites `board.jsonl` as one `{kind:"compact"}` header plus one
-  last-wins snapshot event per surviving entity.
+  projections and never shrink the file. Disk is bounded by **two** entry
+  points to the same compact: an explicit `tower_do action:"gc"`
+  (orchestrator identity `tower` only, empty `tasks`) and an **automatic**
+  threshold-triggered run at a session/settle boundary. Both rewrite
+  `board.jsonl` as one `{kind:"compact"}` header plus one last-wins snapshot
+  event per surviving entity, under the same lease + content CAS + archive.
 - **Revision is preserved**: the header carries the logical `revision`, and
   the snapshot block does not bump it, so a refold after a compact reports
   exactly the revision it did before — a caller's `baseRevision` is never
   invalidated. Appends after the compact bump it as usual (monotonic).
-- **Crash/CAS safety**: the previous log is archived only AFTER the CAS
-  passes, immediately before the rename (an aborted compact leaves no
-  archive behind); the new file is written to `board.jsonl.tmp`, fsynced, the
-  live file is re-read through a hard link taken just before the rename (so
-  the CAS covers exactly the bytes the swap will replace) and its sha256
-  compared to the fold's source, and only then is the tmp renamed over it.
-  Every crash point leaves the old file intact.
+- **Crash/CAS safety**: the new file is written to `board.jsonl.tmp`,
+  fsynced, the live file is re-read (first content check) and, once it still
+  matches the fold's source, the previous log is archived under `archive/` —
+  then the live file is re-read AGAIN through a hard link taken just before
+  the rename (the final CAS covers exactly the bytes the swap will replace),
+  and only then is the tmp renamed over it. The archive write therefore sits
+  AFTER the first content check but BEFORE the hard link and the final CAS,
+  deliberately outside the `[final CAS, rename]` window (see the rename-window
+  bullet): that window must stay one syscall wide, and a whole-file write
+  inside it would widen the one residual append race the CAS exists to close.
+  An aborted compact leaves no archive behind, and every crash point leaves the
+  old file intact.
 - **Cross-process mutual exclusion**: `append` and `compact` both take a
   `<board>.lock` lease — a directory created atomically by `mkdir`, holding a
   file named after the holder's random token; the token file's mtime is
@@ -375,15 +382,31 @@ exit is explicit and auditable:
   as a hard-linked `board.jsonl.prev-*` evidence file named in the error and
   reports the loud failure; it never rolls the inode back, because a rollback
   could clobber writes the new holder made after the rename.
-- **Unfoldable lines block compaction** unless `dropSkipped` is passed (via
-  the `tower_do` `dropSkipped` parameter). The dropped count is recorded in the
+- **Unfoldable lines**: the raw API refuses unless `dropSkipped` is passed.
+  The `tower_do` `gc` action passes it by default because it ALWAYS archives
+  the verbatim pre-compact log first, so the lines survive there; the tool
+  result reports how many moved. The dropped count is also recorded in the
   compact header as **historical audit metadata** — it is deliberately NOT
   re-added to the live `skipped` count, because after the drop the board no
-  longer holds those lines and re-reporting them would be false and would block
-  every later compact forever.
-- The compact is never periodic: `tower_do_status` only *hints* it (via the
-  `State:` log line) at `BOARD_COMPACT_HINT_LINES` / `BOARD_COMPACT_HINT_BYTES`
-  or when `skipped > 0`.
+  longer holds those lines and re-reporting them would be false and would
+  block every later compact forever. An automatic run NEVER passes
+  `dropSkipped`: an unattended path must not discard data it cannot parse, so
+  such a board simply stays uncompacted and keeps disclosing `skipped > 0`
+  plus the explicit `gc` remedy.
+- **Archive retention**: a compact writes one archive per run, so it prunes
+  `archive/` to the newest `MAX_BOARD_ARCHIVES` (3) after a successful swap —
+  otherwise the cleanup would move unbounded growth from `board.jsonl` into
+  the archive set. This run's own archive is pinned and never pruned. NOTE:
+  the lines a `gc` dropped survive only in the archive, i.e. only until
+  `MAX_BOARD_ARCHIVES` newer compacts have pruned it; the `gc` result says so
+  explicitly.
+- The compact is **never periodic**: it is a size observation at a
+  session/settle boundary. The AUTOMATIC trigger uses the BYTE threshold only
+  (`BOARD_COMPACT_HINT_BYTES`, 1 MiB — a cheap `stat`);
+  `BOARD_COMPACT_HINT_LINES` / `skipped > 0` are `tower_do_status` hints that
+  name the explicit `gc` command (the only way to drop unfoldable legacy
+  lines). A board whose log is large AND holds unfoldable lines is therefore
+  NOT auto-compacted and keeps being disclosed.
 
 ## Checkpoint digest (Layer 4)
 
@@ -480,15 +503,15 @@ bunx tsc --noEmit -p tsconfig.json      # strict + noUnused, zero errors
 bun run test/smoke.ts               # end-to-end: 3 tools, persistence, scoping, changedFiles disk round-trip, reminder cadence vs snapshot strip, dashboard truncation footer
 bun run test/config.ts              # config fail-loud + reserved identity (11 cases)
 bun run test/owner-guard.ts         # every-field owner guard + per-claim stale takeover + dependency-cycle and no-op-replay guards (35 cases)
-bun run test/presence-retention.ts  # read receipts / retirement / presence / caller-line match / checkpoints (68)
-bun run test/finding-exit.ts        # finding lifecycle/budget/view-retirement + bounded checkpoint digest + writer-side digest guards + digest round-trip + forged-digest field bounds + non-finite timestamps (51 cases)
+bun run test/presence-retention.ts  # read receipts / retirement / presence / caller-line match / checkpoints (74)
+bun run test/finding-exit.ts        # finding lifecycle/budget/view-retirement + bounded checkpoint digest + writer-side digest guards + digest round-trip + forged-digest field bounds + non-finite timestamps + empty-owner/legacy-skipped guards (54 cases)
 bun run test/changed-files.ts       # P0 receipt invariants (12 cases)
 bun run test/scope-conflicts.ts     # P1 glob + conflict derivation (17 cases)
-bun run test/git-count.ts           # widget git-segment pure derivations (31 cases)
+bun run test/git-count.ts           # widget git-segment pure derivations + rename-origin attribution (34 cases)
 bun run test/live-sessions.ts       # widget live-segment liveness window + sidecar-record parsing (30 cases)
 bun run test/board-progress.ts      # widget board-progress remaining-work glance (8 cases)
 bun run test/task-cap.ts            # open-task budget + fabricated-receipt bound (19 cases)
-bun run test/board-compact.ts       # explicit log compaction: revision preserved, entity survival, owner-clock + lease/CAS atomicity, token-scoped stale reaping, lease exclusivity + abort cleanup, task revision gate, steal-in-rename-window (loud abort + provable reconcile, else evidence; no blind rollback), both-window P/W reconcile ordering, structural-failure fail-loud (50 cases)
+bun run test/board-compact.ts       # log compaction (explicit gc + threshold-triggered auto): revision preserved (incl. tolerated lines inside the snapshot block), entity survival, owner-clock + lease/CAS atomicity, token-scoped stale reaping, lease exclusivity + abort cleanup, task revision gate, archive write order/retention, dropSkipped-requires-archive, steal-in-rename-window (loud abort + provable reconcile, else evidence; no blind rollback), both-window P/W reconcile ordering, structural-failure fail-loud (62 cases)
 bun run test/home-isolation.ts      # static guard: every index.ts-loading suite isolates HOME before import and imports dynamically (9 cases)
 bun run test/view-layers.ts         # layered unfinished view (mine/needs/others) + key ledger + recency order + reminder + folded TUI sections + dashboard budget slice/note (76 cases)
 bun run test/limits.ts              # arg schema vs fold: derived bounds, transport guard, key-bearing errors, list-cap ordering, per-entry caps, code-point metric (61 cases)
