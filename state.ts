@@ -73,11 +73,32 @@ export const MESSAGE_PENDING_RETIRE_MS = 14 * 24 * 60 * 60_000;
  * presence/idle hint: ownership dies on the task-relevant activity clock, not
  * on unrelated board chatter (see staleTaskClaims). */
 export const TASK_CLAIM_STALE_MS = 6 * 60 * 60_000;
-/** `tower_do_status` hint thresholds for the explicit `gc` compact — a hint,
- * never an automatic trigger: rewriting the log must be a named, auditable
- * action by `tower`, not a side effect of a threshold. */
+/** Log-size thresholds. `BOARD_COMPACT_HINT_BYTES` is BOTH the automatic
+ * compaction trigger (`shouldAutoCompactBoard`, a cheap `stat` at a
+ * session/settle boundary) and a `tower_do_status` hint; `BOARD_COMPACT_HINT_LINES`
+ * is disclosed by status only (the auto path does not read the whole file to
+ * count lines). A compact is named (header `by`), archived (the pre-compact log
+ * is kept under `archive/`) and lease/CAS-guarded, so a threshold-triggered run
+ * is as auditable as an explicit `gc` — leaving the cleanup purely advisory is
+ * what let every board in `~/.pi/tower-do` grow without bound.
+ *
+ * Never PERIODIC: the trigger is a file-size observation at a session/settle
+ * boundary, never a timer. */
 export const BOARD_COMPACT_HINT_LINES = 10_000;
 export const BOARD_COMPACT_HINT_BYTES = 1024 * 1024;
+/** Pre-compact logs kept per board under `<board-dir>/archive/`. A compact
+ * writes one archive per run, so without a bound the cleanup would itself
+ * accumulate whole-log copies forever; the newest N survive for audit (they
+ * are also the evidence for the unfoldable legacy lines a `gc` discards). */
+export const MAX_BOARD_ARCHIVES = 3;
+
+/** Whether a board log has crossed the automatic compaction threshold. Pure so
+ * the threshold has one definition and one test. Byte-based on purpose: the
+ * trigger sits on the session/settle path and must stay a cheap `stat`. */
+export function shouldAutoCompactBoard(bytes: number): boolean {
+  return bytes >= BOARD_COMPACT_HINT_BYTES;
+}
+
 /** Checkpoint custom-entry type carrying the bounded digest (Layer 4). The old
  * `TOWER_DO_BOARD_TYPE` full-snapshot entries stay readable. */
 export const TOWER_DO_BOARD_DIGEST_TYPE = "pi-tower-do-board-digest";
@@ -1501,7 +1522,12 @@ function readBoardSnapshot(value: unknown): TowerBoardView | undefined {
   return {
     schemaVersion: TOWER_DO_SCHEMA_VERSION,
     revision: value.revision,
-    skipped: typeof value.skipped === "number" ? value.skipped : 0,
+    skipped:
+      typeof value.skipped === "number" &&
+      Number.isSafeInteger(value.skipped) &&
+      value.skipped >= 0
+        ? value.skipped
+        : 0,
     ...(value.incomplete === true ? { incomplete: true } : {}),
     tasks,
     messages,
@@ -1544,6 +1570,18 @@ export interface TowerDoCheckpointDigest {
 }
 
 /**
+ * Digest-field sanitizer. The digest reader (`readBoardDigest`) requires every
+ * rendered field to be a SINGLE line as well as length-bounded
+ * (`boundedLine`), while the fold accepts finding `id`/`title`/`owner` strings
+ * verbatim. Collapsing line separators before truncating is what keeps the
+ * writer from emitting a checkpoint its own reader rejects (which would drop
+ * the ENTIRE digest, not one field).
+ */
+function digestLine(value: string, max: number): string {
+  return truncateToAtMost(value.replace(/[\r\n\u2028\u2029]/g, " "), max);
+}
+
+/**
  * Bounded projection of a board view for the session transcript. Every field
  * has an upper bound derived from a single constant: `openTasks` <=
  * MAX_TOWER_DO_OPEN_TASKS, `findings` <= MAX_TOWER_DO_OPEN_FINDINGS, counts
@@ -1569,8 +1607,10 @@ export function checkpointDigest(
     .map((task) => ({
       key: task.key,
       status: task.status,
-      ...(task.owner === undefined ? {} : { owner: task.owner }),
-      subject: task.subject,
+      ...(task.owner === undefined
+        ? {}
+        : { owner: digestLine(task.owner, MAX_IDENTITY_CHARS) }),
+      subject: digestLine(task.subject, MAX_TASK_SUBJECT_CHARS),
     }));
   const findings = findingPressureOrder(view.findings, now, liveOwners)
     .filter(
@@ -1580,23 +1620,30 @@ export function checkpointDigest(
     .map((finding) => {
       const state = deriveFindingState(finding, now, liveOwners);
       return {
-        // Truncated to exactly what `readBoardDigest` accepts. The fold does
-        // NOT bound these fields, so a legacy row with an over-long title would
-        // otherwise make the writer emit a checkpoint its own reader rejects —
-        // silently losing the ENTIRE digest instead of one display field.
-        id: truncateToAtMost(finding.id, MAX_IDENTITY_CHARS),
+        // Truncated AND single-lined to exactly what `readBoardDigest`
+        // accepts. The fold does NOT bound these fields, so a legacy row with
+        // an over-long or multi-line title would otherwise make the writer
+        // emit a checkpoint its own reader rejects — silently losing the
+        // ENTIRE digest instead of one display field.
+        id: digestLine(finding.id, MAX_IDENTITY_CHARS),
         severity: finding.severity,
         kind: finding.kind,
-        title: truncateToAtMost(finding.title, MAX_FINDING_TITLE_CHARS),
+        title: digestLine(finding.title, MAX_FINDING_TITLE_CHARS),
         // Owner and snooze deadline are carried ONLY for the state they belong
         // to. An `accepted` finding whose owner died derives `actionable`, and
         // carrying the dead claim's owner would round-trip into the impossible
         // `open`+`owner` shape (the live fold always clears an owner on open).
         ...(state === "claimed" && finding.owner !== undefined
-          ? { owner: truncateToAtMost(finding.owner, MAX_IDENTITY_CHARS) }
+          ? { owner: digestLine(finding.owner, MAX_IDENTITY_CHARS) }
           : {}),
         state,
-        ...(state === "snoozed" && finding.snoozeUntil !== undefined
+        // The reader requires a positive safe integer; `readPersistedFinding`
+        // accepts any finite number, so a legacy fractional/deadline value
+        // must not be carried through verbatim.
+        ...(state === "snoozed" &&
+        finding.snoozeUntil !== undefined &&
+        Number.isSafeInteger(finding.snoozeUntil) &&
+        finding.snoozeUntil > 0
           ? { snoozeUntil: finding.snoozeUntil }
           : {}),
       };
@@ -1748,6 +1795,7 @@ export function readBoardDigest(
       !boundedLine(candidate.title, MAX_FINDING_TITLE_CHARS) ||
       (candidate.owner !== undefined &&
         (typeof candidate.owner !== "string" ||
+          candidate.owner === "" ||
           !boundedLine(candidate.owner, MAX_IDENTITY_CHARS)))
     ) {
       return undefined;
@@ -1897,7 +1945,10 @@ function broadcastAudience(
 ): Set<string> {
   const owners =
     message.audience ??
-    [...currentOwners(view)].filter((owner) => owner !== message.from);
+    // Delivery/display: exclude the sender by AGENT, not exact string, so a
+    // legacy label of the same session is not left as a pending reader it can
+    // never ack (a self-broadcast never reaches its own inbox).
+    [...currentOwners(view)].filter((owner) => !sameAgent(owner, message.from));
   return new Set(owners);
 }
 
@@ -2284,6 +2335,12 @@ export function parseActivityLine(line: string): ActivityEntry | undefined {
   const by = typeof record.by === "string" ? record.by : undefined;
   if (at === undefined || by === undefined) return undefined;
   if (kind === "task") {
+    // Same shape test as `readEvent` (board.ts): a task line whose `op` is
+    // not upsert/remove is skipped by the fold, so it must not count as
+    // ownership activity here either — otherwise presence and the fold read
+    // two different clocks (ARCHITECTURE.md "one clock, not two"), and a
+    // garbage line would extend an owner's takeover protection.
+    if (record.op !== "upsert" && record.op !== "remove") return undefined;
     const task = record.task as Record<string, unknown> | undefined;
     const key = typeof record.key === "string" ? record.key : undefined;
     if (record.op === "remove") {
@@ -2312,26 +2369,22 @@ export function parseActivityLine(line: string): ActivityEntry | undefined {
     return undefined;
   }
   if (kind === "message") {
-    const message = record.message as Record<string, unknown> | undefined;
-    if (message && typeof message.subject === "string") {
-      const to = typeof message.to === "string" ? message.to : "?";
-      const from = typeof message.from === "string" ? message.from : "?";
-      const readBy = Array.isArray(message.readBy)
-        ? message.readBy.filter(
-            (item): item is string => typeof item === "string",
-          )
-        : [];
+    // Validate with the SAME reader the fold uses, so a partially-formed
+    // message cannot show up as activity while the fold skips it.
+    const message = readPersistedMessage(record.message);
+    if (message !== undefined) {
+      const readBy = message.readBy ?? [];
       // An ack re-emission (reader appends their id to readBy) is NOT a new
       // message: it is traffic the *reader* generated. Render it as a read
       // notice, keyed to the reader, so activity doesn't look like the
       // reader re-sent the message.
-      if (by !== from && identityListHas(readBy, by)) {
+      if (by !== message.from && identityListHas(readBy, by)) {
         return {
           kind: "message",
           by,
           at,
           glyph: "👁",
-          detail: `read →${to}: ${message.subject}`, // by = reader
+          detail: `read →${message.to}: ${message.subject}`, // by = reader
         };
       }
       return {
@@ -2339,22 +2392,20 @@ export function parseActivityLine(line: string): ActivityEntry | undefined {
         by,
         at,
         glyph: "✉",
-        detail: `→${to}: ${message.subject}`,
+        detail: `→${message.to}: ${message.subject}`,
       };
     }
     return undefined;
   }
   if (kind === "finding") {
-    const finding = record.finding as Record<string, unknown> | undefined;
-    if (finding && typeof finding.title === "string") {
-      const severity =
-        typeof finding.severity === "string" ? finding.severity : "?";
+    const finding = readPersistedFinding(record.finding);
+    if (finding !== undefined) {
       return {
         kind: "finding",
         by,
         at,
         glyph: "⚑",
-        detail: `[${severity}] ${finding.title}`,
+        detail: `[${finding.severity}] ${finding.title}`,
       };
     }
     return undefined;
