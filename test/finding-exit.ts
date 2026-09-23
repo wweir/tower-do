@@ -34,12 +34,14 @@ import {
   MAX_TOWER_DO_OPEN_TASKS,
   openFindingCount,
   parseActivityLine,
+  readBoardDigest,
   readPersistedFinding,
   readPersistedMessage,
   retainFindings,
   summarizeFindings,
   textLength,
   TOWER_DO_BOARD_DIGEST_TYPE,
+  TOWER_DO_BOARD_TYPE,
   type TowerBoardView,
   type TowerDoFinding,
   type TowerDoTask,
@@ -511,6 +513,29 @@ function digestFieldBounds(): void {
     restores(() => {}),
   );
   check(
+    "a digest row with an empty owner is refused (empty identity names nobody)",
+    !restores((data) => {
+      data.findings[0]!.owner = "";
+    }),
+  );
+  check(
+    "a legacy checkpoint with a non-integer/negative skipped clamps to 0",
+    latestBoardCheckpoint([
+      {
+        type: "custom",
+        customType: TOWER_DO_BOARD_TYPE,
+        data: { ...view, skipped: -5 },
+      },
+    ])?.skipped === 0 &&
+      latestBoardCheckpoint([
+        {
+          type: "custom",
+          customType: TOWER_DO_BOARD_TYPE,
+          data: { ...view, skipped: 1.5 },
+        },
+      ])?.skipped === 0,
+  );
+  check(
     "a digest row with a newline-injecting key is refused (illegal key)",
     !restores((data) => {
       data.openTasks[0]!.key = "bad\nkey";
@@ -579,6 +604,35 @@ function digestFieldBounds(): void {
           { type: "custom", customType: TOWER_DO_BOARD_DIGEST_TYPE, data: longDigest },
         ]) !== undefined,
     }),
+  );
+  // A legacy row can also carry a MULTI-LINE id/title (the fold places no
+  // single-line bound on finding fields) or a non-integer `snoozeUntil`
+  // (`readPersistedFinding` accepts any finite number). The reader's
+  // `boundedLine`/integer checks would then reject the whole digest, so the
+  // writer must neutralize both.
+  const unrulyDigest = checkpointDigest(
+    {
+      ...view,
+      findings: [
+        finding({ id: "f-line\nbreak", title: "first\u2028second" }),
+        finding({
+          title: "snooze",
+          status: "snoozed",
+          snoozeUntil: NOW + 1000.5,
+        }),
+      ],
+    },
+    NOW,
+    live,
+    "alice",
+  );
+  check(
+    "the digest writer single-lines and integer-checks unruly finding fields",
+    readBoardDigest(unrulyDigest) !== undefined &&
+      !/[\r\n\u2028\u2029]/.test(unrulyDigest.findings[0]!.id) &&
+      !/[\r\n\u2028\u2029]/.test(unrulyDigest.findings[0]!.title) &&
+      unrulyDigest.findings[1]!.snoozeUntil === undefined,
+    JSON.stringify(unrulyDigest.findings),
   );
   // A digest whose own counts disagree with its rows is corrupt: accepting it
   // would restore a task count the writer could never have produced.

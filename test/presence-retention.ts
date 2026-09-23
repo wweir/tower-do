@@ -34,6 +34,7 @@ import {
   knownIdentities,
   latestActivity,
   parseActivityLine,
+  relativeTime,
   retainMessages,
   unreadMessagesToMe,
   latestBoardCheckpoint,
@@ -158,6 +159,36 @@ async function layer1(): Promise<void> {
   check(
     "broadcast fully read once the other owner acks",
     isMessageFullyRead(broadcastReadByBob, view),
+  );
+
+  // A broadcast whose sender carries its LEGACY label while its own task row
+  // carries the CURRENT label must not list the sender as a pending reader: a
+  // self-broadcast never reaches its own inbox, so it could never ack and the
+  // row would never retire. Delivery/display exclude by AGENT, not by string.
+  const legacyBroadcast = msg({
+    id: "m-legacy",
+    to: "all",
+    from: "session-01a0b475",
+    at,
+  });
+  const legacySenderView: TowerBoardView = {
+    ...view,
+    tasks: [
+      {
+        key: "lg",
+        subject: "legacy owner",
+        status: "in_progress",
+        owner: "session-01a0b475-abcdef12",
+        dependsOn: [],
+        blockedBy: [],
+        updatedAt: at,
+      },
+    ],
+    messages: [legacyBroadcast],
+  };
+  check(
+    "a legacy label of the sender is excluded from the broadcast audience",
+    isMessageFullyRead(legacyBroadcast, legacySenderView),
   );
 
   // A later-joining owner (carol) was never part of the broadcast audience
@@ -289,6 +320,81 @@ function layer2(): void {
     parseActivityLine(badLine) === undefined,
   );
   check("activity empty line skipped", parseActivityLine("  ") === undefined);
+  // A task line the fold would reject (op is neither upsert nor remove) must
+  // not count as ownership activity: presence and the fold read one clock.
+  check(
+    "activity rejects a task line with an invalid op (fold/reachability agree)",
+    parseActivityLine(
+      JSON.stringify({
+        kind: "task",
+        op: "bogus",
+        key: "feat-x",
+        task: { key: "feat-x", subject: "s", status: "pending" },
+        by: "alice",
+        at: now,
+      }),
+    ) === undefined,
+  );
+  // A message line the fold would reject (no body) must not count either.
+  check(
+    "activity rejects a message line the fold cannot fold",
+    parseActivityLine(
+      JSON.stringify({
+        kind: "message",
+        message: { id: "m-x", to: "bob", from: "alice", subject: "s", at: now },
+        by: "alice",
+        at: now,
+      }),
+    ) === undefined,
+  );
+  // ...and the finding branch validates with the fold's reader too.
+  check(
+    "activity rejects a finding line the fold cannot fold",
+    parseActivityLine(
+      JSON.stringify({
+        kind: "finding",
+        finding: {
+          id: "f-x",
+          kind: "bug",
+          title: "t",
+          severity: "low",
+          status: "open",
+          from: "alice",
+          at: now,
+        },
+        by: "alice",
+        at: now,
+      }),
+    ) === undefined &&
+      parseActivityLine(
+        JSON.stringify({
+          kind: "finding",
+          finding: {
+            id: "f-x",
+            kind: "bug",
+            title: "t",
+            severity: "low",
+            status: "open",
+            summary: "s",
+            from: "alice",
+            at: now,
+          },
+          by: "alice",
+          at: now,
+        }),
+      ) !== undefined,
+  );
+  // relativeTime's 60s boundary (the 45s."0m ago" regression had no test).
+  check(
+    "relativeTime: 59.9s is 'just now'",
+    relativeTime(now, now - 59_999) === "just now",
+    relativeTime(now, now - 59_999),
+  );
+  check(
+    "relativeTime: exactly 60s rolls to '1m ago'",
+    relativeTime(now, now - 60_000) === "1m ago",
+    relativeTime(now, now - 60_000),
+  );
 
   // Presence is derived from events only (a status read must not self-mark).
   // Three distinct owners: alice (active just now), carol (worked 12m ago —

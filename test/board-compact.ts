@@ -2,9 +2,11 @@
  * tower-do log compaction (Layer 3) regression.
  *
  * The board log is append-only, so view retirement alone never shrinks it. The
- * compact is the ONLY mechanism that bounds the file, and it is deliberately
- * explicit (never periodic), `tower`-only, CAS-guarded, and crash-safe. This
- * file locks:
+ * compact is the ONLY mechanism that bounds the file, and it has two entry
+ * points: an explicit, `tower`-only `gc`, and a threshold-triggered automatic
+ * run at a session/settle boundary (never periodic). Both are CAS-guarded,
+ * crash-safe and archive the pre-compact log, and the automatic one never
+ * drops unfoldable lines. This file locks:
  *   1. A refold after compaction reports exactly the revision it did before
  *      (so a caller's `baseRevision` is never invalidated by a compact).
  *   2. Every surviving entity (completed tasks, messages, findings) is kept.
@@ -50,7 +52,9 @@ import { join } from "node:path";
 import { TowerBoard, LOCK_WAIT_MS, STALE_LOCK_MS } from "../board.ts";
 import {
   claimKey,
+  MAX_BOARD_ARCHIVES,
   parseActivityLine,
+  shouldAutoCompactBoard,
   staleTaskClaims,
   writeBoardSnapshot,
   type ActivityEntry,
@@ -557,7 +561,12 @@ async function main(): Promise<void> {
     () => dirtyBoard.compact({ by: "tower" }),
     /refusing to compact/,
   );
-  const dropped = await dirtyBoard.compact({ by: "tower", dropSkipped: true });
+  const dropped = await dirtyBoard.compact({
+    by: "tower",
+    // An unarchived drop is permanent loss, so the API now requires the pair.
+    archive: true,
+    dropSkipped: true,
+  });
   const dirtyAfter = await new TowerBoard(dirtyFile).fold();
   const dirtyHeader = JSON.parse(
     readFileSync(dirtyFile, "utf8").split("\n")[0],
@@ -1151,6 +1160,240 @@ async function main(): Promise<void> {
     LOCK_WAIT_MS > STALE_LOCK_MS,
     `wait=${String(LOCK_WAIT_MS)} stale=${String(STALE_LOCK_MS)}`,
   );
+
+  // ---------------------------------------------------------------------
+  // Automatic compaction trigger + archive retention (the cleanup must not
+  // itself accumulate whole-log copies).
+  // ---------------------------------------------------------------------
+  check(
+    "auto-compact stays off below the byte threshold",
+    !shouldAutoCompactBoard(1024 * 1024 - 1),
+  );
+  check(
+    "auto-compact fires at the byte threshold",
+    shouldAutoCompactBoard(1024 * 1024),
+  );
+
+  // Archive retention: four compactions leave the newest MAX_BOARD_ARCHIVES
+  // pre-compact logs, oldest pruned. mtimes are forced so the ordering is the
+  // filesystem's, not a name-sort accident.
+  {
+    const retentionDir = mkdtempSync(join(tmpdir(), "tower-do-archive-keep-"));
+    const retentionFile = join(retentionDir, "board.jsonl");
+    const retentionBoard = new TowerBoard(retentionFile);
+    const base = await retentionBoard.fold();
+    await retentionBoard.append(
+      writeBoardSnapshot(
+        base,
+        { tasks: [{ key: "a", subject: "row", status: "pending" }] },
+        "tower",
+      ).taskEvents,
+    );
+    const stamps: number[] = [];
+    const archivedPaths: string[] = [];
+    const archiveDir = join(retentionDir, "archive");
+    for (let i = 0; i < MAX_BOARD_ARCHIVES + 1; i += 1) {
+      const stamp = Date.now() + i * 1000;
+      const result = await retentionBoard.compact({
+        by: "tower",
+        archive: true,
+        now: stamp,
+      });
+      stamps.push(stamp);
+      if (result.archived !== undefined) {
+        archivedPaths.push(result.archived);
+        // Force a distinct, increasing mtime so pruning is deterministic.
+        utimesSync(result.archived, new Date(stamp), new Date(stamp));
+      }
+    }
+    const residue = readdirSync(archiveDir).filter((name) =>
+      name.endsWith(".jsonl"),
+    );
+    check(
+      "archive retention keeps exactly the newest MAX_BOARD_ARCHIVES",
+      residue.length === MAX_BOARD_ARCHIVES,
+      `kept=${residue.join(",")}`,
+    );
+    check(
+      "archive retention prunes the oldest pre-compact log",
+      archivedPaths.length === MAX_BOARD_ARCHIVES + 1 &&
+        !existsSync(archivedPaths[0]!),
+      archivedPaths[0] ?? "(no archive path)",
+    );
+  }
+
+  // Unfoldable legacy lines: they no longer block the explicit `gc` (which
+  // archives the verbatim pre-compact log first) and the moved count is
+  // reported; the strict raw API still refuses unless `dropSkipped` is set.
+  {
+    const legacyDir = mkdtempSync(join(tmpdir(), "tower-do-legacy-skip-"));
+    const legacyFile = join(legacyDir, "board.jsonl");
+    const legacyBoard = new TowerBoard(legacyFile);
+    const legacyTask = {
+      key: "legacy",
+      subject: "legacy row",
+      status: "blocked",
+      // Over MAX_BLOCKER_CHARS (120): valid when written, un-foldable now.
+      blockedBy: ["x".repeat(200)],
+      dependsOn: [],
+    };
+    await appendFile(
+      legacyFile,
+      `${JSON.stringify({ kind: "task", op: "upsert", key: "legacy", task: legacyTask, by: "alice", at: Date.now() })}\n`,
+    );
+    const legacyRaw = readFileSync(legacyFile, "utf8");
+    const legacyFold = await legacyBoard.fold();
+    check(
+      "an over-limit legacy row is reported as skipped",
+      legacyFold.skipped === 1,
+      String(legacyFold.skipped),
+    );
+    await expectRejects(
+      "compact still refuses unfoldable lines without dropSkipped",
+      () => legacyBoard.compact({ by: "tower", archive: true }),
+      /refusing to compact/,
+    );
+    const legacyResult = await legacyBoard.compact({
+      by: "tower",
+      archive: true,
+      dropSkipped: true,
+    });
+    check(
+      "a gc with dropSkipped reports how many lines it moved to the archive",
+      legacyResult.skipped === 1 &&
+        legacyResult.archived !== undefined &&
+        readFileSync(legacyResult.archived, "utf8") === legacyRaw,
+      `skipped=${String(legacyResult.skipped)} archived=${String(legacyResult.archived)}`,
+    );
+    check(
+      "the live board no longer holds the dropped line",
+      (await legacyBoard.fold()).skipped === 0,
+    );
+  }
+
+  // Dropping unfoldable lines is only safe alongside an archive: the raw API
+  // must refuse the combination rather than trust every caller to pair them
+  // (an unarchived drop is permanent, silent loss).
+  {
+    const noArchiveDir = mkdtempSync(join(tmpdir(), "tower-do-drop-no-archive-"));
+    const noArchiveFile = join(noArchiveDir, "board.jsonl");
+    await appendFile(
+      noArchiveFile,
+      `${JSON.stringify({ kind: "task", op: "upsert", key: "legacy", task: { key: "legacy", subject: "legacy", status: "blocked", blockedBy: ["x".repeat(200)], dependsOn: [] }, by: "alice", at: Date.now() })}\n`,
+    );
+    await expectRejects(
+      "dropSkipped without archive is refused (no silent permanent loss)",
+      () => new TowerBoard(noArchiveFile).compact({ by: "tower", dropSkipped: true }),
+      /dropSkipped requires archive/,
+    );
+  }
+
+  // The archive is written BEFORE the final CAS, deliberately outside the
+  // [final CAS, rename] window: an archive written inside that window would
+  // widen the one residual append race the CAS exists to keep one syscall
+  // wide. `beforeSwap` fires after the final CAS, so the archive must already
+  // exist by then.
+  {
+    const orderDir = mkdtempSync(join(tmpdir(), "tower-do-archive-order-"));
+    const orderFile = join(orderDir, "board.jsonl");
+    const orderBoard = new TowerBoard(orderFile);
+    await orderBoard.append(
+      writeBoardSnapshot(
+        await orderBoard.fold(),
+        { tasks: [{ key: "o", subject: "o", status: "pending" }] },
+        "tower",
+      ).taskEvents,
+    );
+    const stamp = Date.now();
+    let archivesAtSwap = -1;
+    await orderBoard.compact({
+      by: "tower",
+      archive: true,
+      now: stamp,
+      testHooks: {
+        // Fires AFTER the final CAS and BEFORE the rename: the archive must
+        // already be on disk, proving it sits outside the final window.
+        beforeSwap: () => {
+          const archiveDir = join(orderDir, "archive");
+          archivesAtSwap = existsSync(archiveDir)
+            ? readdirSync(archiveDir).filter((name) =>
+                name.endsWith(".jsonl"),
+              ).length
+            : 0;
+        },
+      },
+    });
+    check(
+      "the archive is written before the final CAS (outside the rename window)",
+      archivesAtSwap === 1,
+      `archives at final CAS: ${String(archivesAtSwap)}`,
+    );
+  }
+
+  // A blank (or tolerated-foreign) line inside the compact snapshot block must
+  // not shift the block: membership is counted by CONSUMED snapshot lines, so
+  // an index window would let trailing snapshot events fall outside it and
+  // bump the revision the header already accounts for.
+  {
+    const windowDir = mkdtempSync(join(tmpdir(), "tower-do-snapshot-window-"));
+    const windowFile = join(windowDir, "board.jsonl");
+    const windowBoard = new TowerBoard(windowFile);
+    await windowBoard.append(
+      writeBoardSnapshot(
+        await windowBoard.fold(),
+        {
+          tasks: [
+            { key: "w1", subject: "one", status: "pending" },
+            { key: "w2", subject: "two", status: "pending" },
+          ],
+        },
+        "tower",
+      ).taskEvents,
+    );
+    const beforeWindow = await windowBoard.fold();
+    await windowBoard.compact({ by: "tower" });
+    const windowLines = readFileSync(windowFile, "utf8").split("\n");
+    // Insert a blank line between the header and the snapshot events.
+    windowLines.splice(1, 0, "");
+    writeFileSync(windowFile, windowLines.join("\n"));
+    const afterWindow = await windowBoard.fold();
+    check(
+      "a blank line inside the snapshot block still preserves the revision",
+      afterWindow.revision === beforeWindow.revision &&
+        afterWindow.tasks.length === 2,
+      `rev ${String(afterWindow.revision)} vs ${String(beforeWindow.revision)} tasks=${String(afterWindow.tasks.length)}`,
+    );
+    // Same for a FOREIGN (unfoldable) line: it is skipped and must not consume
+    // a snapshot slot, or the trailing snapshot events would fall outside the
+    // block and bump the revision.
+    const foreignFile = join(windowDir, "board-foreign.jsonl");
+    const foreignBoard = new TowerBoard(foreignFile);
+    await foreignBoard.append(
+      writeBoardSnapshot(
+        await foreignBoard.fold(),
+        {
+          tasks: [
+            { key: "f1", subject: "one", status: "pending" },
+            { key: "f2", subject: "two", status: "pending" },
+          ],
+        },
+        "tower",
+      ).taskEvents,
+    );
+    const beforeForeign = await foreignBoard.fold();
+    await foreignBoard.compact({ by: "tower" });
+    const foreignLines = readFileSync(foreignFile, "utf8").split("\n");
+    foreignLines.splice(1, 0, "{ this is not json }");
+    writeFileSync(foreignFile, foreignLines.join("\n"));
+    const afterForeign = await foreignBoard.fold();
+    check(
+      "a foreign line inside the snapshot block is skipped without bumping the revision",
+      afterForeign.revision === beforeForeign.revision &&
+        afterForeign.skipped === 1 &&
+        afterForeign.tasks.length === 2,
+      `rev ${String(afterForeign.revision)} vs ${String(beforeForeign.revision)} skipped=${String(afterForeign.skipped)} tasks=${String(afterForeign.tasks.length)}`,
+    );
+  }
 
   console.log(`\n${passed} passed, ${failures} failed`);
   if (failures > 0) process.exit(1);

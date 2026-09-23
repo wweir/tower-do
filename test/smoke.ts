@@ -10,6 +10,7 @@ import {
   mkdirSync,
   mkdtempSync,
   readFileSync,
+  statSync,
   unlinkSync,
   writeFileSync,
 } from "node:fs";
@@ -1812,6 +1813,53 @@ async function layer2(): Promise<void> {
     reminder.slice(0, 120),
   );
 
+  // The LEGACY full-board checkpoint (`pi-tower-do-board`) must also become the
+  // read-path fallback: it is a complete view, not `incomplete`, so keeping
+  // only the digest form left a legacy-snapshot session reporting an empty
+  // fold on every tool call while the board file was gone. (Runs after the
+  // reminder checks above, which depend on `activeCwd` still being compactDir.)
+  {
+    const legacyDir = mkdtempSync(join(tmpdir(), "tower-do-legacy-ckpt-"));
+    const legacyStart = handlers.get("session_start");
+    const legacySnapshot = {
+      ...createEmptyBoard(),
+      revision: 7,
+      tasks: [
+        {
+          key: "keepme",
+          subject: "keep me",
+          status: "pending",
+          dependsOn: [],
+          blockedBy: [],
+        },
+      ],
+    };
+    if (legacyStart !== undefined) {
+      await legacyStart({} as never, {
+        ...(ctxBase as object),
+        cwd: legacyDir,
+        sessionManager: {
+          getSessionId: () => "legacy-ckpt-sess",
+          getBranch: () => [
+            {
+              type: "custom",
+              customType: TOWER_DO_BOARD_TYPE,
+              data: legacySnapshot,
+            },
+          ],
+        },
+      } as never);
+    }
+    const legacyStatus = await run("tower_do_status", {} as never, legacyDir);
+    check(
+      "a legacy full-snapshot checkpoint is the fallback, not an empty fold",
+      legacyStatus.text.includes("keepme") &&
+        legacyStatus.text.includes("last full-board checkpoint") &&
+        !legacyStatus.text.includes("this is an empty fold"),
+      legacyStatus.text.split("\n").slice(0, 5).join(" | "),
+    );
+  }
+
   // A forced checkpoint (compact steer / before_agent_start) injects its own
   // BOARD_TYPE snapshot, but the context hook strips that snapshot before the
   // LLM sees it. The checkpoint must therefore arm the next context event;
@@ -2687,6 +2735,168 @@ async function layer2(): Promise<void> {
     `ok=${reopenOk} nonClosed=${nonClosed}`,
   );
 
+  // The explicit gc archives before dropping, so it compacts a board with
+  // unfoldable legacy lines by default and reports the count; `dropSkipped:
+  // false` keeps the strict refusal. (Must run before the alias-cap probe
+  // below, which consumes this session's whole `as` budget.)
+  const seedLegacyRow = (target: string): void => {
+    const file = boardFileFor(target);
+    mkdirSync(dirname(file), { recursive: true });
+    writeFileSync(
+      file,
+      `${JSON.stringify({
+        kind: "task",
+        op: "upsert",
+        key: "legacy",
+        task: {
+          key: "legacy",
+          subject: "legacy",
+          status: "blocked",
+          blockedBy: ["x".repeat(200)],
+          dependsOn: [],
+        },
+        by: "seed",
+        at: Date.now(),
+      })}\n`,
+    );
+  };
+  {
+    const gcDir = mkdtempSync(join(tmpdir(), "tower-do-gc-default-"));
+    seedLegacyRow(gcDir);
+    const gcDefault = await run(
+      "tower_do",
+      { action: "gc", tasks: [], as: "tower" } as never,
+      gcDir,
+    );
+    check(
+      "the gc action drops unfoldable lines by default and reports the count",
+      gcDefault.text.includes(
+        "unfoldable legacy line(s) moved to the archive",
+      ) &&
+        (
+          JSON.parse(readFileSync(boardFileFor(gcDir), "utf8").split("\n")[0]) as {
+            kind?: unknown;
+          }
+        ).kind === "compact",
+      gcDefault.text.split("\n").slice(0, 3).join(" | "),
+    );
+
+    const gcStrictDir = mkdtempSync(join(tmpdir(), "tower-do-gc-strict-"));
+    seedLegacyRow(gcStrictDir);
+    const strictBefore = readFileSync(boardFileFor(gcStrictDir), "utf8");
+    const strictError = await runThrow(
+      "tower_do",
+      { action: "gc", tasks: [], as: "tower", dropSkipped: false } as never,
+      gcStrictDir,
+    );
+    check(
+      "dropSkipped:false keeps the strict refusal and leaves the log untouched",
+      /refusing to compact/.test(strictError) &&
+        readFileSync(boardFileFor(gcStrictDir), "utf8") === strictBefore,
+      strictError.slice(0, 90),
+    );
+  }
+
+  // The automatic path must NOT drop unfoldable lines: a large board holding
+  // one stays uncompacted (only the explicit gc may clean it).
+  {
+    const autoSkipDir = mkdtempSync(join(tmpdir(), "tower-do-auto-skip-"));
+    const autoSkipFile = boardFileFor(autoSkipDir);
+    const filler = "x".repeat(1000);
+    const at = Date.now();
+    const lines: string[] = [];
+    for (let i = 0; i < 1200; i += 1) {
+      lines.push(
+        JSON.stringify({
+          kind: "task",
+          op: "upsert",
+          key: `s-${String(i % 30)}`,
+          task: {
+            key: `s-${String(i % 30)}`,
+            subject: `s ${String(i)}`,
+            status: "pending",
+            description: filler,
+            dependsOn: [],
+            blockedBy: [],
+          },
+          by: "smoke",
+          at: at + i,
+        }),
+      );
+    }
+    lines.push(
+      JSON.stringify({
+        kind: "task",
+        op: "upsert",
+        key: "legacy",
+        task: {
+          key: "legacy",
+          subject: "legacy",
+          status: "blocked",
+          blockedBy: ["x".repeat(200)],
+          dependsOn: [],
+        },
+        by: "smoke",
+        at: at + 1200,
+      }),
+    );
+    mkdirSync(dirname(autoSkipFile), { recursive: true });
+    writeFileSync(autoSkipFile, `${lines.join("\n")}\n`);
+    const autoSkipBefore = statSync(autoSkipFile).size;
+    const startSkip = handlers.get("session_start");
+    if (startSkip !== undefined) {
+      await startSkip({} as never, {
+        ...(ctxBase as object),
+        cwd: autoSkipDir,
+      } as never);
+    }
+    // The refusal is immediate; wait past it before asserting the negative.
+    await new Promise((resolve) => setTimeout(resolve, 800));
+    const autoSkipHead = JSON.parse(
+      readFileSync(autoSkipFile, "utf8").split("\n")[0],
+    ) as { kind?: unknown };
+    check(
+      "the automatic path refuses to drop unfoldable lines",
+      autoSkipHead.kind !== "compact" &&
+        statSync(autoSkipFile).size === autoSkipBefore,
+      `head=${String(autoSkipHead.kind)} ${String(autoSkipBefore)} -> ${String(statSync(autoSkipFile).size)}`,
+    );
+  }
+
+  // `dropSkipped` is a gc-only knob: on a task write it must be rejected, not
+  // silently ignored (the caller would otherwise believe it compacted).
+  {
+    const dropArgDir = mkdtempSync(join(tmpdir(), "tower-do-drop-arg-"));
+    const dropArgError = await runThrow(
+      "tower_do",
+      { tasks: [], dropSkipped: false } as never,
+      dropArgDir,
+    );
+    check(
+      "dropSkipped outside action:gc is rejected instead of silently ignored",
+      /dropSkipped applies to action:"gc" only/.test(dropArgError),
+      dropArgError.slice(0, 90),
+    );
+  }
+
+  // The snapshot write must hand out arrays that do not alias the input view:
+  // a caller mutating the result would otherwise mutate the board it folded.
+  {
+    const aliasView = createEmptyBoard();
+    const aliasWrite = writeBoardSnapshot(
+      aliasView,
+      { tasks: [{ key: "a", subject: "a", status: "pending" }] },
+      "tower",
+    );
+    (aliasWrite.view.messages as unknown[]).push({ nope: true });
+    (aliasWrite.view.findings as unknown[]).push({ nope: true });
+    check(
+      "writeBoardSnapshot returns arrays that do not alias the input view",
+      aliasView.messages.length === 0 && aliasView.findings.length === 0,
+      `messages=${String(aliasView.messages.length)} findings=${String(aliasView.findings.length)}`,
+    );
+  }
+
   // LAST in the shared instance on purpose: reaching the cap consumes this
   // session's whole alias budget, so every assertion that needs another `as`
   // must already have run. The cap must fail LOUD rather than silently dropping
@@ -2709,6 +2919,68 @@ async function layer2(): Promise<void> {
     /at most \d+ aliases/.test(aliasError),
     aliasError.slice(0, 90),
   );
+
+  // Automatic log compaction (Layer 3): a board log past the size threshold is
+  // compacted at the session boundary under the same lease/CAS/archive as an
+  // explicit gc. The hook is fire-and-forget, so poll for the compact header.
+  {
+    const autoDir = mkdtempSync(join(tmpdir(), "tower-do-autocompact-"));
+    const autoFile = boardFileFor(autoDir);
+    const filler = "x".repeat(1000);
+    const at = Date.now();
+    const lines: string[] = [];
+    // ~1.4 MiB of VALID task events across 30 keys, so folding collapses them
+    // to 30 snapshot rows: enough to cross BOARD_COMPACT_HINT_BYTES, and the
+    // compact genuinely shrinks the log. (The open-task budget is a write-time
+    // check, not a fold one, so the raw append is fine here.)
+    for (let i = 0; i < 1200; i += 1) {
+      lines.push(
+        JSON.stringify({
+          kind: "task",
+          op: "upsert",
+          key: `auto-${String(i % 30)}`,
+          task: {
+            key: `auto-${String(i % 30)}`,
+            subject: `auto ${String(i)}`,
+            status: "pending",
+            description: filler,
+            dependsOn: [],
+            blockedBy: [],
+          },
+          by: "smoke",
+          at: at + i,
+        }),
+      );
+    }
+    mkdirSync(dirname(autoFile), { recursive: true });
+    writeFileSync(autoFile, `${lines.join("\n")}\n`);
+    const beforeBytes = statSync(autoFile).size;
+    const startAuto = handlers.get("session_start");
+    if (startAuto !== undefined) {
+      await startAuto({} as never, {
+        ...(ctxBase as object),
+        cwd: autoDir,
+      } as never);
+    }
+    let compacted = false;
+    for (let i = 0; i < 120 && !compacted; i += 1) {
+      try {
+        const head = JSON.parse(
+          readFileSync(autoFile, "utf8").split("\n")[0],
+        ) as { kind?: unknown };
+        compacted = head.kind === "compact";
+      } catch {
+        // Mid-swap: retry.
+      }
+      if (!compacted) await new Promise((resolve) => setTimeout(resolve, 50));
+    }
+    const afterBytes = statSync(autoFile).size;
+    check(
+      "a board log past the threshold is compacted at the session boundary",
+      compacted && afterBytes < beforeBytes,
+      `compacted=${String(compacted)} ${String(beforeBytes)} -> ${String(afterBytes)}`,
+    );
+  }
 }
 
 await layer1();
