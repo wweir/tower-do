@@ -13,6 +13,7 @@ import {
   EXTERNAL_MOVE_MAX_COMMITS,
   formatGitSegment,
   headMoveIsExternal,
+  leftDirtyPaths,
   parseDiffNames,
   parsePorcelain,
   sessionTouchedDelta,
@@ -59,6 +60,30 @@ check(
   "porcelain: rename is one dirty entry (destination), orig skipped",
   ren.changed.length === 1 && ren.changed[0] === "new name.ts",
   JSON.stringify(ren.changed),
+);
+check(
+  "porcelain: rename exposes the origin→destination pair",
+  ren.renamed.get("old name.ts") === "new name.ts" && ren.renamed.size === 1,
+  JSON.stringify([...ren.renamed]),
+);
+// A rename is ONE dirty entry (destination), so the session viewpoint must not
+// also count the origin as a file that "left the dirty set" — otherwise one
+// `git mv` reads `files 2 · dirty 1`, breaking the same-unit contract.
+check(
+  "left-dirty drops a rename origin whose destination is still dirty",
+  leftDirtyPaths(
+    ["old name.ts", "deleted.ts"],
+    new Set(["new name.ts"]),
+    new Map([["old name.ts", "new name.ts"]]),
+  ).join(",") === "deleted.ts",
+);
+check(
+  "left-dirty keeps an origin whose rename destination is gone again",
+  leftDirtyPaths(
+    ["old name.ts"],
+    new Set<string>(),
+    new Map([["old name.ts", "new name.ts"]]),
+  ).join(",") === "old name.ts",
 );
 
 const special = parsePorcelain('?? foo"bar.txt\0 M edit ed.ts\0');

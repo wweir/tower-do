@@ -29,9 +29,13 @@
 export function parsePorcelain(output: string): {
  changed: string[];
  untracked: string[];
+ /** Rename/copy origin → destination. The dirty entry is the destination, but
+  * attribution needs the pair to avoid counting one rename twice. */
+ renamed: Map<string, string>;
 } {
  const changed: string[] = [];
  const untracked: string[] = [];
+ const renamed = new Map<string, string>();
  const parts = output.split("\0");
  for (let i = 0; i < parts.length; i++) {
   const line = parts[i];
@@ -40,6 +44,8 @@ export function parsePorcelain(output: string): {
   const path = line.slice(3);
   // Rename/copy: skip the original-path record that follows.
   if (status[0] === "R" || status[0] === "C") {
+   const origin = parts[i + 1];
+   if (origin !== undefined && origin.length > 0) renamed.set(origin, path);
    changed.push(path);
    i += 1;
    continue;
@@ -50,7 +56,29 @@ export function parsePorcelain(output: string): {
   }
   changed.push(path);
  }
- return { changed, untracked };
+ return { changed, untracked, renamed };
+}
+
+/**
+ * Paths that left the dirty set, for the session viewpoint's "left with a
+ * different blob" probe. A rename's ORIGIN is dropped when its destination is
+ * still dirty: `dirty` counts a rename as one entry (the destination), so
+ * counting the origin as a separate touched file would make `files` disagree
+ * with `dirty` for a single `git mv` (the "same unit" contract).
+ */
+export function leftDirtyPaths(
+ lastDirty: Iterable<string>,
+ currentSet: ReadonlySet<string>,
+ renamed: ReadonlyMap<string, string>,
+): string[] {
+ const left: string[] = [];
+ for (const path of lastDirty) {
+  if (currentSet.has(path)) continue;
+  const destination = renamed.get(path);
+  if (destination !== undefined && currentSet.has(destination)) continue;
+  left.push(path);
+ }
+ return left;
 }
 
 /** Paths from `git diff --name-only -z` (NUL-terminated, no C-quoting). */
