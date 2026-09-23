@@ -37,10 +37,12 @@ import { dirname, join } from "node:path";
 import {
   createEmptyBoard,
   isEpochMs,
+  MAX_BOARD_ARCHIVES,
   normalizeIdentity,
   readPersistedFinding,
   readPersistedMessage,
   readPersistedTask,
+  sameAgent,
   TOWER_DO_SCHEMA_VERSION,
   TOWER_IDENTITY,
   TowerDoValidationError,
@@ -133,6 +135,50 @@ function readEvent(candidate: unknown): BoardEvent | undefined {
     return { kind: "finding", finding, by, at };
   }
   return undefined;
+}
+
+/**
+ * Keep the newest `MAX_BOARD_ARCHIVES` pre-compact logs under `dir` (by mtime)
+ * and remove the rest. The compact writes one archive per run, so a cleanup
+ * that never pruned them would just move the unbounded growth from
+ * `board.jsonl` into `archive/`. `pinned` (this run's own archive) is never
+ * removed — mtime ordering is an assumption, and a skewed clock (or a
+ * restored archive set) must not delete the evidence of the swap that just
+ * happened. Best-effort: the compaction has already swapped by the time this
+ * runs, so a failed unlink must not fail the call.
+ */
+async function pruneArchives(dir: string, pinned?: string): Promise<string[]> {
+  const removed: string[] = [];
+  let names: string[];
+  try {
+    names = await readdir(dir);
+  } catch {
+    return removed;
+  }
+  const files: { path: string; mtimeMs: number }[] = [];
+  for (const name of names) {
+    if (!name.endsWith(".jsonl")) continue;
+    const path = join(dir, name);
+    if (path === pinned) continue;
+    try {
+      const info = await stat(path);
+      if (info.isFile()) files.push({ path, mtimeMs: info.mtimeMs });
+    } catch {
+      // Raced away (a concurrent prune): skip it.
+    }
+  }
+  files.sort((a, b) => b.mtimeMs - a.mtimeMs);
+  // `pinned` counts against the retention budget even though it is exempt.
+  const budget = Math.max(0, MAX_BOARD_ARCHIVES - (pinned === undefined ? 0 : 1));
+  for (const { path } of files.slice(budget)) {
+    try {
+      await unlink(path);
+      removed.push(path);
+    } catch {
+      // Best-effort.
+    }
+  }
+  return removed;
 }
 
 export class TowerBoard {
@@ -493,12 +539,19 @@ export class TowerBoard {
         // Not JSON: treated as an ordinary (skipped) legacy line below.
       }
     }
+    // Snapshot membership is counted by CONSUMED snapshot events, not by
+    // physical line index: a blank, foreign, or unfoldable line inside the
+    // block advances `li` without being one of the compactor's snapshot rows,
+    // so an index window (`li < start + snapshotLines`) would let the trailing
+    // snapshot events fall outside it and bump the revision the block must not
+    // bump.
+    let snapshotConsumed = 0;
     for (let li = 0; li < lines.length; li += 1) {
       const line = lines[li];
       const trimmed = line.trim();
       if (!trimmed) continue;
       if (li === firstIndex && start !== 0) continue; // the compact header itself
-      const inSnapshot = li >= start && li < start + snapshotLines;
+      const inSnapshot = start !== 0 && snapshotConsumed < snapshotLines;
       let candidate: unknown;
       try {
         candidate = JSON.parse(trimmed);
@@ -515,6 +568,13 @@ export class TowerBoard {
         skipped += 1;
         continue;
       }
+      // Only a line the fold can turn into an event was written by the
+      // compactor as a snapshot row, so only it consumes a snapshot slot. A
+      // foreign/unfoldable line inside the block is skipped and consumes
+      // nothing, keeping the trailing real snapshot events inside the block
+      // (an index or a pre-parse counter would let them fall out and bump the
+      // revision the header already accounts for).
+      if (inSnapshot) snapshotConsumed += 1;
       if (event.kind === "task") {
         if (event.op === "remove") {
           if (event.key !== undefined) {
@@ -575,7 +635,11 @@ export class TowerBoard {
           ];
           const audience =
             foldedSoFar?.audience ??
-            currentOwners.filter((owner) => owner !== message.from);
+            // Delivery/display layer: exclude the sender by AGENT, not by exact
+            // string, so a legacy label of the same session is not left in the
+            // audience (a self-broadcast is never in its own inbox and can
+            // never ack, which would pin the retention budget).
+            currentOwners.filter((owner) => !sameAgent(owner, message.from));
           messages.set(message.id, { ...message, audience });
         } else {
           messages.set(message.id, message);
@@ -705,9 +769,13 @@ export class TowerBoard {
   }): Promise<{
     revision: number;
     kept: { tasks: number; messages: number; findings: number };
+    /** Unfoldable lines the compact discarded (0 unless `dropSkipped`). */
+    skipped: number;
     bytesBefore: number;
     bytesAfter: number;
     archived?: string;
+    /** Older pre-compact logs removed by this run's archive retention. */
+    prunedArchives?: string[];
   }> {
     return this.serialize(() =>
       this.withLock(async (lease) => {
@@ -728,6 +796,14 @@ export class TowerBoard {
       }
       const sourceSha256 = createHash("sha256").update(raw).digest("hex");
       const bytesBefore = Buffer.byteLength(raw, "utf8");
+      // Dropping unfoldable lines is only safe when the verbatim pre-compact
+      // log is archived first (it is the only remaining copy). Refuse the
+      // combination rather than trusting every caller to pair them.
+      if (options.dropSkipped === true && options.archive !== true) {
+        throw new TowerDoValidationError(
+          "dropSkipped requires archive: true — the pre-compact log is the only copy of the unfoldable lines, so they may only be discarded alongside an archive",
+        );
+      }
       const view = await this.fold();
       if (view.skipped > 0 && options.dropSkipped !== true) {
         throw new TowerDoValidationError(
@@ -824,17 +900,24 @@ export class TowerBoard {
         },
       };
       const content = `${[JSON.stringify(header), ...snapshotEvents.map((event) => JSON.stringify(event))].join("\n")}\n`;
-      // Only the archive PATH is decided here; the write happens after the CAS
-      // passes, immediately before the rename. Writing it earlier leaves an
-      // archive that claims a compaction which then aborted.
+      // Only the archive PATH is decided here; the write happens after the
+      // FIRST CAS (the pre-rename content check) and before the hard link and
+      // the FINAL CAS, deliberately outside the [final CAS, rename] window.
+      // Writing it earlier leaves an archive that claims a compaction which
+      // then aborted; writing it inside the final window widens the one
+      // residual append race that window exists to keep narrow.
       let archived: string | undefined;
+      let prunedArchives: string[] = [];
       if (options.archive === true) {
         const dir = join(dirname(this.file), "archive");
         await mkdir(dir, { recursive: true });
         const stamp = new Date(now).toISOString().replace(/[:.]/g, "-");
         archived = join(
           dir,
-          `board-rev${String(view.revision)}-${stamp}.jsonl`,
+          // The random suffix keeps two compacts of the same revision in the
+          // same millisecond from overwriting each other's evidence (the
+          // `now` test seam makes that collision deterministic).
+          `board-rev${String(view.revision)}-${stamp}-${randomUUID().slice(0, 8)}.jsonl`,
         );
       }
       const tmp = `${this.file}.tmp`;
@@ -970,6 +1053,13 @@ export class TowerBoard {
             );
           }
           await unlink(prev).catch(() => {});
+          // Success path only: the swap landed and the evidence link is gone,
+          // so this run's archive is safely on disk. Bound the archive set now
+          // — the cleanup must not itself accumulate whole-log copies. This
+          // run's archive is pinned, so a skewed mtime cannot prune it.
+          if (archived !== undefined) {
+            prunedArchives = await pruneArchives(dirname(archived), archived);
+          }
         } catch (error) {
           if (!keepPrev) await unlink(prev).catch(() => {});
           throw error;
@@ -990,9 +1080,14 @@ export class TowerBoard {
           messages: view.messages.length,
           findings: view.findings.length,
         },
+        /** Unfoldable lines the compact discarded. Non-zero only when the
+         * caller opted in (`dropSkipped`); the pre-compact log that holds them
+         * is in `archive/`, so nothing is lost silently. */
+        skipped: view.skipped,
         bytesBefore,
         bytesAfter: Buffer.byteLength(content, "utf8"),
         ...(archived === undefined ? {} : { archived }),
+        ...(prunedArchives.length === 0 ? {} : { prunedArchives }),
       };
       }),
     );
