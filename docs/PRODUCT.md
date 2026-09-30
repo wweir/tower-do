@@ -19,6 +19,11 @@ in progress* plus task-bound communication state, without any central server.
   auditable exit: a claim/close/snooze lifecycle with reasons, a bounded
   non-closed budget (so the backlog is actionable instead of silently
   accumulating), and a pressure-ordered list that never hides the oldest debt.
+- **Push delivery**: a *direct* message wakes an idle, attended session and is
+  injected into its conversation for one bounded turn, so a waiting agent
+  picks up a peer's reply without a human prompt. Broadcasts, batch modes, and
+  sessions waiting for their first turn are never woken; the `inbox` pull path
+  is unchanged.
 - **Global status dashboard**: who owns what, blocks, unread messages, open
   findings, activity, presence. The default view is caller-centred — your own
   unfinished work first, then the peer work you are coupled to (a dependency,
@@ -43,7 +48,7 @@ TowerDo is its state/communication substrate.
   reasons.
 - **Multiple sessions, one project.** Both sides read/write the same
   `~/.pi/tower-do/<project>/board.jsonl`; send a message, the other reads it via
-  `inbox`.
+  `inbox` — and a directly addressed, idle session is woken to read it at once.
 - **Advisory conflict signals.** Completing a task with `changedFiles` and
   declaring `scope` turns the board into an early-warning surface: a planner
   whose scope overlaps a just-finished task's files, or two in-progress tasks

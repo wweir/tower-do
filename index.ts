@@ -101,6 +101,7 @@ import {
   DEFAULT_IDENTITY,
   deriveFindingState,
   derivePresence,
+  deliveredMailIds,
   findAllUnresolvedDeps,
   findingBudgetRejection,
   findingPressureOrder,
@@ -122,6 +123,7 @@ import {
   formatLiveSegment,
   formatOtherKeysLine,
   formatTakeoverWindow,
+  formatWakeMail,
   formatPresenceLine,
   getAllTasks,
   isCallerLine,
@@ -161,6 +163,7 @@ import {
   relativeTime,
   retainFindings,
   retainMessages,
+  selectWakeMessages,
   sliceScopeConflicts,
   sliceTaskDashboard,
   staleTaskClaims,
@@ -177,6 +180,8 @@ import {
   transportLimit,
   TOWER_DO_BOARD_DIGEST_TYPE,
   TOWER_DO_BOARD_TYPE,
+  TOWER_DO_MAIL_PENDING_TYPE,
+  TOWER_DO_MAIL_TYPE,
   TOWER_DO_REMINDER_TYPE,
   TOWER_DO_STATUS_TOOL_NAME,
   TOWER_DO_STATUSES,
@@ -194,6 +199,7 @@ import {
   type TowerBoardView,
   type TowerDoCheckpointDigest,
   type TowerDoFinding,
+  type TowerDoMailDetails,
   type TowerDoMessage,
   type TowerDoStatus,
   type TowerDoTask,
@@ -221,6 +227,19 @@ const MESSAGE_RETENTION = 50; // max fully-read messages kept in the view
 /** Default `tower_do_talk inbox` page size: the schema description and the
  * handler must agree, so the number lives once. */
 const DEFAULT_INBOX_LIMIT = 20;
+
+// Push wake (internal policy, like the other tuning constants). A DIRECT board
+// message addressed to this session is injected into the conversation and
+// wakes an idle session for one turn, so a peer's message reaches a waiting
+// session without it polling. Broadcasts never wake: one `to: "all"` would
+// start a turn in every live session at once and can cascade into reply
+// storms; the pull path (reminder + inbox) still surfaces them. At most
+// WAKE_MAIL_MAX messages per wake and WAKE_MAX_PER_WINDOW wakes per
+// WAKE_WINDOW_MS, so two agents cannot wake each other in a tight loop
+// (rate-limited, not a hard termination guarantee).
+const WAKE_MAIL_MAX = 5;
+const WAKE_MAX_PER_WINDOW = 10;
+const WAKE_WINDOW_MS = 10 * 60_000;
 
 // ---------------------------------------------------------------------------
 // Config (global, HOME-scoped, fail-loud JSON)
@@ -959,6 +978,20 @@ export default function towerDoExtension(pi: ExtensionAPI): void {
   // mid-session, so recomputing per call would churn the filename every
   // heartbeat and strand the record past clean exit.
   let selfLivePath: string | undefined;
+  // Push-wake state — session/branch scoped, (re)set in restore() and torn
+  // down in session_shutdown. `wakeMailDelivered` holds the board message ids
+  // already injected on the active branch; `wakeInFlight` spans the fold await
+  // of one wake attempt; `wakeGeneration` invalidates a stale attempt's cleanup
+  // across a session boundary; the window counters bound how often a session
+  // can be woken; `hasSettledOnce` blocks a wake before the user's first turn.
+  // Ids whose push is not persisted yet live on the branch as
+  // TOWER_DO_MAIL_PENDING_TYPE entries (not here), so they survive /reload.
+  let wakeMailDelivered = new Set<string>();
+  let wakeInFlight = false;
+  let wakeGeneration = 0;
+  let wakeWindowStart = 0;
+  let wakeWindowCount = 0;
+  let hasSettledOnce = false;
   // Sequence token guarding refreshGitCounts write-backs (see above).
   let gitRefreshSeq = 0;
   // Automatic log compaction (Layer 3): one in-flight compact per board file,
@@ -1530,6 +1563,7 @@ export default function towerDoExtension(pi: ExtensionAPI): void {
         if (needsFold && existsSync(entry.board.file)) {
           try {
             currentView = await foldRetained(activeCwd);
+            await maybeWakeForMail(activeCwd);
           } catch {
             // Display cache only: keep the previous view on a failed fold.
           }
@@ -1832,6 +1866,74 @@ export default function towerDoExtension(pi: ExtensionAPI): void {
       ...folded,
       messages: retainMessages(folded.messages, folded, MESSAGE_RETENTION),
     });
+  };
+
+  /** Push wake: inject DIRECT board mail addressed to this session and start
+   *  one turn, so a peer message reaches an idle session immediately instead
+   *  of waiting for its next user prompt. Called from the board watcher and
+   *  from agent_settled. Never before the session has settled once (a wake
+   *  must not preempt the user's first turn), never while a turn runs (the
+   *  pull path covers it), and never in an unattended batch mode (print/JSON):
+   *  a wake starts an autonomous turn, so only an attended session (TUI/RPC,
+   *  i.e. `hasUI`) may be woken. The in-flight flag is set BEFORE the fold
+   *  await and released in `finally`, so two concurrent refreshes cannot
+   *  deliver the same mail twice; the post-await re-check blocks a wake that
+   *  would land on a replaced session or interleave with a turn started while
+   *  we folded. */
+  const maybeWakeForMail = async (cwd: string): Promise<void> => {
+    if (wakeInFlight || !hasSettledOnce) return;
+    const ctx = selfCtx;
+    if (ctx === undefined || !ctx.hasUI) return;
+    const now = Date.now();
+    if (now - wakeWindowStart > WAKE_WINDOW_MS) {
+      wakeWindowStart = now;
+      wakeWindowCount = 0;
+    }
+    if (wakeWindowCount >= WAKE_MAX_PER_WINDOW) return;
+    const generation = wakeGeneration;
+    wakeInFlight = true;
+    try {
+      const identity = sessionIdentity(cwd, pi, selfCtx);
+      const mail = selectWakeMessages(
+        await foldRetained(cwd),
+        identity,
+        wakeMailDelivered,
+      ).slice(0, WAKE_MAIL_MAX);
+      if (mail.length === 0) return;
+      // Re-check after the await: the session may have been replaced (restore
+      // swaps activeCwd/selfCtx) or a turn may have started meanwhile.
+      if (activeCwd !== cwd || selfCtx !== ctx || !ctx.isIdle()) return;
+      const details: TowerDoMailDetails = {
+        messageIds: mail.map((message) => message.id),
+      };
+      // Mark BEFORE send (at-most-once): a send that fails after this point
+      // must not retry in a loop — the reminder/inbox pull path still surfaces
+      // the message. The durable session marker covers the window where the
+      // (agent_settled-deferred) turn has not persisted the push yet, so a
+      // /reload there cannot re-deliver it; it is session-only (no LLM context,
+      // no board event) and branch-scoped like the push itself.
+      for (const message of mail) wakeMailDelivered.add(message.id);
+      wakeWindowCount += 1;
+      try {
+        pi.appendEntry(TOWER_DO_MAIL_PENDING_TYPE, details);
+      } catch {
+        // Best-effort durable marker: a failed append must not block the send;
+        // dedupe then falls back to the pushed custom message once it persists.
+      }
+      pi.sendMessage(
+        {
+          customType: TOWER_DO_MAIL_TYPE,
+          content: formatWakeMail(mail, identity),
+          display: true,
+          details,
+        },
+        { triggerTurn: true },
+      );
+    } finally {
+      // Only clear our own attempt: restore()/shutdown() bump the generation,
+      // and a stale attempt must not release a newer wake's flag.
+      if (wakeGeneration === generation) wakeInFlight = false;
+    }
   };
 
   const prepare = async (
@@ -3655,6 +3757,18 @@ export default function towerDoExtension(pi: ExtensionAPI): void {
     // re-label this one (see sessionIdentity).
     selfCtx = ctx;
     activeCwd = ctx.cwd;
+    // Push-wake state is branch-scoped: the ids already pushed on this branch
+    // are read back so a reload/tree move does not re-deliver, and a session
+    // that already has conversation (resume) may be woken. A brand-new session
+    // (no real message entry yet) must not be woken before the user's first
+    // turn — `custom_message` entries (reminders / pushed mail) do not count.
+    const branch = ctx.sessionManager.getBranch();
+    // Replays the push custom messages AND their durable pending markers, so a
+    // reload/tree move cannot re-deliver the mail (and a rewind drops both).
+    wakeMailDelivered = deliveredMailIds(branch);
+    hasSettledOnce = branch.some((branchEntry) => branchEntry.type === "message");
+    wakeGeneration += 1;
+    wakeInFlight = false;
     const entry = boards.entryFor(ctx.cwd);
     // Disk is authoritative. Fall back to the last session checkpoint ONLY
     // when the board file is missing (worktree cleaned / first run) — never
@@ -3736,6 +3850,11 @@ export default function towerDoExtension(pi: ExtensionAPI): void {
     if (activeCwd !== undefined && uiContext !== undefined) {
       scheduleAutoCompact(activeCwd, uiContext);
     }
+    // First settle arms the push wake (a resumed branch with conversation is
+    // armed in restore), so a peer message that arrived during the turn is
+    // delivered now instead of waiting for the next user prompt.
+    hasSettledOnce = true;
+    if (activeCwd !== undefined) await maybeWakeForMail(activeCwd);
     if (
       uiContext?.mode !== "tui" ||
       !uiContext?.hasUI ||
@@ -3894,6 +4013,12 @@ export default function towerDoExtension(pi: ExtensionAPI): void {
     resetGitCounts();
     contextCheckpointNeeded = false;
     llmCallsSinceReminder = 0;
+    wakeMailDelivered = new Set<string>();
+    wakeGeneration += 1;
+    wakeInFlight = false;
+    wakeWindowStart = 0;
+    wakeWindowCount = 0;
+    hasSettledOnce = false;
     // Re-resolve project roots next session: the filesystem may have gained
     // or lost a `.git` boundary since this session started (e.g. `git init`
     // mid-session). Within a session the cache is deliberately stable — moving

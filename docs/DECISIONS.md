@@ -1,8 +1,51 @@
 # Decisions — tower-do
 
 > Key decisions and the reasoning behind them. Latest first. Short-lived plans
-> / reviews live in docs/plans + docs/reviews and get folded here when they
+> / reviews live in docs/plans and docs/reviews and get folded here when they
 > become durable rules.
+
+## 2026-09 — push wake delivers direct mail to an idle session
+
+**Context.** Board mail was pull-only: the periodic reminder surfaced
+`N unread message(s)` and the agent had to call `tower_do_talk action:"inbox"`.
+A peer that finished and went idle could sit waiting for a reply that only
+arrived at the *target's* next prompt, so the coordination round stalled on
+human input. Pi supports the push side — `pi.sendMessage(msg, { triggerTurn:
+true })` starts a turn on an idle session and steers when one is running — and
+the board already had the trigger (the `board.jsonl` `fs.watch` debounce), so
+delivery costs no new mechanism.
+
+**Decision.** An idle, attended session that has a *direct* (`to` = its
+identity) unread message injects it into the conversation as a
+`pi-tower-do-mail` custom message and wakes for one turn.
+
+- **Direct only.** Broadcasts never wake: one `to: "all"` would start a turn in
+every live session at once and can cascade into reply storms. The pull path
+still surfaces them.
+- **Idle + attended only.** A running turn is left to the reminder/inbox path,
+and `print`/`JSON` batch modes (`!ctx.hasUI`) are never woken — a wake is an
+autonomous turn and must have a client watching. A resumed session with
+conversation may be woken; a brand-new session is not woken before the user's
+first turn.
+- **Delivered once per branch.** The pushed ids are read back from the
+session's own `pi-tower-do-mail` entries *and* the `pi-tower-do-mail-pending`
+session markers written before each send, so a reload/tree move (including one
+that lands before the deferred push is persisted) does not re-deliver;
+rewinding above a push makes it eligible again.
+- **Bounded.** ≤ 5 messages per wake (a burst is one turn), ≤ 2000 characters
+per message body (longer bodies truncate with a marker; the full text stays on
+the board), and ≤ 10 wakes per 10 minutes per session, so two agents are
+rate-limited rather than able to ping-pong in a tight loop (this bounds the
+rate, it is not a hard termination guarantee).
+- **No config knob.** Like the other tuning constants this is internal policy
+(see "Config surface is `identity` only").
+
+**Trade-off / risk accepted.** The board is cooperative-trust (identities are
+self-declared) and a wake starts a turn without human confirmation, so a peer
+that can write `board.jsonl` can cause an autonomous run in an idle session.
+The direct-only + attended + bounded policy is the mitigation; an opt-in config
+knob was rejected as permanent schema+docs+test surface for a feature whose
+default is the intended behavior.
 
 ## 2026-09 — log cleanup is threshold-triggered, not advisory
 

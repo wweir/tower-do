@@ -140,6 +140,24 @@ within one tick. The board log keeps exactly task/message/finding events:
 liveness never churns `revision` or the activity feed, and directories without
 a board file get neither a live segment nor sidecar writes.
 
+## Push wake (delivery, not a board event)
+
+An **idle** session that a peer addresses directly is woken by
+`pi.sendMessage(msg, { triggerTurn: true })` — Pi starts one turn on an idle
+session, so a waiting session does not need a human prompt to receive mail (a
+running turn is left to the pull path). Delivery is derived, never written to
+the board: the same `board.jsonl` watcher that repaints the widget runs
+`selectWakeMessages` (pure: direct + unread + not already pushed on this
+branch), and the pushed ids are read back on restore from the session's own
+`pi-tower-do-mail` entries plus the `pi-tower-do-mail-pending` session markers
+written before each send (`deliveredMailIds`), so a reload does not re-deliver
+and a rewind above a push re-enables it. The rendered payload is bounded per
+message (`WAKE_BODY_CHARS`). Policy — direct only, idle only, attended
+(`ctx.hasUI`) only, ≤ 5 messages per wake, ≤ 10 wakes / 10 min, a wake only
+after the session has conversation — is internal (DECISIONS.md). A wake adds no
+board event and does not churn `revision`; the pull path (reminder / `inbox`)
+is unchanged.
+
 ## Read derivations (never written)
 
 Several board views are **pure read derivations** over the folded view / raw
@@ -193,7 +211,7 @@ activity tail — they never mutate the file, and callers cannot "write" them:
 ## Layout
 
 ```
-index.ts     # extension entry: 3 tools + widget + reminder + lifecycle
+index.ts     # extension entry: 3 tools + widget + reminder + push wake + lifecycle
 state.ts     # pure schema / validation / fold / read derivations (no I/O)
 board.ts     # disk layer (append-only JSONL) + config normalization
 git-count.ts # widget dirty/session file-count derivations (no I/O)

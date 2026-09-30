@@ -267,6 +267,28 @@ gets no hint at all: there is no legal move to name.
   unacked for the caller performs NO write and takes no lease — a read-only
   state dir still serves it and a peer mid-compact cannot stall it.
 
+## Push wake contracts
+
+- A push wake delivers only a **direct** message (`to` is the caller, not a
+  broadcast), only when the session is idle and attended (`ctx.hasUI`), and
+  only after it has conversation (a resumed branch; a brand-new session is not
+  woken before the user's first turn).
+- Delivery is **branch-scoped and board-write-free**: the id set is replayed
+  from the session's own `pi-tower-do-mail` custom messages and their durable
+  `pi-tower-do-mail-pending` markers (session-transcript entries written before
+  the deferred send is persisted) on restore, so a reload or tree move never
+  re-delivers; rewinding above a push makes it eligible again. A wake therefore
+  adds no board event and never churns `revision`.
+- A wake is **bounded**: ≤ 5 messages per turn (one burst = one turn), ≤ 2000
+  characters per message body (a longer body is truncated with a visible marker;
+  the full text stays on the board), and ≤ 10 wakes per 10 minutes per session.
+- The push is **additive**: the pull path (reminder, `inbox` ack) and message
+  retention are unchanged, and an unacknowledged pushed message still needs an
+  explicit `inbox` ack to retire.
+- Push is **at-most-once**: a failed send does not retry, and a message marked
+  delivered but never injected is still visible through the pull path.
+- Test gate: `test/wake-mail.ts`.
+
 ## Finding contracts (exit mechanism)
 
 Findings are the one record class with no natural terminal event, so their
@@ -514,6 +536,7 @@ bun run test/task-cap.ts            # open-task budget + fabricated-receipt boun
 bun run test/board-compact.ts       # log compaction (explicit gc + threshold-triggered auto): revision preserved (incl. tolerated lines inside the snapshot block), entity survival, owner-clock + lease/CAS atomicity, token-scoped stale reaping, lease exclusivity + abort cleanup, task revision gate, archive write order/retention, dropSkipped-requires-archive, steal-in-rename-window (loud abort + provable reconcile, else evidence; no blind rollback), both-window P/W reconcile ordering, structural-failure fail-loud (62 cases)
 bun run test/home-isolation.ts      # static guard: every index.ts-loading suite isolates HOME before import and imports dynamically (9 cases)
 bun run test/view-layers.ts         # layered unfinished view (mine/needs/others) + key ledger + recency order + reminder + folded TUI sections + dashboard budget slice/note (76 cases)
+bun run test/wake-mail.ts            # push wake: direct-only selection, branch dedupe, render provenance + body cap, delivered-id + pending-marker replay (35 cases)
 bun run test/limits.ts              # arg schema vs fold: derived bounds, transport guard, key-bearing errors, list-cap ordering, per-entry caps, code-point metric (61 cases)
 bun run test/identity-scope.ts      # session scoping: a nested in-process session never re-labels its parent (reminder + status identity), bucket siblings stay distinct (6 cases)
 bun run test/identity-label.ts       # identity labels: bucket siblings stay distinct; permission exact, delivery aliased, legacy rows adoptable via the idle window (39 cases)

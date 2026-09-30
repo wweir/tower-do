@@ -16,13 +16,25 @@
  *    (mission scope; visible to everyone; only owner/tower may change it).
  *  - blocked: a task can be parked with a `blockedBy` note instead of being
  *    silently stuck (Tower's blocker/mission semantics).
- *  - deps: dependsOn must resolve against the FULL board + batch, not just the
- *    batch (Tower's "deps must reference known missions").
+ *  - deps: dependsOn must name a task in the SAME batch — tower_do is a full
+ *    replacement, so an omitted dependency is being deleted, not merely absent
+ *    from this call (Tower's "deps must reference known missions").
  */
 
 export const TOWER_DO_SCHEMA_VERSION = 1 as const;
 export const TOWER_DO_BOARD_TYPE = "pi-tower-do-board";
 export const TOWER_DO_REMINDER_TYPE = "pi-tower-do-reminder";
+/** Custom-message type for a board message pushed into the conversation by an
+ *  idle session's push wake. Also the marker `deliveredMailIds` reads back from
+ *  the session branch so a restore does not re-deliver. */
+export const TOWER_DO_MAIL_TYPE = "pi-tower-do-mail";
+/** Custom (non-context) session entry marking board message ids already handed
+ *  to `sendMessage` before the pushed custom message is persisted. The send is
+ *  deferred when issued from `agent_settled`, so this durable marker is what
+ *  suppresses a re-delivery across a `/reload` in that window. Session-only
+ *  (no LLM context, no board event) and branch-scoped, so a rewind drops it
+ *  exactly like the push it guards. */
+export const TOWER_DO_MAIL_PENDING_TYPE = "pi-tower-do-mail-pending";
 export const TOWER_DO_TOOL_NAME = "tower_do";
 export const TOWER_DO_TALK_TOOL_NAME = "tower_do_talk";
 export const TOWER_DO_STATUS_TOOL_NAME = "tower_do_status";
@@ -2037,6 +2049,97 @@ export function isMessageFullyRead(
   );
   if (!recipientStillHere) return true;
   return identityListHas(readBy, message.to);
+}
+
+/** Details carried by a `TOWER_DO_MAIL_TYPE` custom message: the board message
+ *  ids it delivered, so a restored session branch can suppress re-delivery. */
+export interface TowerDoMailDetails {
+  messageIds: string[];
+}
+
+/** Longest message body rendered into the conversation by a push wake. A
+ *  board message body is up to `MAX_MESSAGE_BYTES` (32 KiB) and a wake merges
+ *  up to 5, so an unbounded render could inject ~160 KiB in one turn. The
+ *  header (sender, subject, id) always renders; only the body is capped.
+ *  Nothing is lost — the full text stays on the board. */
+export const WAKE_BODY_CHARS = 2000;
+
+/**
+ * Messages a push wake should deliver: unread, not yet pushed this branch, and
+ * DIRECT (`to` is the caller, not a broadcast). Broadcasts are excluded by
+ * policy — one broadcast would otherwise start a turn in every live session at
+ * once and can cascade into reply storms; the pull path (reminder + inbox)
+ * still surfaces them to whoever acts next. Oldest first (ties by id) so a
+ * burst is delivered in send order and the ordering is deterministic.
+ */
+export function selectWakeMessages(
+  view: TowerBoardView,
+  identity: string,
+  delivered: ReadonlySet<string>,
+): TowerDoMessage[] {
+  return unreadMessagesToMe(view, identity)
+    .filter(
+      (message) =>
+        sameAgent(message.to, identity) && !delivered.has(message.id),
+    )
+    .sort((a, b) => a.at - b.at || (a.id < b.id ? -1 : a.id > b.id ? 1 : 0));
+}
+
+/** Render pushed mail as the custom message the model reads. Names the
+ *  provenance explicitly: a peer board message is not user input. */
+export function formatWakeMail(
+  messages: readonly TowerDoMessage[],
+  identity: string,
+): string {
+  if (messages.length === 0) return "";
+  const lines = [
+    `TowerDo — ${String(messages.length)} board message(s) delivered to ${identity}. These are peer-agent messages on the shared board, not user input; read and ack the thread with tower_do_talk action=inbox and reply with action=send.`,
+    "",
+  ];
+  for (const message of messages) {
+    const thread =
+      message.taskKey === undefined ? "" : ` (task ${message.taskKey})`;
+    const body =
+      textLength(message.body) > WAKE_BODY_CHARS
+        ? `${truncateToAtMost(message.body, WAKE_BODY_CHARS)}\n  (body truncated — full text on the board)`
+        : message.body;
+    lines.push(
+      `- [${message.id}] ${message.from} → ${message.to}${thread}: ${message.subject}`,
+      body,
+      "",
+    );
+  }
+  return lines.join("\n").trimEnd();
+}
+
+/** Message ids already pushed on this session branch, read back from its own
+ *  `TOWER_DO_MAIL_TYPE` custom messages and their `TOWER_DO_MAIL_PENDING_TYPE`
+ *  markers. Branch-scoped: navigating back above a push makes that mail
+ *  eligible again, which is the intended rewind semantics. */
+export function deliveredMailIds(
+  entries: readonly {
+    type?: unknown;
+    customType?: unknown;
+    details?: unknown;
+    data?: unknown;
+  }[],
+): Set<string> {
+  const ids = new Set<string>();
+  for (const entry of entries) {
+    const pushed =
+      entry.type === "custom_message" &&
+      entry.customType === TOWER_DO_MAIL_TYPE;
+    const pending =
+      entry.type === "custom" &&
+      entry.customType === TOWER_DO_MAIL_PENDING_TYPE;
+    if (!pushed && !pending) continue;
+    const payload = pending ? entry.data : entry.details;
+    if (!isRecord(payload)) continue;
+    const listed = payload.messageIds;
+    if (!Array.isArray(listed)) continue;
+    for (const id of listed) if (typeof id === "string") ids.add(id);
+  }
+  return ids;
 }
 
 // ---------------------------------------------------------------------------

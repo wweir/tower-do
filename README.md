@@ -28,6 +28,9 @@ work — and the manners to talk about it.
 - **Talk where the work lives.** Addressed messages to a task's owner (or
   broadcast to all), plus structured findings (bug / improve / vuln / idea)
   for out-of-scope discoveries — routed to the right agent, not lost in chat.
+  A *direct* message also wakes an idle session: it is injected into the
+  conversation and runs one bounded turn, so a waiting peer picks it up
+  without a human prompt.
 - **Conflict awareness.** The dashboard flags when your task's declared scope
   overlaps files a peer just changed, or when two in-progress tasks declare
   intersecting scopes — advisory warnings you resolve by messaging, never
@@ -77,7 +80,8 @@ Pi auto-discovers the extension at startup; existing sessions pick it up with `/
 claims owners; hands subagents the board path from `tower_do_status`
 (file-as-state); they report back; parent closes out. **Multiple sessions, one
 project.** Both read/write the same `~/.pi/tower-do/<project>/board.jsonl` — send
-a message, the peer reads it via `inbox`.
+a message, the peer reads it via `inbox` (a directly addressed idle session is
+woken to read it immediately).
 
 Identity resolution: `as` param > config `identity` > session name >
 session id. Recording work for a subagent: pass its id (e.g. `as: "coder-1"`).
