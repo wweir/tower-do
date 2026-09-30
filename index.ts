@@ -279,7 +279,7 @@ function isGitMark(p: string): boolean {
 const projectRootCache = new Map<string, string>();
 
 /** Nearest git work-tree root for `cwd`, else `cwd` itself (directory = scope). */
-export function projectRoot(cwd: string): string {
+function projectRoot(cwd: string): string {
   const cached = projectRootCache.get(cwd);
   if (cached !== undefined) return cached;
   let dir = cwd;
@@ -797,8 +797,8 @@ function statusColor(
   return "muted";
 }
 
-function taskLine(task: TowerDoTask, showOwner: boolean): string {
-  const owner = showOwner && task.owner !== undefined ? ` @${task.owner}` : "";
+function taskLine(task: TowerDoTask): string {
+  const owner = task.owner !== undefined ? ` @${task.owner}` : "";
   const deps = task.dependsOn.length ? ` ← ${task.dependsOn.join(",")}` : "";
   const scope = task.scope?.length ? ` [scope: ${task.scope.join(", ")}]` : "";
   return `${task.key}: ${task.subject}${owner}${deps}${scope}`;
@@ -866,7 +866,7 @@ function formatChange(
     const task = byKey.get(key);
     if (task) {
       lines.push(
-        `[added] ${STATUS_GLYPH[task.status]} ${taskLine(task, true)}`,
+        `[added] ${STATUS_GLYPH[task.status]} ${taskLine(task)}`,
       );
     }
   }
@@ -877,7 +877,7 @@ function ensureKnown(
   view: TowerBoardView,
   recipient: string,
   /** Identities from recent board activity (see knownIdentities). */
-  activity = new Set<string>(),
+  activity: ReadonlySet<string>,
 ): void {
   // "all" broadcasts; the orchestrator identity is always addressable.
   if (recipient === "all" || recipient === TOWER_IDENTITY) return;
@@ -900,14 +900,7 @@ function ensureKnown(
 // ---------------------------------------------------------------------------
 
 export default function towerDoExtension(pi: ExtensionAPI): void {
-  let currentView: TowerBoardView = {
-    schemaVersion: 1 as const,
-    revision: 0,
-    tasks: [],
-    messages: [],
-    findings: [],
-    skipped: 0,
-  };
+  let currentView: TowerBoardView = createEmptyBoard();
   let contextCheckpointNeeded = false;
   let llmCallsSinceReminder = 0;
   // Display-only fallback restored from a bounded digest when the board file is
@@ -956,7 +949,8 @@ export default function towerDoExtension(pi: ExtensionAPI): void {
   // render() is only invoked on TUI-driven redraws otherwise.
   let widgetTui: TUI | undefined;
   // Live-session count for the widget header: distinct identities fresh in
-  // the per-session liveness sidecar (live/<session>.json, heartbeat-driven),
+  // the per-session liveness sidecar (live/<identity>.<sessionId>.json,
+  // heartbeat-driven),
   // plus this session (see liveSessionCount). Kept fresh by fs.watch (peer
   // enter/exit/write) and agent_settled; render stays sync and only reads
   // this cache. Undefined until the first refresh lands.
@@ -2094,36 +2088,14 @@ export default function towerDoExtension(pi: ExtensionAPI): void {
           // "no stale claims" (strict guard); the write must still land.
         }
         // Liveness tiebreaker: an owner whose process still heartbeats is
-        // never stale, however quiet on the board. Read failure → treat
-        // EVERY owner as live (strict guard), mirroring the activity read
-        // above. Cheap local scan — refreshLiveSessions owns the widget's
-        // count, not the identities this gate needs.
-        let liveOwners = new Set(
-          freshView.tasks
-            .map((task) => task.owner)
-            .filter((owner): owner is string => owner !== undefined),
+        // never stale, however quiet on the board. `effectiveLiveOwners` is the
+        // same derivation the other guard sites use, so this gate cannot drift
+        // from them; on a read failure every known owner counts as live (strict
+        // guard), mirroring the activity read above.
+        const liveOwners = effectiveLiveOwners(
+          freshView,
+          await readLiveOwners(ctx.cwd),
         );
-        try {
-          const nowMs = Date.now();
-          const parsed = new Set<string>();
-          const dir = liveDirFor(ctx.cwd);
-          for (const name of await readdir(dir)) {
-            // Only .json counts: skips .tmp rename intermediates of peers.
-            if (!name.endsWith(".json")) continue;
-            const record = parseLiveRecord(
-              await readFile(join(dir, name), "utf8"),
-            );
-            if (record !== undefined && record.at >= nowMs - LIVE_WINDOW_MS) {
-              for (const id of liveOwnerIdentities(record)) parsed.add(id);
-            }
-          }
-          // Assign only after the ENTIRE scan succeeded: a mid-scan failure
-          // (peer exit race, permission error) must keep the all-owners set —
-          // a partial set would loosen the guard exactly when data is broken.
-          liveOwners = parsed;
-        } catch {
-          // No/unreadable live dir → no liveness data → no takeover.
-        }
         // An empty activity list (unreadable / empty log) already means "no
         // stale claims" inside the derivation — strict guard, never loosened.
         const staleClaims = staleTaskClaims(
@@ -2260,13 +2232,13 @@ export default function towerDoExtension(pi: ExtensionAPI): void {
     name: TOWER_DO_TALK_TOOL_NAME,
     label: "TowerDo Talk",
     description:
-      'Cross-agent communication on the shared tower-do board. action=send delivers an inbox message to "all", the orchestrator identity "tower", a current task owner, or anyone with recent board activity (self-send rejected); taskKey optionally threads it under a task. action=inbox lists messages addressed to you or "all", newest first, and ACKS the ones it shows (marks them read; acked messages can be retired) — use tower_do_status to read messages without acking. action=finding files a structured out-of-scope finding (bug|improve|vuln|idea) with severity/location/suggestedFix, or updates one or many (findingId or findingIds + status): accepted claims it (owner defaults to you), done|rejected|snoozed require a reason, snoozed needs a future snoozeUntil, and open reopens. Non-closed findings are budgeted (50); a snooze still occupies a slot, so close (done|rejected) to free one before filing past the cap. Every open finding is listed oldest-debt-first. Use findings instead of silently editing other-owned tasks.',
+      `Cross-agent communication on the shared tower-do board. action=send delivers an inbox message to "all", the orchestrator identity "tower", a current task owner, or anyone with recent board activity (self-send rejected); taskKey optionally threads it under a task. action=inbox lists messages addressed to you or "all", newest first, and ACKS the ones it shows (marks them read; acked messages can be retired) — use tower_do_status to read messages without acking. action=finding files a structured out-of-scope finding (bug|improve|vuln|idea) with severity/location/suggestedFix, or updates one or many (findingId or findingIds + status): accepted claims it (owner defaults to you), done|rejected|snoozed require a reason, snoozed needs a future snoozeUntil, and open reopens. Non-closed findings are budgeted (${MAX_TOWER_DO_OPEN_FINDINGS}); a snooze still occupies a slot, so close (done|rejected) to free one before filing past the cap. Every open finding is listed oldest-debt-first. Use findings instead of silently editing other-owned tasks.`,
     promptSnippet:
       "Send addressed messages or file findings on the shared multi-agent board",
     promptGuidelines: [
       'Use tower_do_talk to communicate with task owners on the shared board instead of editing owned tasks directly; the recipient must be "all", "tower", a current task owner, or someone with recent board activity (e.g. a peer whose tasks are all completed).',
       "Use action=finding (not direct edits) when you discover an out-of-scope problem — file it with kind/severity/summary/suggestedFix so the owning agent and reviewers can route it.",
-      "Findings have a lifecycle, not just a create: claim one you take on (status=accepted, owner defaults to you), and close it (done/rejected) or snooze it with a reason when you are finished — a live owner sitting on a claimed finding past the grace period is blocked from filing new ones, and the non-closed budget is 50.",
+      `Findings have a lifecycle, not just a create: claim one you take on (status=accepted, owner defaults to you), and close it (done/rejected) or snooze it with a reason when you are finished — a live owner sitting on a claimed finding past the grace period is blocked from filing new ones, and the non-closed budget is ${MAX_TOWER_DO_OPEN_FINDINGS}.`,
       "Keep message bodies brief and reference files by path; the board persists everything, so pointer-style notes keep context lean.",
       "Prefer tower_do_status over action=inbox when you only need to read messages: inbox acknowledges what it shows, status does not.",
     ],
@@ -3009,7 +2981,7 @@ export default function towerDoExtension(pi: ExtensionAPI): void {
         params.view === "all"
           ? findingRows
           : findingRows.slice(0, DASHBOARD_LIST_LIMIT);
-      // P1: derived scope × changedFiles advisory. Pure read, rendered as a
+      // Derived scope × changedFiles advisory. Pure read, rendered as a
       // dedicated section (not per-row suffix) so long scope lists don't
       // explode every task line.
       const scopeConflicts = findScopeConflicts(view);
@@ -3274,7 +3246,7 @@ export default function towerDoExtension(pi: ExtensionAPI): void {
               ? ' — compact now with tower_do action:"gc" (tower only; archives the old log first), which moves the unfoldable lines into the archive and reports the count. A log with unfoldable lines is NOT compacted automatically.'
               : logBytesTriggerAuto
                 ? ' — compact now with tower_do action:"gc" (tower only; archives the old log first). A log this large is compacted automatically at the session/settle boundary (never periodic).'
-                : ' — it exceeds the line hint but not the 1MiB byte threshold, which is what triggers automatic compaction; compact now with tower_do action:"gc" (tower only).'),
+                : ` — it exceeds the line hint but not the ${BOARD_COMPACT_HINT_BYTES / (1024 * 1024)}MiB byte threshold, which is what triggers automatic compaction; compact now with tower_do action:"gc" (tower only).`),
         );
       }
       // D4: board liveness at a glance. revision is monotonic but silent —

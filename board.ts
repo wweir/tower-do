@@ -2,7 +2,8 @@
  * tower-do — shared multi-agent task board (disk layer).
  *
  * Load-bearing Tower design choice: the board is a plain append-only JSONL
- * file (`<project>/.pi/tower-do/board.jsonl`), i.e. file-as-state. Any agent
+ * file (one per project, under `~/.pi/tower-do/<slug>-<hash>/board.jsonl`),
+ * i.e. file-as-state. Any agent
  * session or subagent that can read the file can see everyone's tasks, and any
  * writer appends events. Folding events yields the current view; the
  * monotonic `revision` is derived from the file (tool-read, never
@@ -37,6 +38,7 @@ import { dirname, join } from "node:path";
 import {
   createEmptyBoard,
   isEpochMs,
+  isRecord,
   MAX_BOARD_ARCHIVES,
   normalizeIdentity,
   readPersistedFinding,
@@ -63,10 +65,6 @@ export interface BoardEvent {
   at: number;
 }
 
-function isRecord(value: unknown): value is Record<string, unknown> {
-  return !!value && typeof value === "object";
-}
-
 /** errno code of a thrown filesystem error, or undefined for anything else. */
 function errorCode(error: unknown): string | undefined {
   return error instanceof Error && "code" in error
@@ -78,7 +76,7 @@ function errorCode(error: unknown): string | undefined {
  *  before a mutation, so a holder that a peer reaped as stale (a long GC/
  *  debugger pause) fails loud instead of writing concurrently with the peer
  *  that took over — the failure the CAS in `compact` cannot detect. */
-export interface BoardLease {
+interface BoardLease {
   assertHeld(): Promise<void>;
 }
 
@@ -486,11 +484,7 @@ export class TowerBoard {
     try {
       raw = await readFile(this.file, "utf8");
     } catch (error) {
-      if (
-        error instanceof Error &&
-        "code" in error &&
-        error.code === "ENOENT"
-      ) {
+      if (errorCode(error) === "ENOENT") {
         return createEmptyBoard();
       }
       throw error;
@@ -736,8 +730,10 @@ export class TowerBoard {
    * content CAS: the live file is re-read after the temp file is fsynced and
    * the rename happens only if it is still byte-identical. Every crash point
    * (archive, temp write, CAS abort) leaves the old file intact. Never
-   * periodic — only the orchestrator identity may call it (index.ts enforces
-   * that). The header carries the logical `revision`, so a refold after
+   * periodic. The explicit `gc` path is orchestrator-only (index.ts enforces
+   * that); the threshold-triggered path runs the same compaction under the
+   * same safety envelope, with the header's `by` naming the caller. The header
+   * carries the logical `revision`, so a refold after
    * compaction reports exactly the revision it did before.
    *
    * The pre-compact inode is hard-linked before the rename and the lease is
@@ -783,11 +779,7 @@ export class TowerBoard {
       try {
         raw = await readFile(this.file, "utf8");
       } catch (error) {
-        if (
-          error instanceof Error &&
-          "code" in error &&
-          error.code === "ENOENT"
-        ) {
+        if (errorCode(error) === "ENOENT") {
           throw new TowerDoValidationError(
             "nothing to compact: the board file does not exist",
           );

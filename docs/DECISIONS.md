@@ -138,7 +138,8 @@ copied the WHOLE folded view into the session transcript (measured: a single
 Also corrected two pre-existing clocks that made the old exits unreliable:
 `staleTaskClaims` now charges staleness to activity **on that task** (the old
 `lastSeen` was board-global, so one unrelated message immunized every stale
-row) at `TASK_CLAIM_STALE_MS` (6 h), separate from the 30 min presence hint.
+row) at `TASK_CLAIM_STALE_MS` (6 h), separate from the 10 min `PRESENCE_IDLE_MS`
+presence hint.
 The derivation is per **claim** (`owner+task`), and so are its consumers: it
 used to return owner labels while the guard applied them per owner, which let
 one long-idle row expose the same owner's freshly touched row to takeover or
@@ -171,7 +172,7 @@ discloses the log size and names the explicit command. The
 budget error names the oldest rows, so the backlog is actionable instead of
 invisible. The compact preserves `revision`, so no caller's `baseRevision` is
 invalidated by it. See CONTRACTS.md "Finding contracts" / "Log compaction" /
-"Checkpoint digest" and docs/plans/board-exit.md (landed).
+"Checkpoint digest".
 
 ## 2026-09 — a session label carries entropy; legacy labels alias their own session
 
@@ -744,7 +745,7 @@ backend and the orchestrator consumes the board.
 
 - **File-as-state over locks/daemon.** Board = append-only JSONL; any reader
   sees the same tasks. Communication and state are the same storage primitive.
-  (Kimi Tower blackboard lineage; see research/kimi-tower-*.)
+  (Kimi Tower blackboard lineage.)
 - **Revision counts task events only** so messages/findings never stale a peer's
   baseRevision.
 - **Full-replacement + every-field owner guard** over per-field merge: with

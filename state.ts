@@ -57,9 +57,9 @@ export const MAX_FINDING_TITLE_CHARS = 200;
 export const MAX_FINDING_SUMMARY_CHARS = 4000;
 export const MAX_FINDING_LOCATION_CHARS = 256;
 export const MAX_FINDING_SUGGESTED_FIX_CHARS = 2_000;
-/** Finding exit mechanism (see docs/plans/board-exit.md and CONTRACTS.md):
- * open work is bounded, closing is auditable, and nothing actionable is ever
- * retired by age alone. These are semantic constants, not tuning knobs. */
+/** Finding exit mechanism (see CONTRACTS.md, "Finding contracts"): open work
+ * is bounded, closing is auditable, and nothing actionable is ever retired by
+ * age alone. These are semantic constants, not tuning knobs. */
 /** Non-closed findings a board may carry (open + accepted + snoozed, expired
  * snoozes included). "Snooze" and "claim" both occupy a slot; only a terminal
  * status frees one — otherwise deferral would be a free way to clear the
@@ -81,9 +81,9 @@ export const MAX_FINDING_REASON_CHARS = 256;
  * acked it. The message stays on disk and is readable via `inbox all` — this is
  * a VIEW retirement (Layer 2), never a delete. */
 export const MESSAGE_PENDING_RETIRE_MS = 14 * 24 * 60 * 60_000;
-/** Ownership-takeover window for non-completed tasks, separate from the 30 min
- * presence/idle hint: ownership dies on the task-relevant activity clock, not
- * on unrelated board chatter (see staleTaskClaims). */
+/** Ownership-takeover window for non-completed tasks, separate from the 10 min
+ * `PRESENCE_IDLE_MS` display hint: ownership dies on the task-relevant
+ * activity clock, not on unrelated board chatter (see staleTaskClaims). */
 export const TASK_CLAIM_STALE_MS = 6 * 60 * 60_000;
 /** Log-size thresholds. `BOARD_COMPACT_HINT_BYTES` is BOTH the automatic
  * compaction trigger (`shouldAutoCompactBoard`, a cheap `stat` at a
@@ -363,7 +363,6 @@ export function createEmptyBoard(): TowerBoardView {
 function cloneTask(task: TowerDoTask): TowerDoTask {
   return {
     ...task,
-    description: task.description,
     ...(task.owner === undefined ? {} : { owner: task.owner }),
     dependsOn: [...task.dependsOn],
     ...(task.scope === undefined ? {} : { scope: [...task.scope] }),
@@ -1069,11 +1068,11 @@ function assertNoDependencyCycles(
 }
 
 /**
- * Dependencies must resolve against BOTH the batched tasks and the existing
- * board (a cross-session mission may depend on a task another agent owns).
- * Mirrors the tower rule "deps must reference known missions" and the
- * reference todo's rule that in_progress/completed require resolved deps
- * (with `blocked` exempt — blocked explicitly means "waiting").
+ * Every dependency must name a task present in the SAME batch. tower_do is a
+ * full replacement, so an omitted dependency is being deleted, not merely
+ * absent from this call. Mirrors the tower rule "deps must reference known
+ * missions" and the reference todo's rule that in_progress/completed require
+ * resolved deps (with `blocked` exempt — blocked explicitly means "waiting").
  */
 function assertDependenciesAreConsistent(
   tasks: readonly ResolvedTowerDoTaskInput[],
@@ -1094,7 +1093,7 @@ function assertDependenciesAreConsistent(
       const omitted = boardByKey.get(dependency);
       throw new TowerDoValidationError(
         omitted === undefined
-          ? `tasks[${index}].dependsOn (${task.key}) references missing task ${dependency} — it must exist on the shared board or in this call`
+          ? `tasks[${index}].dependsOn (${task.key}) references missing task ${dependency} — tower_do is a full replacement, so it must be included in this call`
           : `cannot remove task ${dependency} (this write omits it): ${task.key} still depends on it — keep it in the batch or drop the dependency first`,
       );
     }
@@ -1119,10 +1118,7 @@ export function taskIsBlocked(
   if (task.status === "completed") return false;
   if (task.status === "blocked") return true;
   if (task.blockedBy.length > 0) return true;
-  const statusByKey = new Map(
-    board.tasks.map((candidate) => [candidate.key, candidate.status]),
-  );
-  return task.dependsOn.some((key) => statusByKey.get(key) !== "completed");
+  return findAllUnresolvedDeps(task, board).length > 0;
 }
 
 /** Dependency keys that are not yet completed on the board (block reason). */
@@ -1139,7 +1135,7 @@ export function findAllUnresolvedDeps(
 // ---------------------------------------------------------------------------
 // Scope × changedFiles overlap detection (derived, read-only).
 //
-// P1: turn the (previously decorative) `scope` declaration into a *useful*
+// Turn the (previously decorative) `scope` declaration into a *useful*
 // boundary signal. Because changedFiles is a delivery receipt (completed
 // only; a worker may set it once, owner/tower may amend) and scope is the
 // owner's declared file boundary, we can derive two advisory warnings without
@@ -1324,7 +1320,7 @@ export function sliceScopeConflicts(
 // The disk board is authoritative; the session checkpoint is a fallback.
 // ---------------------------------------------------------------------------
 
-function isRecord(value: unknown): value is Record<string, unknown> {
+export function isRecord(value: unknown): value is Record<string, unknown> {
   return !!value && typeof value === "object";
 }
 
@@ -1625,12 +1621,13 @@ export function checkpointDigest(
       subject: digestLine(task.subject, MAX_TASK_SUBJECT_CHARS),
     }));
   const findings = findingPressureOrder(view.findings, now, liveOwners)
-    .filter(
-      (finding) => deriveFindingState(finding, now, liveOwners) !== "closed",
-    )
+    .map((finding) => ({
+      finding,
+      state: deriveFindingState(finding, now, liveOwners),
+    }))
+    .filter(({ state }) => state !== "closed")
     .slice(0, MAX_TOWER_DO_OPEN_FINDINGS)
-    .map((finding) => {
-      const state = deriveFindingState(finding, now, liveOwners);
+    .map(({ finding, state }) => {
       return {
         // Truncated AND single-lined to exactly what `readBoardDigest`
         // accepts. The fold does NOT bound these fields, so a legacy row with
@@ -2022,11 +2019,10 @@ export function isMessageFullyRead(
       (owner) => !identityListHas(readBy, owner),
     );
     if (pendingReaders.length === 0) return true;
-    const pendingStillHere = pendingReaders.some(
-      (owner) =>
-        view.tasks.some(
-          (task) => task.owner !== undefined && sameAgent(task.owner, owner),
-        ) || sameAgent(owner, message.to),
+    const pendingStillHere = pendingReaders.some((owner) =>
+      view.tasks.some(
+        (task) => task.owner !== undefined && sameAgent(task.owner, owner),
+      ),
     );
     if (!pendingStillHere) return true;
     return false;
@@ -2655,6 +2651,14 @@ export function derivePresence(
     return matches.length === 1 ? matches[0] : label;
   };
   const lines: PresenceLine[] = [];
+  const refreshDerivedFlags = (line: PresenceLine): void => {
+    const hasOwnership = line.ownerOf.length > 0;
+    line.unstarted = hasOwnership && line.lastSeenAt === undefined;
+    line.idle =
+      hasOwnership &&
+      line.lastSeenAt !== undefined &&
+      now - line.lastSeenAt > PRESENCE_IDLE_MS;
+  };
   for (const raw of identities) {
     const identity = displayLabel(raw);
     const existing = lines.find((line) => line.identity === identity);
@@ -2668,24 +2672,20 @@ export function derivePresence(
         (existing.lastSeenAt === undefined || lastSeenAt > existing.lastSeenAt)
       )
         existing.lastSeenAt = lastSeenAt;
+      // Recompute after merging: the merged row may have gained the activity
+      // or the ownership this raw label did not carry.
+      refreshDerivedFlags(existing);
       continue;
     }
-    const unstarted = ownerOfKeys.length > 0 && lastSeenAt === undefined;
-    const idle =
-      ownerOfKeys.length > 0 &&
-      lastSeenAt !== undefined &&
-      now - lastSeenAt > PRESENCE_IDLE_MS;
-    lines.push({ identity, lastSeenAt, ownerOf: ownerOfKeys, unstarted, idle });
-  }
-  // Derived flags are recomputed after merging (a merged row may have gained
-  // the activity or the ownership the first pass did not see).
-  for (const line of lines) {
-    const hasOwnership = line.ownerOf.length > 0;
-    line.unstarted = hasOwnership && line.lastSeenAt === undefined;
-    line.idle =
-      hasOwnership &&
-      line.lastSeenAt !== undefined &&
-      now - line.lastSeenAt > PRESENCE_IDLE_MS;
+    const line: PresenceLine = {
+      identity,
+      lastSeenAt,
+      ownerOf: ownerOfKeys,
+      unstarted: false,
+      idle: false,
+    };
+    refreshDerivedFlags(line);
+    lines.push(line);
   }
   lines.sort((a, b) => {
     const aAt = a.lastSeenAt ?? 0;
@@ -2696,11 +2696,8 @@ export function derivePresence(
   return lines;
 }
 
-/** Idle threshold after which the owner of a non-completed task becomes
- * adoptable/removable by anyone (see staleTaskClaims). Deliberately separate
- * from SESSION_BREAK_GAP_MS (30 min), which now serves presence/idle display
- * only: ownership must not look dead just because a 30-minute session break
- * happened, and it must not survive 30 minutes of unrelated chatter either. */
+/** Alias of `TASK_CLAIM_STALE_MS` under the name the docs and the takeover
+ * hint use; a single constant behind the alias means the two cannot drift. */
 export const OWNER_TAKEOVER_MS = TASK_CLAIM_STALE_MS;
 
 /** Human form of the takeover window, derived from the constant so the
@@ -2829,7 +2826,9 @@ function staleClaimHint(
   return ` (owner idle past the ${formatTakeoverWindow()} takeover window: adopt it by setting owner to yourself and changing nothing else, then edit in a second write — or remove it)`;
 }
 
-/** Heartbeat cadence for the per-session liveness sidecar (`live/<sessionId>.json`, see index.ts): each session rewrites its own record on this cadence. */
+/** Heartbeat cadence for the per-session liveness sidecar
+ * (`live/<identity>.<sessionId>.json`, see index.ts): each session rewrites its
+ * own record on this cadence. */
 export const LIVE_HEARTBEAT_MS = 30_000;
 
 /** Liveness window: a sidecar record older than this no longer counts as

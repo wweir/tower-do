@@ -520,7 +520,7 @@ Ownership rule:
 ## Test gate (what must stay green)
 
 ```bash
-bun install            # devDeps (bun-types + typescript) — typecheck/tests only
+bun install            # devDeps (bun-types + typescript + @earendil-works/pi-coding-agent) — typecheck/tests only
 bunx tsc --noEmit -p tsconfig.json      # strict + noUnused, zero errors
 bun run test/smoke.ts               # end-to-end: 3 tools, persistence, scoping, changedFiles disk round-trip, reminder cadence vs snapshot strip, dashboard truncation footer
 bun run test/config.ts              # config fail-loud + reserved identity (11 cases)

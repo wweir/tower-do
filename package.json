@@ -35,9 +35,9 @@
     ]
   },
   "devDependencies": {
-    "@earendil-works/pi-coding-agent": "^0.85.1",
-    "bun-types": "^1.3.14",
-    "typescript": "^5.0.0"
+    "@earendil-works/pi-coding-agent": "^0.99.1",
+    "bun-types": "^1.4.2",
+    "typescript": "^5.9.3"
   },
   "peerDependencies": {
     "@earendil-works/pi-ai": "*",

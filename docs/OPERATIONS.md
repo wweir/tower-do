@@ -5,12 +5,10 @@
 
 ## Install
 
-Three equivalent routes (README has the commands):
-
-1. **npm (recommended)** — `pi install npm:tower-do` (auto-discovered at next
-   startup; `/reload` picks it up in an existing session).
-2. **git** — `pi install git:https://github.com/wweir/tower-do.git@main`.
-3. **manual** — copy to `~/.pi/agent/extensions/`.
+Three equivalent routes — see the README for the commands: npm
+(`pi install npm:tower-do`), git, or a manual copy to
+`~/.pi/agent/extensions/`. Pi auto-discovers the extension at startup;
+`/reload` picks it up in an existing session.
 
 Runtime deps (`typebox`, `@earendil-works/pi-ai`, `@earendil-works/pi-tui`) are
 peer dependencies provided by the Pi host — no manual install.
