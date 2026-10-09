@@ -158,6 +158,7 @@ import {
   MAX_TOWER_DO_OPEN_FINDINGS,
   MAX_TOWER_DO_OPEN_TASKS,
   messagesToMe,
+  normalizeIdentity,
   openFindingCount,
   parseActivityLine,
   relativeTime,
@@ -451,7 +452,19 @@ function sessionIdentity(
     typeof pi.getSessionName === "function"
       ? pi.getSessionName()?.trim()
       : undefined;
-  if (sessionName) return sessionName;
+  if (sessionName) {
+    // Same rule as the config identity and an explicit `as`: the host strips
+    // `\r\n` from a session name but neither U+2028/U+2029 nor an over-long
+    // value, and this string becomes an owner / message `from` / reminder
+    // header identity that every write then validates. A name the identity
+    // rule rejects falls back to the session label instead of bricking the
+    // session over its title.
+    try {
+      return normalizeIdentity(sessionName, "session name");
+    } catch {
+      // Fall through to the session label.
+    }
+  }
   const sessionId =
     typeof ctx?.sessionManager.getSessionId === "function"
       ? (ctx.sessionManager.getSessionId() ?? "")
@@ -2127,6 +2140,11 @@ export default function towerDoExtension(pi: ExtensionAPI): void {
         const presence = derivePresence(activity, details.view.tasks, now);
         const idleOwners = presence.filter(
           (line) =>
+            // The caller is never "someone who may be stalled" to itself: it
+            // just wrote the board, and telling it to message itself gets a
+            // self-send rejection (or a no-op adopt) instead of surfacing a
+            // peer.
+            !sameAgent(line.identity, caller) &&
             line.idle &&
             line.ownerOf.some(
               (key) =>

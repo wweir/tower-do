@@ -429,6 +429,28 @@ function assertSingleLine(value: string, location: string): string {
   return value;
 }
 
+/**
+ * Normalize one list-valued task field: trim, drop blanks, dedupe — while
+ * keeping each surviving entry's ORIGINAL payload index. A length error must
+ * name the caller's position (`scope[2]`), not the deduped one (`scope[1]`),
+ * or the documented remedy ("shorten the named entry") points at the wrong
+ * item and the retry fails identically.
+ */
+function normalizeListEntries(
+  input: readonly string[] | undefined,
+  location: (entryIndex: number) => string,
+): Array<{ value: string; at: number }> {
+  const out: Array<{ value: string; at: number }> = [];
+  const seen = new Set<string>();
+  for (const [entryIndex, raw] of (input ?? []).entries()) {
+    const value = assertSingleLine(raw.trim(), location(entryIndex));
+    if (!value || seen.has(value)) continue;
+    seen.add(value);
+    out.push({ value, at: entryIndex });
+  }
+  return out;
+}
+
 export function normalizeIdentity(
   value: string | undefined,
   location: string,
@@ -920,19 +942,14 @@ function normalizeTask(
   // then apply the cap. Counting the raw input would reject a batch whose
   // stored value is legal: 101 changedFiles entries with one duplicate is 100
   // paths, and 21 dependsOn entries with a duplicate is one dependency.
-  const dependsOn = [
-    ...new Set(
-      (input.dependsOn ?? [])
-        .map((dependency) => dependency.trim())
-        .filter(Boolean),
-    ),
-  ];
-  for (const [dependencyIndex, dependency] of dependsOn.entries()) {
-    normalizeTaskKey(
-      dependency,
-      `tasks[${index}].dependsOn[${dependencyIndex}] (${key})`,
-    );
+  const dependsOnEntries = normalizeListEntries(
+    input.dependsOn,
+    (entryIndex) => `tasks[${index}].dependsOn[${entryIndex}] (${key})`,
+  );
+  for (const { value, at } of dependsOnEntries) {
+    normalizeTaskKey(value, `tasks[${index}].dependsOn[${at}] (${key})`);
   }
+  const dependsOn = dependsOnEntries.map((entry) => entry.value);
   if (dependsOn.length > MAX_TASK_DEPENDENCIES) {
     throw new TowerDoValidationError(
       `tasks[${index}].dependsOn (${key}) supports at most ${MAX_TASK_DEPENDENCIES} keys`,
@@ -944,52 +961,39 @@ function normalizeTask(
     );
   }
 
-  const scope = [
-    ...new Set(
-      (input.scope ?? [])
-        .map((glob, entryIndex) =>
-          assertSingleLine(
-            glob.trim(),
-            `tasks[${index}].scope[${entryIndex}] (${key})`,
-          ),
-        )
-        .filter(Boolean),
-    ),
-  ];
-  for (const [entryIndex, glob] of scope.entries()) {
-    const globLength = textLength(glob);
+  const scopeEntries = normalizeListEntries(
+    input.scope,
+    (entryIndex) => `tasks[${index}].scope[${entryIndex}] (${key})`,
+  );
+  for (const { value, at } of scopeEntries) {
+    const globLength = textLength(value);
     if (globLength > MAX_PATH_ENTRY_CHARS) {
       throw new TowerDoValidationError(
-        `tasks[${index}].scope[${entryIndex}] (${key}) is ${globLength} characters (max ${MAX_PATH_ENTRY_CHARS}) — shorten it`,
+        `tasks[${index}].scope[${at}] (${key}) is ${globLength} characters (max ${MAX_PATH_ENTRY_CHARS}) — shorten it`,
       );
     }
   }
+  const scope = scopeEntries.map((entry) => entry.value);
   if (scope.length > MAX_SCOPE_GLOBS) {
     throw new TowerDoValidationError(
       `tasks[${index}].scope (${key}) supports at most ${MAX_SCOPE_GLOBS} globs`,
     );
   }
 
-  const changedFiles = [
-    ...new Set(
-      (input.changedFiles ?? [])
-        .map((file, entryIndex) =>
-          assertSingleLine(
-            file.trim(),
-            `tasks[${index}].changedFiles[${entryIndex}] (${key})`,
-          ),
-        )
-        .filter(Boolean),
-    ),
-  ];
-  for (const [entryIndex, file] of changedFiles.entries()) {
-    const fileLength = textLength(file);
+  const changedFilesEntries = normalizeListEntries(
+    input.changedFiles,
+    (entryIndex) =>
+      `tasks[${index}].changedFiles[${entryIndex}] (${key})`,
+  );
+  for (const { value, at } of changedFilesEntries) {
+    const fileLength = textLength(value);
     if (fileLength > MAX_PATH_ENTRY_CHARS) {
       throw new TowerDoValidationError(
-        `tasks[${index}].changedFiles[${entryIndex}] (${key}) is ${fileLength} characters (max ${MAX_PATH_ENTRY_CHARS}) — shorten it`,
+        `tasks[${index}].changedFiles[${at}] (${key}) is ${fileLength} characters (max ${MAX_PATH_ENTRY_CHARS}) — shorten it`,
       );
     }
   }
+  const changedFiles = changedFilesEntries.map((entry) => entry.value);
   if (changedFiles.length > MAX_CHANGED_FILES) {
     throw new TowerDoValidationError(
       `tasks[${index}].changedFiles (${key}) supports at most ${MAX_CHANGED_FILES} paths`,
@@ -1001,31 +1005,24 @@ function normalizeTask(
     );
   }
 
-  const blockedBy = [
-    ...new Set(
-      (input.blockedBy ?? [])
-        .map((entry, entryIndex) =>
-          assertSingleLine(
-            entry.trim(),
-            `tasks[${index}].blockedBy[${entryIndex}] (${key})`,
-          ),
-        )
-        .filter(Boolean),
-    ),
-  ];
-  if (blockedBy.length > MAX_TASK_BLOCKERS) {
+  const blockedByEntries = normalizeListEntries(
+    input.blockedBy,
+    (entryIndex) => `tasks[${index}].blockedBy[${entryIndex}] (${key})`,
+  );
+  if (blockedByEntries.length > MAX_TASK_BLOCKERS) {
     throw new TowerDoValidationError(
       `tasks[${index}].blockedBy (${key}) supports at most ${MAX_TASK_BLOCKERS} entries`,
     );
   }
-  for (const [entryIndex, entry] of blockedBy.entries()) {
-    const entryLength = textLength(entry);
+  for (const { value, at } of blockedByEntries) {
+    const entryLength = textLength(value);
     if (entryLength > MAX_BLOCKER_CHARS) {
       throw new TowerDoValidationError(
-        `tasks[${index}].blockedBy[${entryIndex}] (${key}) is ${entryLength} characters (max ${MAX_BLOCKER_CHARS}) — shorten it`,
+        `tasks[${index}].blockedBy[${at}] (${key}) is ${entryLength} characters (max ${MAX_BLOCKER_CHARS}) — shorten it`,
       );
     }
   }
+  const blockedBy = blockedByEntries.map((entry) => entry.value);
 
   const owner = normalizeOptionalText(input.owner);
   if (owner !== undefined) {

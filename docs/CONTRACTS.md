@@ -70,7 +70,11 @@ who wants to keep an existing task must replay it (usually unchanged).
   dependency is one dependency. Every list-valued field also caps each ENTRY's
   length (`MAX_PATH_ENTRY_CHARS` for `scope`/`changedFiles`, `MAX_BLOCKER_CHARS`
   for `blockedBy`) — `blockedBy` is rendered inline in the reminder, which has
-  no byte budget of its own.
+  no byte budget of its own. The schema's matching `maxItems` is a payload
+  guard on the RAW array (see "arg schema vs the fold"), so a payload carrying
+  more than twice the cap in raw duplicates can still be refused preflight
+  even though it would dedupe to a legal list; the normalized-list rule
+  applies to every payload that reaches the fold.
 - **Unfolded log lines are disclosed, never silent**: a non-empty line the fold
   cannot turn into an event (corrupt JSON, a foreign shape, or a task payload
   that no longer validates under the current limits — e.g. a cap retuned
@@ -383,7 +387,9 @@ exit is explicit and auditable:
   ignores the lease (e.g. an older extension version). The lease is a hard
   requirement for `compact` (it fails closed if the lock cannot be created);
   an `append` may degrade to unlocked when the lock path is unwritable (its
-  `O_APPEND` write is still atomic), so a previously writable board does not
+  `O_APPEND` write is a single syscall and so does not interleave in practice —
+  a short write remains a POSIX possibility, so this degrade path is
+  best-effort, not a guarantee), so a previously writable board does not
   become a hard failure.
 - **Rename window**: no userspace lease can exclude a holder paused past
   `STALE_LOCK_MS` between the final proof and the rename, so the compact
@@ -504,7 +510,11 @@ Ownership rule:
   the intended payload. It is *not* an upper bound on payload — one base
   character plus thousands of combining marks is a single grapheme and passes
   any such guard, and that value then simply reaches the extension, which is
-  the outcome we want.
+  the outcome we want. For a **list count** the guard counts RAW array items
+  while the rule counts the normalized (deduped) list, so a payload carrying
+  more than twice the cap in raw duplicates is the one case where the
+  preflight guard can refuse a value the fold would accept — a bounded payload
+  guard, not the count rule.
 - **Metric**: the extension counts Unicode **code points** (`textLength`) — one
   emoji is one character (`String.length` would count two) and a combining
   sequence counts per code point (a grapheme-cluster limit would count one).

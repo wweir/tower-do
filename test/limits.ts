@@ -541,6 +541,27 @@ async function main(): Promise<void> {
       }),
     /tasks\[0\]\.scope\[1\] \(astral\) is 257 characters \(max 256\)/,
   );
+  // The index must be the ORIGINAL payload position, not the deduped one: a
+  // duplicate before the offender shifts the deduped index, so the caller
+  // would shorten the wrong entry and fail identically on retry.
+  await expectThrows(
+    "an over-long scope entry names the raw index after a duplicate",
+    () =>
+      write({
+        baseRevision: current.revision,
+        tasks: [
+          {
+            key: "astral",
+            scope: [
+              "dup/**",
+              "dup/**",
+              "x".repeat(MAX_PATH_ENTRY_CHARS + 1),
+            ],
+          },
+        ],
+      }),
+    /tasks\[0\]\.scope\[2\] \(astral\) is 257 characters \(max 256\)/,
+  );
   await expectThrows(
     "an over-long blockedBy entry is refused with the key and the entry index",
     () =>

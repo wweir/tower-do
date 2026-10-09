@@ -21,7 +21,7 @@
  */
 import { mkdtempSync } from "node:fs";
 
-import { sessionLabel } from "../state.ts";
+import { MAX_IDENTITY_CHARS, sessionLabel } from "../state.ts";
 import { tmpdir } from "node:os";
 import { join } from "node:path";
 
@@ -50,7 +50,7 @@ type ToolDef = {
 };
 
 /** One session's extension instance: its own handlers, tools and ctx. */
-function makeInstance(dir: string, sessionId: string) {
+function makeInstance(dir: string, sessionId: string, sessionName?: string) {
   const handlers = new Map<string, Handler>();
   const tools = new Map<string, ToolDef>();
   const sent: string[] = [];
@@ -64,7 +64,7 @@ function makeInstance(dir: string, sessionId: string) {
     appendEntry: (): void => {},
     sendMessage: (): void => {},
     sendUserMessage: (): void => {},
-    getSessionName: () => undefined,
+    getSessionName: () => sessionName,
     getActiveTools: () => [],
     setActiveTools: (): void => {},
     getAllTools: () => [],
@@ -180,6 +180,31 @@ async function main(): Promise<void> {
     statusText.includes(`identity ${parentIdentity}`),
     statusText.split("\n")[0]?.slice(0, 120),
   );
+
+  // A session name the identity rule rejects must fall back to the session
+  // label: the host strips \r\n from a name but neither U+2028 nor an
+  // over-long value, and the raw name would become an owner / message `from`
+  // identity that every write then rejects.
+  const badNameId = "01a0b47e-b9e9-70bd-9a77-2416a6b6d6be";
+  const badName = "x".repeat(MAX_IDENTITY_CHARS + 1);
+  const named = makeInstance(dir, badNameId, badName);
+  towerDoExtension(named.pi as never);
+  await named.fire("session_start");
+  const namedStatus = await named.tools.get("tower_do_status")!.execute(
+    "call-3",
+    {} as never,
+    undefined,
+    undefined,
+    named.ctx,
+  );
+  const namedText = namedStatus.content.map((item) => item.text).join("\n");
+  check(
+    "a session name the identity rule rejects falls back to the session label",
+    namedText.includes(`identity ${sessionLabel(badNameId)}`) &&
+      !namedText.includes(badName),
+    namedText.split("\n")[0]?.slice(0, 120),
+  );
+  await named.fire("session_shutdown").catch(() => {});
 
   // Both instances are real extension sessions: they hold live heartbeat
   // timers and fs watchers, so the test must shut them down (and exit) rather
