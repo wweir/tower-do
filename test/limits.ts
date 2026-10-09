@@ -577,6 +577,22 @@ async function main(): Promise<void> {
     /tasks\[0\]\.blockedBy\[1\] \(astral\) is 121 characters \(max 120\)/,
   );
   await expectThrows(
+    "an over-long changedFiles entry is refused with the key and the entry index",
+    () =>
+      write({
+        baseRevision: current.revision,
+        tasks: [
+          {
+            key: "receipt",
+            subject: "delivered",
+            status: "completed",
+            changedFiles: ["src/a.ts", "x".repeat(MAX_PATH_ENTRY_CHARS + 1)],
+          },
+        ],
+      }),
+    /tasks\[0\]\.changedFiles\[1\] \(receipt\) is 257 characters \(max 256\)/,
+  );
+  await expectThrows(
     "a malformed dependency key is refused with the depending task key",
     () =>
       write({

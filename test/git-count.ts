@@ -66,6 +66,18 @@ check(
   ren.renamed.get("old name.ts") === "new name.ts" && ren.renamed.size === 1,
   JSON.stringify([...ren.renamed]),
 );
+// Y-column rename: `git status --porcelain -z` emits `" R dest\0origin\0"`
+// for a worktree rename (verified: `mv a.txt c.txt && git add -N c.txt`). The
+// origin record has NO status prefix, so it must be consumed here too.
+const worktreeRen = parsePorcelain(" R new name.ts\0old name.ts\0");
+check(
+  "porcelain: a worktree rename (Y=R) consumes the origin record",
+  worktreeRen.changed.length === 1 &&
+    worktreeRen.changed[0] === "new name.ts" &&
+    worktreeRen.renamed.get("old name.ts") === "new name.ts" &&
+    worktreeRen.untracked.length === 0,
+  JSON.stringify(worktreeRen),
+);
 // A rename is ONE dirty entry (destination), so the session viewpoint must not
 // also count the origin as a file that "left the dirty set" — otherwise one
 // `git mv` reads `files 2 · dirty 1`, breaking the same-unit contract.

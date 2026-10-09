@@ -224,11 +224,33 @@ async function main(): Promise<void> {
   );
   const compactHead = JSON.parse(
     readFileSync(file, "utf8").split("\n")[0],
-  ) as { snapshotLines?: number; sourceSha256?: string };
+  ) as {
+    snapshotLines?: number;
+    sourceSha256?: string;
+    counts?: { tasks?: number; messages?: number; findings?: number };
+  };
   check(
-    "the compact header records the source hash and kept counts",
+    "the compact header records the snapshot line count",
     (compactHead.snapshotLines ?? 0) === 4,
     JSON.stringify(compactHead.snapshotLines),
+  );
+  // `counts` is written into the header but `fold` ignores it, so nothing else
+  // would notice a header that miscounts its own snapshot rows. Assert it
+  // against the rows the header claims to describe.
+  const snapshotKinds = readFileSync(file, "utf8")
+    .split("\n")
+    .slice(1, 1 + (compactHead.snapshotLines ?? 0))
+    .map((line) => JSON.parse(line) as { kind?: string })
+    .map((event) => event.kind);
+  check(
+    "the compact header's kept counts match its snapshot rows",
+    compactHead.counts?.tasks ===
+      snapshotKinds.filter((kind) => kind === "task").length &&
+      compactHead.counts?.messages ===
+        snapshotKinds.filter((kind) => kind === "message").length &&
+      compactHead.counts?.findings ===
+        snapshotKinds.filter((kind) => kind === "finding").length,
+    JSON.stringify({ head: compactHead.counts, rows: snapshotKinds }),
   );
   check(
     "the compact header's sourceSha256 hashes the exact pre-compact bytes",

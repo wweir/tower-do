@@ -132,6 +132,35 @@ async function main(): Promise<void> {
   );
 
   expectThrows(
+    "worker cannot change another owner's blockedBy",
+    () =>
+      writeBoardSnapshot(
+        view,
+        {
+          tasks: [
+            {
+              key: "a-task",
+              subject: "S1",
+              status: "in_progress",
+              owner: "A",
+              scope: ["extensions/tower-do/**"],
+              blockedBy: ["blocker-x"], // content field, owner/status unchanged
+            },
+            {
+              key: "b-task",
+              subject: "B's own",
+              status: "in_progress",
+              owner: "B",
+            },
+          ],
+          baseRevision: view.revision,
+        },
+        "B",
+      ),
+    /owned by "A"/,
+  );
+
+  expectThrows(
     "worker cannot add a dependsOn to another owner's task",
     () =>
       writeBoardSnapshot(
@@ -866,6 +895,42 @@ async function main(): Promise<void> {
               subject: "REPLANNED-WHILE-ADOPTING",
               status: "in_progress",
               owner: "C",
+            },
+            {
+              key: "stale-done",
+              subject: "delivered",
+              status: "completed",
+              owner: "A",
+              changedFiles: ["x.ts"],
+            },
+            {
+              key: "fresh-task",
+              subject: "active",
+              status: "in_progress",
+              owner: "B",
+            },
+          ],
+          baseRevision: idleView.revision,
+        },
+        "C",
+        STALE,
+      ),
+    /adopt it by setting owner to yourself/,
+  );
+
+  expectThrows(
+    "adoption cannot carry a blockedBy edit in the same write",
+    () =>
+      writeBoardSnapshot(
+        idleView,
+        {
+          tasks: [
+            {
+              key: "stale-task",
+              subject: "stalled",
+              status: "in_progress",
+              owner: "C", // adopt
+              blockedBy: ["sneaky"], // ...plus a content edit
             },
             {
               key: "stale-done",

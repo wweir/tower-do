@@ -42,8 +42,18 @@ export function parsePorcelain(output: string): {
   if (line.length < 4) continue;
   const status = line.slice(0, 2);
   const path = line.slice(3);
-  // Rename/copy: skip the original-path record that follows.
-  if (status[0] === "R" || status[0] === "C") {
+  // Rename/copy: skip the original-path record that follows. R/C can sit in
+  // EITHER column — `git status --porcelain -z` emits `" R dest\0origin\0"`
+  // for a worktree rename (Y=R), whose second record has no `XY ` prefix.
+  // Checking only the index column parsed that origin as a status line and
+  // minted a phantom path from its tail (" R c.txt\0a.txt\0" → changed
+  // ["c.txt", "txt"], dirty 2 instead of 1).
+  if (
+    status[0] === "R" ||
+    status[0] === "C" ||
+    status[1] === "R" ||
+    status[1] === "C"
+  ) {
    const origin = parts[i + 1];
    if (origin !== undefined && origin.length > 0) renamed.set(origin, path);
    changed.push(path);
