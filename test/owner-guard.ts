@@ -539,13 +539,14 @@ async function main(): Promise<void> {
   );
 
   // Real parser wiring: `parseActivityLine` must expose the structured taskKey
-  // (the display `detail` is `key: subject` and must never be parsed back).
+  // (the display `detail` is `key: subject` and must never be parsed back),
+  // and it must accept exactly what the fold accepts.
   const parsedActivity = parseActivityLine(
     JSON.stringify({
       kind: "task",
       op: "upsert",
       key: "real-key",
-      task: { subject: "real subject", status: "in_progress" },
+      task: { key: "real-key", subject: "real subject", status: "in_progress" },
       by: "A",
       at: NOW,
     }),
@@ -566,6 +567,53 @@ async function main(): Promise<void> {
         ],
         NOW,
       ).size === 0,
+  );
+
+  // Parity with the fold: a task upsert whose nested payload the fold would
+  // count in `skipped` (here: no `task.key`) is NOT activity and must not
+  // extend the takeover protection of an otherwise-stale claim. A second,
+  // valid entry keeps the activity log non-empty (an empty log disables the
+  // takeover exception entirely, so it cannot discriminate the two parsers).
+  const skippedActivity = parseActivityLine(
+    JSON.stringify({
+      kind: "task",
+      op: "upsert",
+      key: "real-key",
+      task: { subject: "real subject", status: "in_progress" },
+      by: "A",
+      at: NOW,
+    }),
+  );
+  const otherActivity = parseActivityLine(
+    JSON.stringify({
+      kind: "task",
+      op: "upsert",
+      key: "z-other",
+      task: { key: "z-other", subject: "other", status: "in_progress" },
+      by: "Z",
+      at: NOW,
+    }),
+  );
+  const logActivity = [skippedActivity, otherActivity].filter(
+    (entry) => entry !== undefined,
+  );
+  check(
+    "a task upsert the fold would skip cannot protect a stale claim",
+    skippedActivity === undefined &&
+      logActivity.length === 1 &&
+      staleTaskClaims(
+        logActivity,
+        [
+          handTask({
+            key: "real-key",
+            subject: "real subject",
+            status: "in_progress",
+            owner: "A",
+            updatedAt: NOW - 7 * 60 * MIN,
+          }),
+        ],
+        NOW,
+      ).has(claimKey("A", "real-key")),
   );
 
   // Board: A owns an in_progress task and went quiet 40 min ago.

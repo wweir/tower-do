@@ -719,8 +719,10 @@ export class TowerBoard {
   /** Raw tail of the event log (newest lines last). */
   async rawTail(lines: number = 50): Promise<string[]> {
     // slice(-0) is slice(0) — the whole log — so a non-positive request must
-    // be an empty tail, not a full read that looks bounded.
-    if (lines <= 0) return [];
+    // be an empty tail, not a full read that looks bounded. `!Number.isFinite`
+    // also catches NaN, for which `NaN <= 0` is false and `slice(-NaN)`
+    // silently becomes `slice(0)`.
+    if (!Number.isFinite(lines) || lines <= 0) return [];
     return (await this.rawLines()).slice(-lines);
   }
 

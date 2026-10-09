@@ -1181,39 +1181,89 @@ export function globMatchesPath(glob: string, path: string): boolean {
   const gSeg = g.split("/");
   const pSeg = p.split("/");
 
+  // Memoized on (gi, pi): a `**`-heavy glob (e.g. "**/**/…/x") otherwise
+  // branches exponentially, and peer-written scope globs are matched against
+  // every changed-file path on each status/widget/reminder render. Each
+  // (gi, pi) pair is solved at most once, so the walk is polynomial.
+  const memo = new Map<number, boolean>();
+  const cols = pSeg.length + 1;
   const matchFrom = (gi: number, pi: number): boolean => {
+    const memoKey = gi * cols + pi;
+    const cached = memo.get(memoKey);
+    if (cached !== undefined) return cached;
+    let result = false;
+    let g = gi;
+    let p = pi;
     for (;;) {
-      if (gi === gSeg.length) return pi === pSeg.length;
-      const seg = gSeg[gi];
+      if (g === gSeg.length) {
+        result = p === pSeg.length;
+        break;
+      }
+      const seg = gSeg[g];
       if (seg === "**") {
         // `**` eats zero or more path segments: try every split point.
-        for (let skip = pi; skip <= pSeg.length; skip += 1) {
-          if (matchFrom(gi + 1, skip)) return true;
+        for (let skip = p; skip <= pSeg.length; skip += 1) {
+          if (matchFrom(g + 1, skip)) {
+            result = true;
+            break;
+          }
         }
-        return false;
+        break;
       }
-      if (pi >= pSeg.length) return false;
-      if (!segmentMatches(seg, pSeg[pi])) return false;
-      gi += 1;
-      pi += 1;
+      if (p >= pSeg.length) {
+        result = false;
+        break;
+      }
+      if (!segmentMatches(seg, pSeg[p])) {
+        result = false;
+        break;
+      }
+      g += 1;
+      p += 1;
     }
+    memo.set(memoKey, result);
+    return result;
   };
   return matchFrom(0, 0);
 }
 
+/**
+ * One glob segment against one path segment: `*` matches any run (including
+ * none), `?` exactly one character. This is the classic greedy two-pointer
+ * wildcard matcher instead of a repeated `[^/]*` RegExp: a glob such as
+ * `"*a*a*…a"` written to a peer-controlled board makes the RegExp engine
+ * backtrack exponentially (a ReDoS that would freeze every render), while the
+ * loop is O(glob × value) and allocation-free.
+ */
 function segmentMatches(glob: string, value: string): boolean {
-  if (!glob.includes("*") && !glob.includes("?")) return glob === value;
-  // Build a regex char by char: escape regex metacharacters first, then map
-  // `*` → any non-slash run and `?` → exactly one non-slash char. (Escaping
-  // AFTER substituting `?` would escape the generated `.` and turn `?` into
-  // a literal dot — a classic order bug.)
-  let pattern = "";
-  for (const ch of glob) {
-    if (ch === "*") pattern += "[^/]*";
-    else if (ch === "?") pattern += "[^/]";
-    else pattern += ch.replace(/[.+^${}()|[\]\\]/g, "\\$&");
+  let g = 0;
+  let v = 0;
+  let starG = -1;
+  let starV = 0;
+  while (v < value.length) {
+    const ch = glob[g];
+    // The star branch MUST come first: when `value[v]` is itself a literal
+    // `*`, testing equality first would consume the glob's `*` as a literal
+    // and lose the backtrack point (`globMatchesPath("*", "*.ts")` would be
+    // false instead of true).
+    if (g < glob.length && ch === "*") {
+      // Remember the star and retry its tail from the next value character.
+      starG = g;
+      starV = v;
+      g += 1;
+    } else if (g < glob.length && (ch === "?" || ch === value[v])) {
+      g += 1;
+      v += 1;
+    } else if (starG !== -1) {
+      g = starG + 1;
+      starV += 1;
+      v = starV;
+    } else {
+      return false;
+    }
   }
-  return new RegExp(`^${pattern}$`).test(value);
+  while (g < glob.length && glob[g] === "*") g += 1;
+  return g === glob.length;
 }
 
 function scopeGlobIntersects(a: string, b: string): boolean {
@@ -1638,11 +1688,14 @@ export function checkpointDigest(
         severity: finding.severity,
         kind: finding.kind,
         title: digestLine(finding.title, MAX_FINDING_TITLE_CHARS),
-        // Owner and snooze deadline are carried ONLY for the state they belong
-        // to. An `accepted` finding whose owner died derives `actionable`, and
-        // carrying the dead claim's owner would round-trip into the impossible
-        // `open`+`owner` shape (the live fold always clears an owner on open).
-        ...(state === "claimed" && finding.owner !== undefined
+        // Owner and snooze deadline are carried ONLY for the states that keep
+        // them: the fold preserves a claimer's owner through `accepted` and
+        // `snoozed` (and clears it on `open`). An `accepted` finding whose
+        // owner died derives `actionable`, so carrying its dead owner would
+        // round-trip into the impossible `open`+`owner` shape.
+        ...((state === "claimed" || state === "snoozed") &&
+        finding.owner !== undefined &&
+        finding.owner !== ""
           ? { owner: digestLine(finding.owner, MAX_IDENTITY_CHARS) }
           : {}),
         state,
@@ -1780,6 +1833,7 @@ export function readBoardDigest(
       !boundedLine(candidate.subject, MAX_TASK_SUBJECT_CHARS) ||
       (candidate.owner !== undefined &&
         (typeof candidate.owner !== "string" ||
+          candidate.owner === "" ||
           !boundedLine(candidate.owner, MAX_IDENTITY_CHARS)))
     ) {
       return undefined;
@@ -1889,7 +1943,9 @@ function digestToView(digest: TowerDoCheckpointDigest): TowerBoardView {
       summary: "",
       from: "",
       at: 0,
-      ...(finding.state === "claimed" && finding.owner !== undefined
+      ...((finding.state === "claimed" || finding.state === "snoozed") &&
+      finding.owner !== undefined &&
+      finding.owner !== ""
         ? { owner: finding.owner }
         : {}),
       ...(finding.state === "snoozed" && finding.snoozeUntil !== undefined
@@ -1952,12 +2008,15 @@ function broadcastAudience(
   message: TowerDoMessage,
   view: TowerBoardView,
 ): Set<string> {
-  const owners =
-    message.audience ??
-    // Delivery/display: exclude the sender by AGENT, not exact string, so a
-    // legacy label of the same session is not left as a pending reader it can
-    // never ack (a self-broadcast never reaches its own inbox).
-    [...currentOwners(view)].filter((owner) => !sameAgent(owner, message.from));
+  // Exclude the sender by AGENT — not exact string — for BOTH the send-time
+  // snapshot and the current-owners fallback. A session that migrated from a
+  // legacy label sends as its current label, so the audience it persisted can
+  // name its own older label; that label can never ack (a self-broadcast never
+  // reaches its own inbox), which would pin the broadcast outside the
+  // retention budget forever.
+  const owners = [...(message.audience ?? currentOwners(view))].filter(
+    (owner) => !sameAgent(owner, message.from),
+  );
   return new Set(owners);
 }
 
@@ -2452,18 +2511,24 @@ export function parseActivityLine(line: string): ActivityEntry | undefined {
         ...(key === undefined ? {} : { taskKey: key }),
       };
     }
-    if (task && typeof task.subject === "string") {
-      const status = isTowerDoStatus(task.status)
-        ? (task.status as TowerDoStatus)
-        : "pending";
-      return {
-        kind: "task",
-        by,
-        at,
-        glyph: ACTIVITY_GLYPHS[status],
-        detail: `${key ?? "?"}: ${task.subject}`, // could be added or updated
-        ...(key === undefined ? {} : { taskKey: key }),
-      };
+    // Parity with the fold: a task upsert counts as activity only when the
+    // fold can actually turn it into a row (an event key plus a payload that
+    // still validates under the current limits). `readPersistedTask` is the
+    // SAME reader `fold()` uses, so a line the fold reports in `skipped` can
+    // no longer refresh an owner's takeover clock (ARCHITECTURE.md "one clock,
+    // not two").
+    if (key !== undefined && task !== undefined) {
+      const plain = readPersistedTask(task, 0);
+      if (plain !== undefined) {
+        return {
+          kind: "task",
+          by,
+          at,
+          glyph: ACTIVITY_GLYPHS[plain.status],
+          detail: `${key}: ${plain.subject}`, // could be added or updated
+          taskKey: key,
+        };
+      }
     }
     return undefined;
   }
@@ -2591,6 +2656,11 @@ export function knownIdentities(
   const known = new Set([
     ...currentOwners(view),
     ...entries.map((entry) => entry.by),
+    // Readers survive compaction: an ack is its own log line whose byline the
+    // compact snapshot does not keep (one line per message), but `readBy`
+    // rides inside the message entity forever. Without this a peer whose only
+    // footprint was an ack would become an unknown recipient after a gc.
+    ...view.messages.flatMap((message) => message.readBy ?? []),
   ]);
   known.delete(TOWER_IDENTITY);
   return known;
@@ -2691,7 +2761,11 @@ export function derivePresence(
     const aAt = a.lastSeenAt ?? 0;
     const bAt = b.lastSeenAt ?? 0;
     if (aAt !== bAt) return bAt - aAt;
-    return a.identity.localeCompare(b.identity);
+    // Code-unit compare, not localeCompare: identity is a user/session label,
+    // and the runtime default locale would make the display order of a
+    // lastSeenAt tie drift across environments. Every other sort in this file
+    // is deterministic for the same reason.
+    return a.identity < b.identity ? -1 : a.identity > b.identity ? 1 : 0;
   });
   return lines;
 }

@@ -709,6 +709,14 @@ function digestRoundTrip(): void {
       finding({ id: "f-recent-done", status: "done", at: NOW - DAY }),
       // Closed and past the grace: counted, but never serialized as a row.
       finding({ id: "f-retired", status: "done", at: NOW - 30 * DAY }),
+      // A live snooze keeps its claimer (the fold preserves an owner through
+      // `snoozed`), so the digest must carry it too.
+      finding({
+        id: "f-snooze-owned",
+        status: "snoozed",
+        owner: "alice",
+        snoozeUntil: NOW + DAY,
+      }),
     ],
     skipped: 0,
   };
@@ -749,6 +757,17 @@ function digestRoundTrip(): void {
     restoredById.get("f-live")?.status === "accepted" &&
       restoredById.get("f-live")?.owner === "alice",
     JSON.stringify(restoredById.get("f-live")),
+  );
+  check(
+    "a claimed snooze keeps its owner through the digest round-trip",
+    digestById.get("f-snooze-owned")?.owner === "alice" &&
+      digestById.get("f-snooze-owned")?.state === "snoozed" &&
+      restoredById.get("f-snooze-owned")?.status === "snoozed" &&
+      restoredById.get("f-snooze-owned")?.owner === "alice",
+    JSON.stringify({
+      digest: digestById.get("f-snooze-owned"),
+      restored: restoredById.get("f-snooze-owned"),
+    }),
   );
   check(
     "an expired snooze keeps no stale deadline",

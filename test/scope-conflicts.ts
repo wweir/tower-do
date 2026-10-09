@@ -58,6 +58,34 @@ async function main(): Promise<void> {
     "no wildcard is exact, not prefix",
     !globMatchesPath("src/a", "src/a.ts"),
   );
+  // Consecutive `*` inside one segment collapse to one and may match nothing.
+  check(
+    "consecutive * inside a segment behaves as one",
+    globMatchesPath("a**b", "ab") &&
+      globMatchesPath("a**b", "axxb") &&
+      !globMatchesPath("a**b", "a/b"),
+  );
+  // A literal `*` in the VALUE must not swallow the glob's `*`: the star
+  // branch has to be evaluated before the equality branch, or these regress
+  // to false (and scopeGlobIntersects misses an obvious collision).
+  check(
+    "a glob * matches a literal * in the path",
+    globMatchesPath("*", "*.ts") &&
+      globMatchesPath("*.ts", "*.ts") &&
+      globMatchesPath("src/*", "src/*.ts") &&
+      globMatchesPath("a*b", "a*cb"),
+  );
+  // ReDoS regression: a peer-written glob with many ambiguous `*` runs must be
+  // answered without exponential RegExp backtracking (the old `[^/]*`-per-`*`
+  // matcher hung on this input). The wall-clock bound is deliberately generous
+  // so it flags a hang without being timing-flaky.
+  const pathologicalGlob = `${"*".repeat(60)}a${"*".repeat(60)}b`;
+  const pathologicalStarted = Date.now();
+  const pathologicalHit = globMatchesPath(pathologicalGlob, "a".repeat(200));
+  check(
+    "a pathologically ambiguous glob is answered without backtracking",
+    pathologicalHit === false && Date.now() - pathologicalStarted < 2000,
+  );
 
   // --- findScopeConflicts: overlap (completed receipt inside active scope) ---
   const b0 = createEmptyBoard();
