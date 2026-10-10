@@ -226,6 +226,99 @@ function main(): void {
       !rejection.includes("status=done|rejected|snoozed"),
     rejection?.split("\n")[0],
   );
+  // The remedy must name WHY a candidate is safe to close, so a caller is not
+  // asked to make a blind judgment on someone else's row. An unheld row (no
+  // live claim) is drainable; a live claim belongs to its owner.
+  const candidateLine = rejection?.split("\n")[1] ?? "";
+  check(
+    "the budget candidates disclose their hold state",
+    candidateLine.includes("no live claim") &&
+      !candidateLine.includes("held by"),
+    candidateLine,
+  );
+  // All rows held by a live owner: the remedy must not tell the caller to close
+  // an unheld row that does not exist.
+  const claimedRejection = findingBudgetRejection(
+    Array.from({ length: MAX_TOWER_DO_OPEN_FINDINGS }, (_, i) =>
+      finding({
+        id: `f-claimed${i}`,
+        status: "accepted",
+        owner: "alice",
+        at: NOW - i * DAY,
+      }),
+    ),
+    NOW,
+    live,
+    "repoter",
+  );
+  check(
+    "a live-claimed candidate is marked held, so the remedy is not a blind close",
+    claimedRejection?.split("\n")[1]?.includes("held by alice (live)") === true,
+    claimedRejection?.split("\n")[1],
+  );
+  check(
+    "a fully live-claimed backlog gets a wait/ask remedy, not a drain it cannot do",
+    claimedRejection?.includes("ask that owner") === true &&
+      claimedRejection.includes("no live claim") === false,
+    claimedRejection?.split("\n")[2],
+  );
+  // A snooze carried an owner's claim: `snoozed` alone does not make a row
+  // drainable, so a live owner's snoozed row must read as held.
+  const snoozedHeld = findingBudgetRejection(
+    Array.from({ length: MAX_TOWER_DO_OPEN_FINDINGS }, (_, i) =>
+      finding({
+        id: `f-snoozeheld${i}`,
+        status: "snoozed",
+        owner: "alice",
+        snoozeUntil: NOW + 30 * DAY,
+        at: NOW - i * DAY,
+      }),
+    ),
+    NOW,
+    live,
+    "repoter",
+  );
+  check(
+    "a snoozed row held by a live owner is not offered as a drain",
+    snoozedHeld?.split("\n")[1]?.includes("held by alice (live)") === true &&
+      snoozedHeld.includes("ask that owner") &&
+      snoozedHeld.includes("no live claim") === false,
+    snoozedHeld?.split("\n")[2],
+  );
+  // A drainable row can rank below the pressure top-5 (an unheld snoozed row
+  // sits behind claimed rows), and the dashboard hides snoozed rows — so the
+  // remedy must name the drain target rather than imply a row the caller
+  // cannot find.
+  const hiddenDrain = findingBudgetRejection(
+    [
+      ...Array.from({ length: 55 }, (_, i) =>
+        finding({
+          id: `f-held${i}`,
+          status: "accepted",
+          owner: "alice",
+          at: NOW - i * DAY,
+        }),
+      ),
+      ...Array.from({ length: 5 }, (_, i) =>
+        finding({
+          id: `f-drain${i}`,
+          status: "snoozed",
+          snoozeUntil: NOW + (i + 1) * DAY,
+          at: NOW - (100 + i) * DAY,
+        }),
+      ),
+    ],
+    NOW,
+    live,
+    "repoter",
+  );
+  check(
+    "a drain target hidden below the top-5 is named, not implied",
+    hiddenDrain?.includes("drain target: f-drain0") === true &&
+      hiddenDrain.includes("most pressing: f-held") &&
+      hiddenDrain.includes("status=rejected"),
+    hiddenDrain?.split("\n").slice(1, 3).join(" | "),
+  );
 
   // Close obligation: a live owner holding an overdue claim is blocked until
   // it closes or holds it — but a dead owner never blocks a peer.

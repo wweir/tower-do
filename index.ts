@@ -2705,7 +2705,7 @@ export default function towerDoExtension(pi: ExtensionAPI): void {
               afterOpen > MAX_TOWER_DO_OPEN_FINDINGS
             ) {
               throw new TowerDoValidationError(
-                `this update would grow non-closed findings over the budget (${String(MAX_TOWER_DO_OPEN_FINDINGS)}): ${String(beforeOpen)} -> ${String(afterOpen)}. A snooze still occupies a slot, so close one (done|rejected) first — tower_do_talk action=finding findingIds=[…] status=done|rejected reason=…`,
+                `this update would grow non-closed findings over the budget (${String(MAX_TOWER_DO_OPEN_FINDINGS)}): ${String(beforeOpen)} -> ${String(afterOpen)}. A snooze still occupies a slot, so close one first — draining an unheld row is not a judgment on it: tower_do_talk action=finding findingIds=[…] status=rejected reason="budget overflow: stale unclaimed finding"`,
               );
             }
             await appendLocked(events);

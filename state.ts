@@ -2399,16 +2399,50 @@ export function findingBudgetRejection(
   }
   const open = findings.filter((finding) => !isFindingClosed(finding));
   if (open.length >= MAX_TOWER_DO_OPEN_FINDINGS) {
-    const pressing = findingPressureOrder(open, now, liveOwners)
-      .slice(0, 5)
-      .map(
-        (finding) =>
-          `${finding.id} (${String(ageDays(now - finding.at))}d, ${finding.severity}/${finding.kind})`,
-      );
+    // Annotate each candidate with WHO holds it, not just its age: the remedy
+    // asks the caller to free a slot, and closing a row a live owner holds is
+    // a different act from draining an unheld backlog row. The finding update
+    // guard keys on owner liveness (not on the derived state), so the
+    // annotation must too: `snoozed` is not automatically drainable (a claim
+    // carried into the snooze stays held), and an `accepted` row whose owner
+    // died is. Without the hold state the caller's only options read as blind
+    // judgment calls on rows it cannot see (the 30-day unclaimed backlog this
+    // names today).
+    const ranked = findingPressureOrder(open, now, liveOwners).map(
+      (finding) => {
+        const heldByLive =
+          finding.owner !== undefined && liveOwners.has(finding.owner);
+        const state = deriveFindingState(finding, now, liveOwners);
+        const hold = heldByLive
+          ? `held by ${finding.owner} (live)`
+          : state === "snoozed"
+            ? "snoozed, no live holder"
+            : "no live claim";
+        return { finding, drainable: !heldByLive, hold };
+      },
+    );
+    const formatRow = (row: { finding: TowerDoFinding; hold: string }): string =>
+      `${row.finding.id} (${String(ageDays(now - row.finding.at))}d, ${row.finding.severity}/${row.finding.kind}, ${row.hold})`;
+    const top = ranked.slice(0, 5);
+    const drainableRows = ranked.filter((row) => row.drainable);
+    // The pressure order shows only the top 5. A drainable row can rank below
+    // claimed rows only when it is an unheld *snoozed* one (rank 3) — and the
+    // default dashboard list hides snoozed rows — so when the top 5 are all
+    // held, name the highest-pressure drainable row explicitly: otherwise the
+    // remedy points at a row the caller cannot locate. The label is not
+    // "oldest": within snoozed rows the pressure order is soonest-deadline.
+    const drainTarget =
+      drainableRows.length > 0 && !top.some((row) => row.drainable)
+        ? `  drain target: ${formatRow(drainableRows[0]!)}\n`
+        : "";
     return (
       `non-closed findings are at the budget (${String(MAX_TOWER_DO_OPEN_FINDINGS)}): close one first — a snooze still occupies a slot, so it frees nothing.\n` +
-      `  most pressing: ${pressing.join(", ")}\n` +
-      `  remedy: tower_do_talk action=finding findingIds=[…] status=done|rejected reason=…`
+      `  most pressing: ${top.map(formatRow).join(", ")}\n` +
+      drainTarget +
+      (drainableRows.length > 0
+        ? `  remedy: draining the budget is not a judgment on the finding — a row with no live claim is nobody's to defend, so close it as a budget drain: ` +
+          `tower_do_talk action=finding findingIds=[…] status=rejected reason="budget overflow: stale unclaimed finding"`
+        : `  remedy: every non-closed row is held by a live owner — a snooze frees nothing, so ask that owner (or ${TOWER_IDENTITY}) to close one, or wait for that owner to go offline (the claim then becomes drainable)`)
     );
   }
   return undefined;
