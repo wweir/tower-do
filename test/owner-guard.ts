@@ -804,7 +804,7 @@ async function main(): Promise<void> {
         "C",
         STALE,
       ),
-    /a completed task stays with its owner — only that owner or an as: "tower" write that replays the rows to keep may drop it/,
+    /a completed task stays with its owner — only that owner or an as: "tower" write that replays the rows to keep may drop it[\s\S]*enumerate every receipt it does not mean to drop/,
   );
   expectThrows(
     "idle owner's completed task cannot have its owner swapped by a peer",
@@ -838,7 +838,7 @@ async function main(): Promise<void> {
         "C",
         STALE,
       ),
-    /owned by "A"/,
+    /owned by "A"[\s\S]*replay the key unchanged to keep it/,
   );
 
   // A fresh owner is not adoptable: takeover attempt is rejected, no hint.

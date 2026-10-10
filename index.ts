@@ -2912,7 +2912,7 @@ export default function towerDoExtension(pi: ExtensionAPI): void {
       "Use tower_do_status before starting work to see who owns what on the shared board, and before finishing work to reconcile your own tasks.",
       "When a tower_do write is rejected as stale, call tower_do_status first to re-read the current revision, then merge your changes and retry with the new baseRevision.",
       "Share the board file path from tower_do_status with subagents so they can read shared state directly; have them report back instead of editing owned tasks.",
-      "Before a tower_do write, make sure the whole board is in view: the folded `## Others` ledger already names every open key (view=all adds their rows), and a key omitted from the write is removed — the default view's ledger is the minimum you must enumerate.",
+      "Before a tower_do write, make sure the whole board is in view: the folded `## Others` ledger names every open key and the completed key ledger names the receipts (view=all adds their rows), and a key omitted from the write is removed — so you must enumerate the ledger, completed receipts included (an omitted completed row owned by someone else is rejected by the owner guard as a removal, not kept).",
     ],
     parameters: StatusParamsSchema,
     executionMode: "sequential",

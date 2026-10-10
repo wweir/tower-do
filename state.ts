@@ -809,7 +809,7 @@ export function writeBoardSnapshot(
       throw new TowerDoValidationError(
         `task ${task.key} is owned by "${existing.owner}" — workers may update only their own tasks ` +
           `(${TOWER_IDENTITY} may update any)` +
-          staleClaimHint(existing, staleClaims),
+          staleClaimHint(existing, staleClaims, "update"),
       );
     }
     updated.push(task.key);
@@ -2886,13 +2886,17 @@ const OPEN_TASK_BUDGET_HINT =
  * rejects adoption-with-edits on a stale row. `status` therefore decides the
  * remedy and the stale-claim set only decides whether there is one to name — a
  * completed row never enters that set (a receipt is not displaceable), so its
- * text must not depend on it. */
+ * text must not depend on it. `site` separates the two completed-row failures:
+ * a removal is fixed by replaying the key, an update by replaying it unchanged. */
 function staleClaimHint(
   task: TowerDoTask,
   staleClaims: ReadonlySet<string>,
+  site: "removal" | "update" = "removal",
 ): string {
   if (task.status === "completed")
-    return ' (a completed task stays with its owner — only that owner or an as: "tower" write that replays the rows to keep may drop it; a peer cannot forge a receipt)';
+    return site === "update"
+      ? ' (a completed task stays with its owner — replay the key unchanged to keep it, and enumerate every receipt you do not mean to drop; only that owner or an as: "tower" write may change it, and a peer cannot forge a receipt)'
+      : ' (a completed task stays with its owner — only that owner or an as: "tower" write that replays the rows to keep may drop it; a peer cannot forge a receipt. Keeping it means replaying its key: an omitted completed key is a removal, so the write must enumerate every receipt it does not mean to drop)';
   if (!isStaleClaim(staleClaims, task.owner, task.key)) return "";
   return ` (owner idle past the ${formatTakeoverWindow()} takeover window: adopt it by setting owner to yourself and changing nothing else, then edit in a second write — or remove it)`;
 }
