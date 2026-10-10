@@ -308,7 +308,14 @@ exit is explicit and auditable:
   slot; only `done`/`rejected` frees one. Filing past the budget is rejected
   with the OLDEST rows named by pressure and a batch remedy, so the rejection
   itself surfaces the hidden backlog (the old dashboard rendered the newest 20,
-  permanently hiding the oldest debt). "Oldest" here is the last transition
+  permanently hiding the oldest debt). Each named row also carries its hold
+  state (`no live claim` / `held by … (live)` / `snoozed, no live holder`), and
+  the remedy is a drain of an unheld row rather than a blind judgment on a live
+  claim: when the pressure top-5 shows only held rows, a `drain target` is
+  named explicitly (the highest-pressure drainable row — an unheld snoozed row
+  can rank below claimed rows and be hidden by the default list), and an
+  all-held backlog says so instead of naming a drain that does not exist.
+  "Oldest" here is the last transition
   (`at`), not first filing, so a re-opened row ranks as fresh. The
   count-and-append is done under the
   cross-process write lease (`withWriteLock`), so two sessions cannot each

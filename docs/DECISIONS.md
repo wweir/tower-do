@@ -4,6 +4,50 @@
 > / reviews live in docs/plans and docs/reviews and get folded here when they
 > become durable rules.
 
+## 2026-10 — write replay names receipts; compaction never reduces the key set
+
+**Context.** `docs/reviews/2026-10-10-write-replay-and-finding-budget.md`
+reproduced two dead ends on a 209-key board (10 open + 199 completed).
+`tower_do_status`'s own guidance said "the default view's ledger is the minimum
+you must enumerate", but a full-replacement write removes every key it omits,
+and a completed row omitted by a non-owner is rejected by the owner guard — so
+the documented minimum was a guaranteed rejection that echoed the whole payload
+back. Separately, the finding-budget rejection told a caller to close a row from
+its top-5 list, all of which were 30+ day unclaimed backlog rows: the only
+remedy read as a blind terminal judgment on someone else's work.
+
+**Decision.**
+
+1. The status guideline and the completed-row guard hint now state that the
+   ledger is the minimum to enumerate **including completed receipts**: an
+   omitted completed key is a removal, so a write must name every receipt it
+   does not mean to drop. (No new mechanism — the contract never changed; only
+   the guidance that contradicted it.)
+2. The finding-budget rejection annotates each named row with its hold state
+   (`no live claim` / `held by <owner> (live)` / `snoozed, no live holder`),
+   names a `drain target` (the highest-pressure drainable row) when the
+   pressure top-5 shows only held rows (an unheld snoozed row ranks below
+   claimed rows and the default list hides it), and frames the remedy as a
+   budget drain of an unheld row, not a judgment on a claim (an all-held
+   backlog gets a wait/ask remedy instead of a drain that does not exist). The
+   budget semantics are unchanged (only `done`/`rejected` frees a slot; a legacy
+   over-cap board can always drain).
+3. Compaction stays an **equivalent rewrite**: `TowerBoard.compact` writes one
+   snapshot row per surviving task from the folded view, so it cannot reduce
+   the task key set; `dropSkipped` only discards lines the fold cannot turn
+   into events and always archives the verbatim pre-compact log first. This is
+   now asserted by `test/board-compact.ts` (a `tower` compaction preserves a
+   peer's completed receipt, and a `dropSkipped` compaction keeps every
+   foldable key).
+
+**Rejected.** Requiring an explicit `dropKeys` list (and a per-key retention
+check) before a `tower` write may omit a peer's row: it would re-inflate every
+write on a board of finished history back to naming all 199 receipts — the
+deadlock the open-task budget exists to remove — while adding no authority
+(the board is unauthenticated cooperative trust by contract, so a real identity
+boundary is out of scope). The drop is already disclosed: the write result
+lists removed keys and the log records `op:remove, by:tower`.
+
 ## 2026-09 — push wake delivers direct mail to an idle session
 
 **Context.** Board mail was pull-only: the periodic reminder surfaced

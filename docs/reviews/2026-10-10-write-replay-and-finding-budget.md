@@ -1,5 +1,19 @@
 # 写入重放与 finding 预算：实测到的三个落点（2026-10-10）
 
+> **Resolved (2026-10-10).** P1/P2 fixed: the `tower_do_status` guideline and the
+> completed-row guard hint now state that a write must enumerate completed
+> receipts too (an omitted completed key is a removal, rejected by the owner
+> guard). P3 fixed: the finding-budget rejection annotates each named row with
+> its hold state (`no live claim` / `held by … (live)` / `snoozed, no live
+> holder`) and frames the remedy as a drain of an unheld row, not a blind
+> judgment on a live claim; it names a `drain target` when the top-5 shows only
+> held rows, and an all-held backlog gets a wait/ask remedy.
+> P4: `TowerBoard.compact` is asserted (new `test/board-compact.ts` cases) to be
+> an equivalent rewrite that never reduces the task key set; the proposed
+> `dropKeys` gate was rejected. Durable rules folded into DECISIONS.md ("write
+> replay names receipts; compaction never reduces the key set") and CONTRACTS.md
+> (finding budget hold-state evidence).
+
 短期材料（`docs/reviews/`）。触发场景：另一个项目（WingGate，板 `home-wweir-Mine-WingGate-fed3321e`，
 209 key = 10 open + 199 completed）上的一次独立会话，需要 (a) 登记自己的分析任务、(b) 把两条带证据的
 finding 上报。两件事都失败，过程与根因记录如下。
