@@ -211,6 +211,20 @@ async function main(): Promise<void> {
         "src/x.ts",
   );
   check(
+    "compact is an equivalent rewrite, never a key reduction",
+    after.tasks.length === before.tasks.length &&
+      before.tasks.every((task) =>
+        after.tasks.some((kept) => kept.key === task.key),
+      ) &&
+      // `done` is alice's receipt and the compactor is `tower`: a tower
+      // compaction must merge history, not drop a peer's receipt. Explicit
+      // assertion because dropSkipped CAN drop a line the fold rejects, and
+      // the invariant that it never drops a row the fold understands cannot
+      // be inferred from the file shrinking.
+      after.tasks.find((task) => task.key === "done")?.owner === "alice",
+    `${before.tasks.map((t) => t.key).join(",")} -> ${after.tasks.map((t) => t.key).join(",")}`,
+  );
+  check(
     "compact shrinks the file but keeps the current text",
     result.bytesAfter < bytesBefore &&
       after.tasks.find((task) => task.key === "live")?.subject ===
@@ -599,6 +613,13 @@ async function main(): Promise<void> {
       dirtyAfter.skipped === 0 &&
       dirtyHeader.skipped === 1,
     `live=${dirtyAfter.skipped} header=${dirtyHeader.skipped}`,
+  );
+  // The dropped line is the unfoldable one; the foldable task row must survive
+  // the same compact, so a dropSkipped gc never quietly reduces the key set.
+  check(
+    "a dropSkipped compact keeps every foldable task key",
+    dirtyAfter.tasks.length === 1 && dirtyAfter.tasks[0]?.key === "k",
+    dirtyAfter.tasks.map((task) => task.key).join(","),
   );
   // The historical count must not make dropSkipped sticky.
   const secondCompact = await new TowerBoard(dirtyFile).compact({
