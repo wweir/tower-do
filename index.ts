@@ -89,7 +89,6 @@ import {
   zipHashObject,
 } from "./git-count.ts";
 import {
-  checkpointDigest,
   classifyTaskLayers,
   cloneBoard,
   createEmptyBoard,
@@ -129,7 +128,6 @@ import {
   truncateChars,
   knownIdentities,
   latestActivity,
-  latestBoardCheckpoint,
   LIVE_HEARTBEAT_MS,
   LIVE_PRUNE_MS,
   LIVE_WINDOW_MS,
@@ -175,8 +173,6 @@ import {
   TASK_KEY_PATTERN,
   textLength,
   transportLimit,
-  TOWER_DO_BOARD_DIGEST_TYPE,
-  TOWER_DO_BOARD_TYPE,
   TOWER_DO_MAIL_PENDING_TYPE,
   TOWER_DO_MAIL_TYPE,
   TOWER_DO_REMINDER_TYPE,
@@ -194,7 +190,6 @@ import {
   type FindingStatus,
   type LiveRecord,
   type TowerBoardView,
-  type TowerDoCheckpointDigest,
   type TowerDoFinding,
   type TowerDoMailDetails,
   type TowerDoMessage,
@@ -208,13 +203,6 @@ const WIDGET_KEY = "pi-tower-do-widget";
 // no user evidence ever justified tuning them, and every knob is permanent
 // schema+docs+test surface).
 const REMINDER_INTERVAL = 3; // inject a board reminder every N LLM calls
-// A forced checkpoint (compact steer / before_agent_start) injects its own
-// board snapshot, but the context hook strips that snapshot before the LLM
-// sees it (it is a persisted custom message). Arm the counter so the next
-// context event replaces it immediately; the steady-state cadence resumes
-// from there. Without this arming the checkpoint's snapshot never reaches
-// the LLM. See DECISIONS.md (reminder cadence vs snapshot strip).
-const REMINDER_ARMED = REMINDER_INTERVAL - 1;
 const WIDGET_TASK_LIMIT = 3; // unfinished tasks shown in the above-editor line
 const STATUS_ACTIVITY_TAIL = 8; // activity feed lines in tower_do_status
 /** Rows the dashboard renders per message/finding section. The section headers
@@ -911,13 +899,7 @@ function ensureKnown(
 
 export default function towerDoExtension(pi: ExtensionAPI): void {
   let currentView: TowerBoardView = createEmptyBoard();
-  let contextCheckpointNeeded = false;
   let llmCallsSinceReminder = 0;
-  // Display-only fallback restored from a bounded digest when the board file is
-  // missing (Layer 4). Never used for writes: the write path folds the real
-  // file (missing = empty, revision 0), so no ghost baseRevision can pass the
-  // gate. Cleared as soon as the board file exists again.
-  let checkpointFallback: TowerBoardView | undefined;
   let widgetRegistered = false;
   let uiContext: ExtensionContext | undefined;
   let activeCwd: string | undefined;
@@ -1936,16 +1918,7 @@ export default function towerDoExtension(pi: ExtensionAPI): void {
     as: string | undefined,
   ): Promise<{ board: TowerBoard; caller: string; view: TowerBoardView }> => {
     const entry = boards.entryFor(ctx.cwd);
-    const folded = await foldRetained(ctx.cwd);
-    // Read paths show the last bounded checkpoint when the board file is gone;
-    // the fold of a missing file is an empty board and would hide the digest's
-    // open tasks. Writes ignore this view and re-fold the real file.
-    const boardFileExists = existsSync(entry.board.file);
-    if (boardFileExists) checkpointFallback = undefined;
-    const view =
-      !boardFileExists && checkpointFallback !== undefined
-        ? cloneBoard(checkpointFallback)
-        : folded;
+    const view = await foldRetained(ctx.cwd);
     selfCtx = ctx;
     activeCwd = ctx.cwd;
     currentView = view;
@@ -3575,39 +3548,10 @@ export default function towerDoExtension(pi: ExtensionAPI): void {
     hasSettledOnce = branch.some((branchEntry) => branchEntry.type === "message");
     wakeGeneration += 1;
     wakeInFlight = false;
-    const entry = boards.entryFor(ctx.cwd);
-    // Disk is authoritative. Fall back to the last session checkpoint ONLY
-    // when the board file is missing (worktree cleaned / first run) — never
-    // when the board exists but holds zero tasks, because that is a genuine
-    // `tower_do tasks: []` clear and replaying an old checkpoint would
-    // resurrect finished work in the UI.
-    if (existsSync(entry.board.file)) {
-      currentView = await foldRetained(ctx.cwd);
-      checkpointFallback = undefined;
-    } else {
-      // Always replace the in-memory view: a previous session's currentView
-      // must not leak into this one when the board file is gone. getBranch
-      // is root-to-leaf, so take the last valid checkpoint (see
-      // latestBoardCheckpoint), not the first. BOTH forms restore: a digest is
-      // an `incomplete` display view (open tasks + finding titles only), a
-      // legacy full snapshot is a complete view. Either must become the
-      // fallback the read paths use — keeping only the digest form left a
-      // legacy-snapshot session reporting an empty fold on every tool call.
-      const checkpoint = latestBoardCheckpoint(ctx.sessionManager.getBranch());
-      // Pin the fallback to revision 0 as well: the write gate folds the
-      // missing file at revision 0, so a read path that advertised the
-      // checkpoint's revision would hand the caller a baseRevision every write
-      // then rejects.
-      checkpointFallback =
-        checkpoint === undefined
-          ? undefined
-          : cloneBoard({ ...checkpoint, revision: 0 });
-      currentView =
-        checkpoint === undefined
-          ? createEmptyBoard()
-          : cloneBoard({ ...checkpoint, revision: 0 });
-    }
-    contextCheckpointNeeded = false;
+    // Disk is authoritative; a missing board file is an empty board. Writes
+    // fold the real file, so no in-memory fallback can hand a caller a
+    // baseRevision the write gate would reject.
+    currentView = await foldRetained(ctx.cwd);
     llmCallsSinceReminder = 0;
     uiContext = ctx;
     // New session ⇒ new viewpoint: drop the previous session's counts
@@ -3677,20 +3621,17 @@ export default function towerDoExtension(pi: ExtensionAPI): void {
   });
 
   pi.on("context", async (event, ctx) => {
-    // Compact / before_agent_start inject board snapshots (legacy full view or
-    // the bounded digest) that persist in the session transcript. They must
-    // not keep cancelled todos in the LLM context after a peer writes; always
-    // strip them. Replacing with a fresh reminder is a separate cadence
-    // (REMINDER_INTERVAL) — a leftover snapshot must not skip the counter and
+    // A board reminder persisted in the transcript must not keep cancelled
+    // todos in the LLM context after a peer writes; always strip it.
+    // Replacing with a fresh reminder is a separate cadence
+    // (REMINDER_INTERVAL) — a leftover reminder must not skip the counter and
     // re-inject every call.
     const isBoardContext = (message: {
       role?: string;
       customType?: string;
     }): boolean =>
       message.role === "custom" &&
-      (message.customType === TOWER_DO_REMINDER_TYPE ||
-        message.customType === TOWER_DO_BOARD_TYPE ||
-        message.customType === TOWER_DO_BOARD_DIGEST_TYPE);
+      message.customType === TOWER_DO_REMINDER_TYPE;
     const messages = event.messages.filter(
       (message) => !isBoardContext(message),
     );
@@ -3730,77 +3671,6 @@ export default function towerDoExtension(pi: ExtensionAPI): void {
     };
   });
 
-  pi.on("session_compact", async (event, ctx) => {
-    // Fold + checkpoint under the same mutation queue as tower_do so a
-    // concurrent cancel cannot land between the fold and appendEntry. The
-    // transcript payload is the bounded DIGEST (Layer 4): open tasks + finding
-    // titles + O(1) counts, never the whole view.
-    const compactEntry = boards.entryFor(ctx.cwd);
-    const identity = sessionIdentity(ctx.cwd, pi, ctx);
-    const buildDigest = async (): Promise<TowerDoCheckpointDigest> =>
-      checkpointDigest(
-        currentView,
-        Date.now(),
-        effectiveLiveOwners(currentView, await readLiveOwners(ctx.cwd)),
-        identity,
-      );
-    let digest: TowerDoCheckpointDigest;
-    if (existsSync(compactEntry.board.file)) {
-      digest = await withFileMutationQueue(compactEntry.board.file, async () => {
-        currentView = await foldRetained(ctx.cwd);
-        const next = await buildDigest();
-        pi.appendEntry(TOWER_DO_BOARD_DIGEST_TYPE, next);
-        return next;
-      });
-    } else {
-      digest = await buildDigest();
-      pi.appendEntry(TOWER_DO_BOARD_DIGEST_TYPE, digest);
-    }
-    if (event.willRetry || ctx.hasPendingMessages()) {
-      contextCheckpointNeeded = false;
-      llmCallsSinceReminder = REMINDER_ARMED;
-      pi.sendMessage(
-        {
-          customType: TOWER_DO_BOARD_DIGEST_TYPE,
-          content: formatBoardReminder(currentView, identity),
-          display: false,
-          details: digest,
-        },
-        { deliverAs: "steer" },
-      );
-    } else {
-      contextCheckpointNeeded = true;
-    }
-  });
-
-  pi.on("before_agent_start", async (_event, ctx) => {
-    if (!contextCheckpointNeeded) return;
-    contextCheckpointNeeded = false;
-    llmCallsSinceReminder = REMINDER_ARMED;
-    const cwd = ctx?.cwd ?? activeCwd;
-    if (cwd !== undefined) {
-      const entry = boards.entryFor(cwd);
-      if (existsSync(entry.board.file)) {
-        await withFileMutationQueue(entry.board.file, async () => {
-          currentView = await foldRetained(cwd);
-        });
-      }
-    }
-    const identity = sessionIdentity(cwd, pi, selfCtx);
-    const live =
-      cwd === undefined
-        ? new Set<string>()
-        : effectiveLiveOwners(currentView, await readLiveOwners(cwd));
-    return {
-      message: {
-        customType: TOWER_DO_BOARD_DIGEST_TYPE,
-        content: formatBoardReminder(currentView, identity),
-        display: false,
-        details: checkpointDigest(currentView, Date.now(), live, identity),
-      },
-    };
-  });
-
   pi.on("session_shutdown", () => {
     // Exit signal first (delete while selfLivePath is still known), then
     // tear down the session-scoped wiring.
@@ -3813,9 +3683,7 @@ export default function towerDoExtension(pi: ExtensionAPI): void {
     selfCtx = undefined;
     activeCwd = undefined;
     currentView = createEmptyBoard();
-    checkpointFallback = undefined;
     resetGitCounts();
-    contextCheckpointNeeded = false;
     llmCallsSinceReminder = 0;
     wakeMailDelivered = new Set<string>();
     wakeGeneration += 1;

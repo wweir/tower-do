@@ -37,8 +37,6 @@ import {
   relativeTime,
   retainMessages,
   unreadMessagesToMe,
-  latestBoardCheckpoint,
-  TOWER_DO_BOARD_TYPE,
   writeBoardSnapshot,
   type TowerBoardView,
   type TowerDoMessage,
@@ -1152,54 +1150,12 @@ function layer7(): void {
 // --- layer 6: session-checkpoint replay (oldest-first branch) ---------------
 // Pi getBranch() is root-to-leaf. Restore must take the LAST valid custom
 // board snapshot, otherwise a later compact's cancelled todos come back.
-function layer6(): void {
-  const board = (key: string, subject: string): TowerBoardView =>
-    writeBoardSnapshot(
-      createEmptyBoard(),
-      {
-        tasks: [{ key, subject, status: "in_progress" }],
-      },
-      "alice",
-    ).view;
-  const cancelled = board("old", "cancelled work");
-  const current = board("new", "current work");
-  const picked = latestBoardCheckpoint([
-    { type: "custom", customType: TOWER_DO_BOARD_TYPE, data: cancelled },
-    { type: "message" },
-    {
-      type: "custom",
-      customType: TOWER_DO_BOARD_TYPE,
-      data: { schemaVersion: 1 },
-    },
-    { type: "custom", customType: TOWER_DO_BOARD_TYPE, data: current },
-  ]);
-  check(
-    "latest valid checkpoint wins over older and malformed",
-    picked?.tasks.length === 1 && picked.tasks[0]?.key === "new",
-  );
-  check(
-    "empty branch has no checkpoint",
-    latestBoardCheckpoint([]) === undefined,
-  );
-  check(
-    "custom_message steer payload is not a checkpoint",
-    latestBoardCheckpoint([
-      {
-        type: "custom_message",
-        customType: TOWER_DO_BOARD_TYPE,
-        data: cancelled,
-      },
-    ]) === undefined,
-  );
-}
-
 async function main(): Promise<void> {
   await layer1();
   layer2();
   await layer3();
   await layer4();
   layer5();
-  layer6();
   layer7();
   console.log(`\n${passed} passed, ${failures} failed`);
   if (failures > 0) process.exit(1);

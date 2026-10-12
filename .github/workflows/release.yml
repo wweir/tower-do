@@ -46,7 +46,6 @@ jobs:
           bun test/config.ts
           bun test/owner-guard.ts
           bun test/presence-retention.ts
-          bun test/finding-exit.ts
           bun test/home-isolation.ts
           bun test/changed-files.ts
           bun test/scope-conflicts.ts

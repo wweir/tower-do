@@ -41,7 +41,9 @@
 | 方式/计划 | `rw-plan` | done |
 | P2 磁盘层（D1） | `rw-disk` | done |
 | P1 写入语义 | `rw-core` | done |
-| P3 tools 收敛 | `rw-tools` | open |
+| P3a digest 退役 | `rw-digest` | done |
+| P3b findings 退役 | `rw-findings` | open |
+| P3c 剪枝（scope / receipts / layers / presence） | `rw-trim` | open |
 | P4a 消息投递（D2） | `rw-msg` | open |
 | P4b 身份（D4） | `rw-identity` | open |
 | P5 UI（D3） | `rw-ux` | open |
@@ -57,8 +59,16 @@
 - [x] **P1 写入语义** — `tower_do.tasks` 改为 upsert（列出即新建/合并补丁），删除走显式
   `remove: [key]`；`writeBoardSnapshot` 去掉“省略即删除”与随之而来的移除守卫；容量/依赖/环
   检查改为基于“写入后产出的盘面”而非输入列表；tool schema 加 `remove` 参数。tsc + 17 套件全绿。
-- [ ] **P3 tools** — 删 findings / scope / changedFiles / dashboard layers / presence；
-  `tower_do_status` 收敛为 open tasks + completed 键账目 + unread + activity。
+- [x] **P3a digest 退役（Layer 4）** — 删 checkpoint digest 全链路：
+  `TOWER_DO_BOARD_TYPE`/`TOWER_DO_BOARD_DIGEST_TYPE`、`TowerDoCheckpointDigest`、`checkpointDigest`、
+  `readBoardDigest`、`digestToView`、`latestBoardCheckpoint`、`readBoardSnapshot`；`index.ts` 删
+  `session_compact`/`before_agent_start` 两个 checkpoint handler、`checkpointFallback`、
+  `contextCheckpointNeeded`、`REMINDER_ARMED`。restore 直接 fold 文件（缺文件=空板）。
+  删 `test/finding-exit.ts`（digest↔findings 往返测试）与 smoke/presence-retention 的 checkpoint 用例。tsc + 16 套件全绿。
+- [ ] **P3b findings 退役** — 删 findings 类型/契约/预算/生命周期，`tower_do_talk` 的 finding action
+  与 `tower_do_status` 的 findings 章节。
+- [ ] **P3c 剪枝** — 删 scope / changedFiles 收据 / dashboard layers / presence，`tower_do_status`
+  收敛为 open tasks + completed 键账目 + unread + activity。
 - [ ] **P4b 身份（D4）** — identity = `as` > config `identity` > session id；删 `sessionLabel`
   label entropy / alias / `sameAgent` 多时钟体系；stale takeover 只用 `task.updatedAt` 单时钟。
 - [ ] **P5 UI** — 极简 widget + reminder。
