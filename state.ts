@@ -38,12 +38,12 @@ export const TOWER_IDENTITY = "tower";
 export const MAX_MESSAGE_BYTES = 32 * 1024;
 export const MAX_MESSAGE_SUBJECT_CHARS = 200;
 /** Age after which an unread message leaves the default view even though nobody
- * acked it. The message stays on disk and is readable via `inbox all` — this is
- * a VIEW retirement (Layer 2), never a delete. */
-export const MESSAGE_PENDING_RETIRE_MS = 14 * 24 * 60 * 60_000;
-/** Ownership-takeover window for non-completed tasks, separate from the 10 min
- * `PRESENCE_IDLE_MS` display hint: ownership dies on the task-relevant
- * activity clock, not on unrelated board chatter (see staleTaskClaims). */
+ * acked it. The message stays on disk and is readable via `inbox all` — a view
+ * retirement, never a delete. */
+const MESSAGE_PENDING_RETIRE_MS = 14 * 24 * 60 * 60_000;
+/** Ownership-takeover window for non-completed tasks: ownership dies on the
+ * task-relevant activity clock, not on unrelated board chatter (see
+ * staleTaskClaims). */
 export const TASK_CLAIM_STALE_MS = 6 * 60 * 60_000;
 
 // ---------------------------------------------------------------------------
@@ -190,14 +190,14 @@ interface TowerDoChangeSummary {
   removed: string[];
 }
 
-export interface TowerDoWriteDetails {
+interface TowerDoWriteDetails {
   view: TowerBoardView;
   caller: string;
   change: TowerDoChangeSummary;
   taskEvents: BoardTaskEvent[];
 }
 
-export interface TowerDoSnapshotInput {
+interface TowerDoSnapshotInput {
   /** Upsert list: each entry is created or merged as a patch onto the stored
    *  row. A key omitted here is left untouched. */
   tasks: TowerDoTaskInput[];
@@ -872,14 +872,6 @@ export function readPersistedTask(
         (item): item is string => typeof item === "string",
       )
     : [];
-  const scope = Array.isArray(candidate.scope)
-    ? candidate.scope.filter((item): item is string => typeof item === "string")
-    : undefined;
-  const changedFiles = Array.isArray(candidate.changedFiles)
-    ? candidate.changedFiles.filter(
-        (item): item is string => typeof item === "string",
-      )
-    : undefined;
   const blockedBy = Array.isArray(candidate.blockedBy)
     ? candidate.blockedBy.filter(
         (item): item is string => typeof item === "string",
@@ -894,10 +886,6 @@ export function readPersistedTask(
         ...(description ? { description } : {}),
         ...(owner ? { owner } : {}),
         dependsOn,
-        ...(scope !== undefined && scope.length ? { scope } : {}),
-        ...(changedFiles !== undefined && changedFiles.length
-          ? { changedFiles }
-          : {}),
         blockedBy,
       },
       index,
@@ -954,7 +942,7 @@ export function readPersistedMessage(
 const REMINDER_TASK_LINE_CAP = 12;
 
 // ---------------------------------------------------------------------------
-// Bounded checkpoint digest (Layer 4)
+// Messages (read derivations — never written to the board)
 // ---------------------------------------------------------------------------
 
 /**
@@ -1109,7 +1097,7 @@ export function retainMessages(
 }
 
 // ---------------------------------------------------------------------------
-// Activity + presence (derived, read-only — never written to the board).
+// Activity (derived, read-only — never written to the board).
 // ---------------------------------------------------------------------------
 
 export interface ActivityEntry {
@@ -1154,8 +1142,8 @@ export function parseActivityLine(line: string): ActivityEntry | undefined {
   if (kind === "task") {
     // Same shape test as `readEvent` (board.ts): a task line whose `op` is
     // not upsert/remove is skipped by the fold, so it must not count as
-    // ownership activity here either — otherwise presence and the fold read
-    // two different clocks (ARCHITECTURE.md "one clock, not two"), and a
+    // ownership activity here either — otherwise the activity parser and the
+    // fold read two different clocks (ARCHITECTURE.md "one clock, not two"), and a
     // garbage line would extend an owner's takeover protection.
     if (record.op !== "upsert" && record.op !== "remove") return undefined;
     const task = record.task as Record<string, unknown> | undefined;
@@ -1223,7 +1211,7 @@ export function parseActivityLine(line: string): ActivityEntry | undefined {
   return undefined;
 }
 
-/** Compact relative time for activity/presence lines (test-friendly). */
+/** Compact relative time for activity lines (test-friendly). */
 export function relativeTime(now: number, at: number): string {
   const delta = Math.max(0, now - at);
   if (delta < 60_000) return "just now";
@@ -1307,14 +1295,10 @@ export function knownIdentities(
   return known;
 }
 
-/** Alias of `TASK_CLAIM_STALE_MS` under the name the docs and the takeover
- * hint use; a single constant behind the alias means the two cannot drift. */
-export const OWNER_TAKEOVER_MS = TASK_CLAIM_STALE_MS;
-
 /** Human form of the takeover window, derived from the constant so the
  * user-facing hint can never drift from the permission it describes. */
 export function formatTakeoverWindow(
-  idleMs: number = OWNER_TAKEOVER_MS,
+  idleMs: number = TASK_CLAIM_STALE_MS,
 ): string {
   const minutes = Math.round(idleMs / 60_000);
   if (minutes < 60) return `${String(minutes)} min`;
@@ -1352,7 +1336,7 @@ export function staleTaskClaims(
   entries: readonly ActivityEntry[],
   tasks: readonly TowerDoTask[],
   now: number,
-  idleMs: number = OWNER_TAKEOVER_MS,
+  idleMs: number = TASK_CLAIM_STALE_MS,
 ): Set<string> {
   const stale = new Set<string>();
   // No activity data at all (unreadable / garbage log) must disable the
@@ -1428,7 +1412,7 @@ function staleClaimHint(
   return ` (owner idle past the ${formatTakeoverWindow()} takeover window: adopt it by setting owner to yourself and changing nothing else, then edit in a second write — or remove it)`;
 }
 
-export type BoardProgressCount =
+type BoardProgressCount =
   | "title"
   | "open"
   | "blocked"
@@ -1474,16 +1458,15 @@ function escapeRegExp(s: string): string {
 
 /**
  * True for status lines that describe the caller's own session. Prefixes
- * (header, presence `(me)`, activity byline, messages section) are owned
- * by the renderer. The task-line alternative looks for ` @<id> (me)`
+ * (header, activity byline, messages section) are owned by the renderer. The task-line alternative looks for ` @<id> (me)`
  * before a renderer suffix (` ←` / ` [` / ` —`) or EOL: a mention in the
  * middle of a subject, or on a line that still has a real other owner
  * after it, does not match. An *unowned* subject that itself ends with
  * that token can still match — closing that needs structured line marks,
  * not a tighter regex.
  *
- * Keep in sync with the renderers in index.ts (status sections, presence
- * `(me)` label, owner `(me)` suffix, activity feed format).
+ * Keep in sync with the renderers in index.ts (status sections, owner `(me)`
+ * suffix, activity feed format).
  */
 export function isCallerLine(line: string, caller: string): boolean {
   if (caller === "") return false;
@@ -1497,26 +1480,6 @@ export function isCallerLine(line: string, caller: string): boolean {
       `^## Messages for ${id} \\(`,
     ].join("|"),
   ).test(line);
-}
-
-/** Truncate the CONTENT to `max` code points, appending an ellipsis when cut
- *  (so the result is at most `max + 1` code points — the marker is always
- *  disclosed). Code points, not UTF-16 units — the same metric as every other
- *  limit. */
-export function truncateChars(value: string, max: number): string {
-  const chars = [...value];
-  return chars.length <= max ? value : `${chars.slice(0, max).join("")}…`;
-}
-
-/** Truncate to AT MOST `max` code points, ellipsis included. `truncateChars`
- * is display-oriented and returns `max + 1` when it cuts, so it cannot be used
- * where the result must satisfy a validated `<= max` bound (a checkpoint digest
- * field must be re-readable by `readBoardDigest`). */
-export function truncateToAtMost(value: string, max: number): string {
-  const chars = [...value];
-  if (chars.length <= max) return value;
-  if (max <= 1) return chars.slice(0, Math.max(0, max)).join("");
-  return `${chars.slice(0, max - 1).join("")}…`;
 }
 
 /** Compact status-line rendering of the whole board for reminders. Rows are

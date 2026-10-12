@@ -45,7 +45,7 @@ jobs:
           bun test/smoke.ts
           bun test/config.ts
           bun test/owner-guard.ts
-          bun test/presence-retention.ts
+          bun test/message-retention.ts
           bun test/home-isolation.ts
           bun test/board-progress.ts
           bun test/task-cap.ts

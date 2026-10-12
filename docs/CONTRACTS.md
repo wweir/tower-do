@@ -92,7 +92,7 @@ Length is measured in Unicode **code points** (`textLength`), not UTF-16 units.
 | `test/smoke.ts` | end-to-end: fold round-trips, the real extension via a mock API (3 tools), owner guard, revision gate, widget/reminder |
 | `test/config.ts` | config normalization; `identity` validation fails loud |
 | `test/owner-guard.ts` | every-field ownership guard and the stale-claim takeover |
-| `test/presence-retention.ts` | message read/retention derivations |
+| `test/message-retention.ts` | message read/retention derivations |
 | `test/home-isolation.ts` | state lives under `$HOME`, never in a repo |
 | `test/board-progress.ts` | the widget progress segment |
 | `test/task-cap.ts` | open-task budget, dependency gating across the budget |

@@ -1328,17 +1328,13 @@ export default function towerDoExtension(pi: ExtensionAPI): void {
       // Write-side capacity is stored status, not display status (a gated
       // pending row still occupies an open slot): open = non-completed.
       const openCount = tasks.length - completedCount;
-      // Fetch a wider tail than the rendered window: presence (who is around,
-      // who went idle) needs enough history to judge inactivity, while the
-      // rendered activity feed only shows the configured activity tail.
-      // The tail is also the source for the header's "last updated" line, so
-      // it is parsed once and shared by all three consumers.
+      // The activity tail feeds both the rendered feed and the header's
+      // "last updated" line, so it is parsed once.
       const tailCount = STATUS_ACTIVITY_TAIL;
-      const presenceCount = Math.max(tailCount, 200);
       const now = Date.now();
       let rawTail: string[] = [];
       try {
-        rawTail = (await board.rawTail(presenceCount)).reverse();
+        rawTail = (await board.rawTail(tailCount)).reverse();
       } catch {
         // Missing/unreadable log → empty activity; the folded view still renders.
       }

@@ -1,7 +1,7 @@
 {
   "name": "tower-do",
   "version": "0.7.2",
-  "description": "Shared multi-agent task board for Pi coding agent — Kimi Tower style orchestration (todo-flavored)",
+  "description": "Shared project task board + cross-session mail for the Pi coding agent",
   "license": "MPL-2.0",
   "author": "温习江湖 <wweir@foxmail.com>",
   "type": "module",
@@ -20,7 +20,6 @@
     "index.ts",
     "state.ts",
     "board.ts",
-    "git-count.ts",
     "test/",
     "docs/",
     "tsconfig.json",
@@ -29,7 +28,6 @@
     "LICENSE"
   ],
   "pi": {
-    "image": "https://raw.githubusercontent.com/wweir/tower-do/main/docs/pi-tower-do.png",
     "extensions": [
       "./index.ts"
     ]

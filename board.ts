@@ -38,7 +38,7 @@ import {
   type TowerDoTask,
 } from "./state.ts";
 
-export interface BoardEvent {
+interface BoardEvent {
   kind: "task" | "message";
   op?: "upsert" | "remove";
   key?: string;
