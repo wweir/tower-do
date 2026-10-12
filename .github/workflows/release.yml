@@ -32,29 +32,33 @@ jobs:
 
       # The repo publishes TypeScript sources directly (main: ./index.ts, no
       # build step) — tsc is the compile gate and the rest is the test gate.
+      #
+      # `bun <file>`, NOT `bun run <file>`: since bun 1.4.0 a `bun run <path>`
+      # with no matching package.json script prints the CLI help, runs NOTHING,
+      # and exits 0 — a silent always-green gate. `bun <file>` executes the file
+      # and each suite calls process.exit(1) on failure.
       - name: Compile check
         run: bunx tsc --noEmit -p tsconfig.json
 
       - name: Test gate
         run: |
-          bun run test/smoke.ts
-          bun run test/config.ts
-          bun run test/owner-guard.ts
-          bun run test/presence-retention.ts
-          bun run test/finding-exit.ts
-          bun run test/board-compact.ts
-          bun run test/home-isolation.ts
-          bun run test/changed-files.ts
-          bun run test/scope-conflicts.ts
-          bun run test/git-count.ts
-          bun run test/live-sessions.ts
-          bun run test/board-progress.ts
-          bun run test/task-cap.ts
-          bun run test/view-layers.ts
-          bun run test/wake-mail.ts
-          bun run test/limits.ts
-          bun run test/identity-scope.ts
-          bun run test/identity-label.ts
+          bun test/smoke.ts
+          bun test/config.ts
+          bun test/owner-guard.ts
+          bun test/presence-retention.ts
+          bun test/finding-exit.ts
+          bun test/home-isolation.ts
+          bun test/changed-files.ts
+          bun test/scope-conflicts.ts
+          bun test/git-count.ts
+          bun test/live-sessions.ts
+          bun test/board-progress.ts
+          bun test/task-cap.ts
+          bun test/view-layers.ts
+          bun test/wake-mail.ts
+          bun test/limits.ts
+          bun test/identity-scope.ts
+          bun test/identity-label.ts
 
       - name: Verify tag matches package version
         run: |
