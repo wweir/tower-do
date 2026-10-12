@@ -190,7 +190,15 @@ export class TowerBoard {
         continue;
       }
       const event = readEvent(candidate);
-      if (event === ignored) continue;
+      if (event === ignored) {
+        // A legacy finding row was written as part of the snapshot block, so it
+        // still occupies a snapshot slot. Leaving the slot unconsumed lets the
+        // window run past the block and swallow the task events appended after
+        // it — their revision bump is lost and a write's returned revision
+        // diverges from a re-fold forever.
+        if (inSnapshot) snapshotConsumed += 1;
+        continue;
+      }
       if (event === undefined) {
         skipped += 1;
         continue;

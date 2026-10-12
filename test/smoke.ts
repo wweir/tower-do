@@ -401,6 +401,95 @@ async function layer1(): Promise<void> {
     `tasks=${view.tasks.map((t) => t.key).join(",")}`,
   );
 
+
+  // A legacy compacted log whose snapshot block contains finding rows must
+  // still count task events appended AFTER the block: a finding row is ignored
+  // by the fold, but it is a snapshot row and must consume its slot — otherwise
+  // the snapshot window runs past the block, swallows real events, and the
+  // revision a write reports stops matching a re-fold.
+  {
+    const legacyCompactDir = mkdtempSync(
+      join(tmpdir(), "tower-do-legacy-compact-"),
+    );
+    const legacyCompactFile = join(legacyCompactDir, "board.jsonl");
+    const at = Date.now();
+    const keptTask = {
+      key: "kept",
+      subject: "kept task",
+      status: "pending",
+      dependsOn: [],
+      blockedBy: [],
+      updatedAt: at,
+    };
+    const newTask = { ...keptTask, key: "new", subject: "new task" };
+    writeFileSync(
+      legacyCompactFile,
+      [
+        JSON.stringify({
+          kind: "compact",
+          revision: 5,
+          at,
+          by: "tower",
+          sourceSha256: "test",
+          skipped: 0,
+          snapshotLines: 3,
+          counts: { tasks: 1, messages: 1, findings: 1 },
+        }),
+        JSON.stringify({
+          kind: "task",
+          op: "upsert",
+          key: "kept",
+          task: keptTask,
+          by: "alice",
+          at,
+        }),
+        JSON.stringify({
+          kind: "message",
+          message: {
+            id: "m-1",
+            to: "all",
+            from: "alice",
+            subject: "s",
+            body: "b",
+            at,
+          },
+          by: "alice",
+          at,
+        }),
+        JSON.stringify({
+          kind: "finding",
+          finding: {
+            id: "f-1",
+            kind: "bug",
+            title: "legacy",
+            severity: "low",
+            status: "open",
+            summary: "s",
+            from: "alice",
+            at,
+          },
+          by: "alice",
+          at,
+        }),
+        JSON.stringify({
+          kind: "task",
+          op: "upsert",
+          key: "new",
+          task: newTask,
+          by: "alice",
+          at,
+        }),
+      ].join("\n") + "\n",
+    );
+    const folded = await new TowerBoard(legacyCompactFile).fold();
+    check(
+      "a legacy snapshot's finding row still consumes its slot (appended task event bumps the revision)",
+      folded.revision === 6 &&
+        folded.tasks.length === 2 &&
+        folded.skipped === 0,
+      `rev=${String(folded.revision)} tasks=${String(folded.tasks.length)} skipped=${String(folded.skipped)}`,
+    );
+  }
 }
 
 async function layer2(): Promise<void> {
