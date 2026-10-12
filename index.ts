@@ -45,7 +45,6 @@ import {
   type Theme,
 } from "@earendil-works/pi-coding-agent";
 import { Text, truncateToWidth, type TUI } from "@earendil-works/pi-tui";
-import { execFile } from "node:child_process";
 import {
   cpSync,
   existsSync,
@@ -54,17 +53,7 @@ import {
   renameSync,
   rmSync,
   statSync,
-  watch,
-  type FSWatcher,
 } from "node:fs";
-import {
-  mkdir,
-  readFile,
-  readdir,
-  rename,
-  unlink,
-  writeFile,
-} from "node:fs/promises";
 import { createHash, randomUUID } from "node:crypto";
 import { homedir } from "node:os";
 import { basename, dirname, join, resolve } from "node:path";
@@ -76,16 +65,6 @@ import {
   type TowerDoConfig,
 } from "./board.ts";
 import {
-  ABSENT_HASH,
-  formatGitSegment,
-  headMoveIsExternal,
-  leftDirtyPaths,
-  parseDiffNames,
-  parsePorcelain,
-  sessionTouchedDelta,
-  zipHashObject,
-} from "./git-count.ts";
-import {
   cloneBoard,
   createEmptyBoard,
   DEFAULT_IDENTITY,
@@ -93,17 +72,12 @@ import {
   formatActivityFeed,
   formatBoardProgress,
   formatBoardReminder,
-  formatLiveSegment,
   formatTakeoverWindow,
   getAllTasks,
   isCallerLine,
   isTowerDoStatus,
   knownIdentities,
   latestActivity,
-  LIVE_HEARTBEAT_MS,
-  LIVE_PRUNE_MS,
-  liveSessionCount,
-  parseLiveRecord,
   MAX_IDENTITY_CHARS,
   MAX_MESSAGE_BYTES,
   MAX_MESSAGE_SUBJECT_CHARS,
@@ -134,7 +108,6 @@ import {
   unreadMessagesToMe,
   writeBoardSnapshot,
   type ActivityEntry,
-  type LiveRecord,
   type TowerBoardView,
   type TowerDoMessage,
   type TowerDoStatus,
@@ -722,633 +695,9 @@ export default function towerDoExtension(pi: ExtensionAPI): void {
   // Widget (above-editor status line)
   // -------------------------------------------------------------------------
 
-  // Git dirty/session counts for the widget header. Populated asynchronously
-  // (session_start snapshot + agent_settled refresh); render stays sync and
-  // only reads this cache. "disabled" means cwd is not a git worktree — the
-  // segment stays hidden instead of erroring.
-  type LiveGitCounts = {
-    disabled: false;
-    root: string; // git toplevel; porcelain paths are relative to this
-    startHashes: Map<string, string> | undefined; // undefined = baseline hashing failed/paused; dirty-only display
-    lastHead: string | undefined; // attribution window start; the empty tree when unborn; undefined only while paused
-    lastDirty: Set<string>;
-    touched: Set<string>;
-    dirty: number;
-    session: number;
-  };
-  /** A live state with a usable content baseline and attribution window. */
-  const isSeeded = (
-    counts: LiveGitCounts | undefined,
-  ): counts is LiveGitCounts & {
-    startHashes: Map<string, string>;
-    lastHead: string;
-  } =>
-    counts !== undefined &&
-    counts.startHashes !== undefined &&
-    counts.lastHead !== undefined;
-  let gitCounts: { disabled: true } | LiveGitCounts | undefined;
   // Captured by the widget factory so async refreshes can force a repaint —
   // render() is only invoked on TUI-driven redraws otherwise.
   let widgetTui: TUI | undefined;
-  // Live-session count for the widget header: distinct identities fresh in
-  // the per-session liveness sidecar (live/<identity>.<sessionId>.json,
-  // heartbeat-driven),
-  // plus this session (see liveSessionCount). Kept fresh by fs.watch (peer
-  // enter/exit/write) and agent_settled; render stays sync and only reads
-  // this cache. Undefined until the first refresh lands.
-  let liveSessions: { count: number } | undefined;
-  // Liveness sidecar wiring — session-scoped, all (re)set in restore() and
-  // torn down in session_shutdown.
-  let liveHeartbeat: ReturnType<typeof setInterval> | undefined;
-  let liveWatchers: FSWatcher[] = [];
-  let liveRefreshTimer: ReturnType<typeof setTimeout> | undefined;
-  // Set when a watcher event asked for a board re-fold during the debounce
-  // window (OR-merged across sources); cleared when the refresh runs.
-  let liveRefreshNeedsFold = false;
-  // This session's liveness file path — computed ONCE in restore(). The
-  // empty-session-id fallback is a fresh random UUID and identity can change
-  // mid-session, so recomputing per call would churn the filename every
-  // heartbeat and strand the record past clean exit.
-  let selfLivePath: string | undefined;
-  // Sequence token guarding refreshGitCounts write-backs (see above).
-  let gitRefreshSeq = 0;
-
-  const git = (cwd: string, args: string[]): Promise<string | undefined> =>
-    new Promise((resolve) => {
-      execFile(
-        "git",
-        args,
-        { cwd, encoding: "utf8", maxBuffer: 16 * 1024 * 1024 },
-        (error, stdout) => resolve(error === null ? stdout : undefined),
-      );
-    });
-
-  const gitStdin = (
-    cwd: string,
-    args: string[],
-    stdin: string,
-  ): Promise<string | undefined> =>
-    new Promise((resolve) => {
-      const child = execFile(
-        "git",
-        args,
-        { cwd, encoding: "utf8", maxBuffer: 16 * 1024 * 1024 },
-        (error, stdout) => resolve(error === null ? stdout : undefined),
-      );
-      child.stdin?.on("error", () => {});
-      child.stdin?.end(stdin);
-    });
-
-  // git's canonical empty tree — startHead stand-in for an unborn HEAD.
-  const EMPTY_TREE_HASH = "4b825dc642cb6eb9a060e54bf8d69288fbee4904";
-  // Hashing cost must stay bounded: the widget refreshes after every settled
-  // agent run, so a huge untracked tree must not be stat'ed + hashed each
-  // time. Past the cap the session viewpoint pauses (keeps its last count)
-  // while dirty stays correct.
-  const MAX_HASHED_PATHS = 2000;
-
-  // `git hash-object --stdin-paths` splits stdin on newlines and C-unquotes
-  // lines starting with `"` — encode such paths so they survive round-trip.
-  const hashStdinLine = (path: string): string =>
-    path.startsWith('"')
-      ? `"${path.replace(/\\/g, "\\\\").replace(/"/g, '\\"')}"`
-      : path;
-
-  const hashPaths = async (
-    root: string,
-    paths: string[],
-  ): Promise<Map<string, string> | undefined> => {
-    const hashes = new Map<string, string>();
-    if (paths.length > MAX_HASHED_PATHS) return undefined;
-    const files: string[] = [];
-    const lines: string[] = [];
-    for (const path of paths) {
-      try {
-        if (statSync(join(root, path)).isFile()) {
-          if (path.includes("\n")) {
-            // cannot cross the line-based stdin-paths protocol; baseline and
-            // current both see ABSENT, so it just never counts
-            hashes.set(path, ABSENT_HASH);
-          } else {
-            files.push(path);
-            lines.push(hashStdinLine(path));
-          }
-        } else {
-          hashes.set(path, ABSENT_HASH);
-        }
-      } catch {
-        hashes.set(path, ABSENT_HASH);
-      }
-    }
-    if (files.length === 0) return hashes;
-    const out = await gitStdin(
-      root,
-      ["hash-object", "--stdin-paths"],
-      `${lines.join("\n")}\n`,
-    );
-    if (out === undefined) return undefined;
-    const zipped = zipHashObject(files, out);
-    if (zipped === undefined) return undefined;
-    for (const [path, hash] of zipped) hashes.set(path, hash);
-    return hashes;
-  };
-
-  /** HEAD blob names for committed paths; a missing blob becomes ABSENT. */
-  const headBlobHashes = async (
-    root: string,
-    paths: string[],
-  ): Promise<Map<string, string> | undefined> => {
-    const hashes = new Map<string, string>();
-    const send: string[] = [];
-    for (const path of paths) {
-      if (path.includes("\n")) hashes.set(path, ABSENT_HASH);
-      else send.push(path);
-    }
-    if (send.length === 0) return hashes;
-    const out = await gitStdin(
-      root,
-      ["cat-file", "--batch-check=%(objectname)"],
-      `${send.map((path) => `HEAD:${path}`).join("\n")}\n`,
-    );
-    if (out === undefined) return undefined;
-    const lines = out === "" ? [] : out.replace(/\n$/, "").split("\n");
-    if (lines.length !== send.length) return undefined;
-    for (let i = 0; i < send.length; i++) {
-      // missing entries echo "<request> missing" instead of an object name
-      hashes.set(
-        send[i],
-        lines[i].startsWith("HEAD:") ? ABSENT_HASH : lines[i],
-      );
-    }
-    return hashes;
-  };
-
-  const writeLive = (
-    root: string,
-    startHashes: Map<string, string>,
-    lastHead: string,
-    lastDirty: Set<string>,
-    touched: Set<string>,
-    dirty: number,
-  ): void => {
-    gitCounts = {
-      disabled: false,
-      root,
-      startHashes,
-      lastHead,
-      lastDirty,
-      touched,
-      dirty,
-      session: touched.size,
-    };
-  };
-
-  const headMovedExternally = async (
-    root: string,
-    from: string,
-    to: string,
-  ): Promise<boolean> => {
-    // Non-ancestor move (diverged pull / rebase / branch switch) first: when
-    // `from` is not an ancestor of `to`, nothing in from..to is this
-    // session's own forward progress. A small *diverged* switch (no merge,
-    // few commits) has no merge/count signal — only ancestry exposes it.
-    // `git merge-base --is-ancestor` exits 1 (not an ancestor) without
-    // stdout, so our git() wrapper yields undefined → external (re-anchor),
-    // as does a real git error. A *descendant* branch switch (from is an
-    // ancestor) with few commits is the accepted blind spot — same signal
-    // profile as a fast-forward pull, and ref-tracking would mislabel a
-    // session-created branch as external.
-    //
-    // Unborn baseline: `from` is the empty tree, not a commit.
-    // `merge-base --is-ancestor` exits 128 and would drop this session's
-    // first commit from `mine`. Skip ancestry only; merge/count still
-    // distinguish a large pull into a fresh repo from a single first commit.
-    if (from !== EMPTY_TREE_HASH) {
-      const ancestor = await git(root, [
-        "merge-base",
-        "--is-ancestor",
-        from,
-        to,
-      ]);
-      if (ancestor === undefined) return true;
-    }
-    const merges = await git(root, [
-      "rev-list",
-      "--merges",
-      "--count",
-      `${from}..${to}`,
-    ]);
-    if (merges === undefined) return true;
-    const count = await git(root, ["rev-list", "--count", `${from}..${to}`]);
-    if (count === undefined) return true;
-    return headMoveIsExternal({
-      ancestor: true, // ancestry succeeded, or from is the empty tree
-      merges: Number.parseInt(merges.trim(), 10),
-      commits: Number.parseInt(count.trim(), 10),
-    });
-  };
-
-  /** First observation (or re-seed after a paused state): hash the dirty
-   * worktree, freeze the attribution window at the current HEAD (unborn →
-   * the empty tree). On hash failure/cap keep the dirty count visible and
-   * retry the baseline on a later refresh. */
-  const seedGitCounts = async (
-    root: string,
-    seq: number,
-    dirtyPaths: string[],
-    existing?: LiveGitCounts,
-  ): Promise<void> => {
-    const currentHashes = await hashPaths(root, dirtyPaths);
-    if (seq !== gitRefreshSeq) return;
-    if (currentHashes === undefined) {
-      if (existing === undefined) {
-        gitCounts = {
-          disabled: false,
-          root,
-          startHashes: undefined,
-          lastHead: undefined,
-          lastDirty: new Set(dirtyPaths),
-          touched: new Set(),
-          dirty: dirtyPaths.length,
-          session: 0,
-        };
-      } else {
-        gitCounts = { ...existing, dirty: dirtyPaths.length };
-      }
-      return;
-    }
-    const lastHead =
-      (await git(root, ["rev-parse", "--verify", "HEAD"]))?.trim() ??
-      EMPTY_TREE_HASH;
-    if (seq !== gitRefreshSeq) return;
-    writeLive(
-      root,
-      currentHashes,
-      lastHead,
-      new Set(dirtyPaths),
-      new Set(),
-      dirtyPaths.length,
-    );
-  };
-
-  const refreshGitCounts = async (cwd: string): Promise<void> => {
-    if (gitCounts?.disabled) return;
-    const seq = ++gitRefreshSeq;
-    const existing =
-      gitCounts === undefined || gitCounts.disabled ? undefined : gitCounts;
-    const root =
-      existing?.root ??
-      (await git(cwd, ["rev-parse", "--show-toplevel"]))?.trim();
-    if (seq !== gitRefreshSeq) return;
-    if (!root) {
-      // Transient failure — retry on the next refresh; only a non-worktree
-      // cwd disables the segment.
-      const inside = await git(cwd, ["rev-parse", "--is-inside-work-tree"]);
-      if (seq !== gitRefreshSeq) return;
-      if (inside?.trim() !== "true") gitCounts = { disabled: true };
-      return;
-    }
-    // Run from the toplevel so paths are root-relative regardless of the
-    // status.relativePaths config; -z keeps raw path bytes (no C-quoting) and
-    // -uall expands untracked directories to file granularity.
-    const porcelain = await git(root, ["status", "--porcelain", "-z", "-uall"]);
-    if (seq !== gitRefreshSeq) return;
-    if (porcelain === undefined) {
-      if (existing !== undefined) return;
-      const inside = await git(root, ["rev-parse", "--is-inside-work-tree"]);
-      if (seq !== gitRefreshSeq) return;
-      if (inside?.trim() !== "true") gitCounts = { disabled: true };
-      return;
-    }
-    const { changed, untracked, renamed } = parsePorcelain(porcelain);
-    const dirtyPaths = [...changed, ...untracked];
-    if (!isSeeded(existing)) {
-      await seedGitCounts(root, seq, dirtyPaths, existing);
-      return;
-    }
-    await attributeGitCounts(root, seq, existing, dirtyPaths, renamed);
-  };
-
-  /** Steady state: fold worktree hash deltas and the commit window
-   * lastHead..HEAD into the persistent touched set. */
-  const attributeGitCounts = async (
-    root: string,
-    seq: number,
-    existing: LiveGitCounts & {
-      startHashes: Map<string, string>;
-      lastHead: string;
-    },
-    dirtyPaths: string[],
-    renamed: ReadonlyMap<string, string>,
-  ): Promise<void> => {
-    const currentSet = new Set(dirtyPaths);
-    const currentHashes = await hashPaths(root, dirtyPaths);
-    if (seq !== gitRefreshSeq) return;
-    if (currentHashes === undefined) {
-      gitCounts = { ...existing, dirty: dirtyPaths.length };
-      return;
-    }
-    const left = leftDirtyPaths(existing.lastDirty, currentSet, renamed);
-    const leftHashes =
-      left.length === 0
-        ? new Map<string, string>()
-        : await hashPaths(root, left);
-    if (seq !== gitRefreshSeq) return;
-    if (leftHashes === undefined) {
-      gitCounts = { ...existing, dirty: dirtyPaths.length };
-      return;
-    }
-    // Fold commits since the last refresh: catches content changed *and*
-    // committed between two refreshes (never visible in lastDirty).
-    const head = (await git(root, ["rev-parse", "--verify", "HEAD"]))?.trim();
-    if (seq !== gitRefreshSeq) return;
-    const window = await commitWindow(root, existing.lastHead, head);
-    if (seq !== gitRefreshSeq) return;
-    if (window === undefined) {
-      gitCounts = { ...existing, dirty: dirtyPaths.length };
-      return;
-    }
-    // Worktree hashes for paths that left the dirty set (deleted, or
-    // committed and untouched since) join the HEAD roster.
-    for (const [path, hash] of leftHashes) {
-      if (!window.hashes.has(path)) window.hashes.set(path, hash);
-    }
-    const touched = new Set(existing.touched);
-    for (const path of sessionTouchedDelta(
-      currentHashes,
-      existing.startHashes,
-      window.hashes,
-    )) {
-      touched.add(path);
-    }
-    writeLive(
-      root,
-      existing.startHashes,
-      window.head,
-      currentSet,
-      touched,
-      dirtyPaths.length,
-    );
-  };
-
-  /** Resolve the roster of commits since the last refresh. External HEAD
-   * movement (pull / rebase / branch switch) re-anchors the window instead
-   * of folding foreign work into sess. */
-  const commitWindow = async (
-    root: string,
-    lastHead: string,
-    head: string | undefined,
-  ): Promise<{ hashes: Map<string, string>; head: string } | undefined> => {
-    if (head === undefined || head === lastHead) {
-      return { hashes: new Map(), head: lastHead };
-    }
-    if (await headMovedExternally(root, lastHead, head)) {
-      return { hashes: new Map(), head };
-    }
-    const diffOut = await git(root, [
-      "diff",
-      "--name-only",
-      "-z",
-      lastHead,
-      head,
-    ]);
-    if (diffOut === undefined) return undefined;
-    const hashes = await headBlobHashes(root, parseDiffNames(diffOut));
-    if (hashes === undefined) return undefined;
-    return { hashes, head };
-  };
-
-  /** Reset the git viewpoint (new session / shutdown); supersedes in-flight refreshes. */
-  const resetGitCounts = (): void => {
-    gitRefreshSeq += 1;
-    gitCounts = undefined;
-    // Same lifecycle as the git viewpoint: a stale count from the previous
-    // session must not outlive the restore that recomputes it.
-    liveSessions = undefined;
-  };
-
-  // --- Liveness sidecar (per-session files + heartbeat + fs.watch) ---------
-  //
-  // Liveness is a different signal from board activity ("process running"
-  // vs "touched the board"), so it lives in its own channel: each session
-  // owns exactly one file `~/.pi/tower-do/<project>/live/<identity>.<sessionId>.json`
-  // rewritten on a heartbeat cadence and deleted on clean exit. Own-file
-  // writes never contend cross-process; exit is a delete, a crash expires
-  // via LIVE_WINDOW_MS. fs.watch makes peer enter/exit/write visible within
-  // one debounce tick instead of at our next settle.
-
-  const liveDirFor = (cwd: string): string =>
-    join(dirname(boards.entryFor(cwd).board.file), "live");
-
-  /** Filename-safe component (identities/session ids are human-chosen). */
-  const sanitizeLiveName = (s: string): string =>
-    s.replace(/[^A-Za-z0-9._-]/g, "_").slice(0, MAX_IDENTITY_CHARS) || "x";
-
-  const selfSessionId = (ctx?: ExtensionContext): string => {
-    const manager = ctx?.sessionManager ?? selfCtx?.sessionManager;
-    // Call the method BOUND to the manager: extracting it into a local first
-    // (unbound call) makes `this` undefined inside pi's SessionManager and
-    // crashes with "undefined is not an object (evaluating 'this.sessionId')".
-    const id =
-      typeof manager?.getSessionId === "function"
-        ? (manager.getSessionId() ?? "")
-        : "";
-    return id === "" ? randomUUID().slice(0, 8) : id;
-  };
-
-  /** Rewrite this session's liveness record (temp + rename, own file at the
-   * stable selfLivePath). Best-effort: a failed write degrades to self-only
-   * counting via the liveSessionCount `self` union, never a wrong peer
-   * count. Serialized below: the heartbeat and a fresh `as` alias write can
-   * be in flight together, and an older snapshot's rename landing last would
-   * silently drop the alias — an alive owner could then look stale to the
-   * takeover gate. */
-  const writeSelfLiveOnce = async (cwd: string): Promise<void> => {
-    if (selfLivePath === undefined) return;
-    try {
-      await mkdir(dirname(selfLivePath), { recursive: true });
-      const tmp = `${selfLivePath}.${randomUUID()}.tmp`;
-      await writeFile(
-        tmp,
-        JSON.stringify({
-          identity: sessionIdentity(cwd, pi, selfCtx),
-          at: Date.now(),
-        }),
-      );
-      await rename(tmp, selfLivePath);
-    } catch {
-      // Best-effort by design (see above).
-    }
-  };
-
-  // One promise chain per session: own-file writes never overlap, so the
-  // last queued snapshot (the newest alias set) is the one that lands.
-  let liveWriteChain: Promise<void> = Promise.resolve();
-  const writeSelfLive = (cwd: string): void => {
-    liveWriteChain = liveWriteChain
-      .then(() => writeSelfLiveOnce(cwd))
-      .catch(() => {});
-  };
-
-  /** Live-session count from the liveness sidecar: distinct identities with
-   * a record no older than LIVE_WINDOW_MS, plus this session. Boardless
-   * directories have nothing to be live about — the segment stays hidden
-   * there instead of showing a meaningless `live 1` everywhere. */
-  const refreshLiveSessions = async (cwd: string): Promise<void> => {
-    const boardEntry = boards.entryFor(cwd);
-    if (!existsSync(boardEntry.board.file)) {
-      liveSessions = undefined;
-      return;
-    }
-    const records: LiveRecord[] = [];
-    try {
-      const dir = liveDirFor(cwd);
-      const now = Date.now();
-      for (const name of await readdir(dir)) {
-        // Only .json counts: skips .tmp rename intermediates of peers.
-        if (!name.endsWith(".json")) continue;
-        const path = join(dir, name);
-        try {
-          const record = parseLiveRecord(await readFile(path, "utf8"));
-          if (record === undefined) continue;
-          if (record.at < now - LIVE_PRUNE_MS) {
-            // Crashed-session residue. Unlink far beyond the window so a
-            // slow heartbeat or modest clock skew cannot prune a live peer;
-            // never our own file.
-            if (path !== selfLivePath) void unlink(path).catch(() => {});
-            continue;
-          }
-          records.push(record);
-        } catch {
-          // Unreadable file: skip it.
-        }
-      }
-    } catch {
-      // No live dir yet (first session in this project): only self.
-    }
-    // Restore may have switched projects while this refresh was in flight;
-    // a stale count from another board must not land.
-    if (activeCwd !== cwd) return;
-    liveSessions = {
-      count: liveSessionCount(records, sessionIdentity(cwd, pi, selfCtx), Date.now()),
-    };
-  };
-
-  const stopLiveWatchers = (): void => {
-    if (liveRefreshTimer !== undefined) {
-      clearTimeout(liveRefreshTimer);
-      liveRefreshTimer = undefined;
-    }
-    if (liveHeartbeat !== undefined) {
-      clearInterval(liveHeartbeat);
-      liveHeartbeat = undefined;
-    }
-    for (const watcher of liveWatchers) {
-      try {
-        watcher.close();
-      } catch {
-        // Already closed.
-      }
-    }
-    liveWatchers = [];
-    liveRefreshNeedsFold = false;
-    selfLivePath = undefined;
-  };
-
-  /** Coalesce fs.watch bursts into one refresh. `foldBoard` requests a
-   * board re-fold (peer task writes); live-dir events (heartbeats, peer
-   * enter/exit) only refresh the count — folding a growing board on every
-   * 30s heartbeat of every peer would be pure churn. */
-  const scheduleLiveRefresh = (foldBoard: boolean): void => {
-    if (foldBoard) liveRefreshNeedsFold = true;
-    if (liveRefreshTimer !== undefined) return;
-    liveRefreshTimer = setTimeout(() => {
-      liveRefreshTimer = undefined;
-      const needsFold = liveRefreshNeedsFold;
-      liveRefreshNeedsFold = false;
-      if (activeCwd === undefined) return;
-      void (async () => {
-        const entry = boards.entryFor(activeCwd);
-        if (needsFold && existsSync(entry.board.file)) {
-          try {
-            currentView = await foldRetained(activeCwd);
-          } catch {
-            // Display cache only: keep the previous view on a failed fold.
-          }
-        }
-        await refreshLiveSessions(activeCwd);
-        updateWidget();
-        widgetTui?.requestRender();
-      })();
-    }, 250);
-  };
-
-  const startLiveWatchers = (cwd: string): void => {
-    const towerDir = dirname(boards.entryFor(cwd).board.file);
-    const watchDir = (
-      target: string,
-      foldBoard: boolean,
-      filter?: (name: string) => boolean,
-    ): void => {
-      try {
-        const watcher = watch(target, (_event, filename) => {
-          const name = filename === null ? undefined : filename.toString();
-          if (name !== undefined && filter && !filter(name)) return;
-          scheduleLiveRefresh(foldBoard);
-        });
-        watcher.on("error", () => {
-          // Best-effort: a failed watcher falls back to the old
-          // settle-driven refresh cadence.
-          try {
-            watcher.close();
-          } catch {
-            // Already closed.
-          }
-        });
-        liveWatchers.push(watcher);
-      } catch {
-        // Missing dir (first session) or unsupported platform: same fallback.
-      }
-    };
-    watchDir(liveDirFor(cwd), false);
-    watchDir(towerDir, true, (name) => name === "board.jsonl");
-  };
-
-  const startLiveHeartbeat = (cwd: string): void => {
-    writeSelfLive(cwd);
-    if (liveHeartbeat !== undefined) clearInterval(liveHeartbeat);
-    liveHeartbeat = setInterval(() => {
-      if (activeCwd === undefined) return;
-      writeSelfLive(activeCwd);
-    }, LIVE_HEARTBEAT_MS);
-    liveHeartbeat.unref?.();
-  };
-
-  /** Set up the session-scoped liveness wiring once, and only against a
-   * board that exists: without a board there is no live segment, and
-   * heartbeat files would pollute non-tower projects. Re-invoked from
-   * agent_settled so a board created mid-session (first tower_do call in a
-   * fresh project) still joins the live channel. */
-  const startLiveWiring = (cwd: string, ctx?: ExtensionContext): void => {
-    if (selfLivePath !== undefined) return;
-    if (!existsSync(boards.entryFor(cwd).board.file)) return;
-    selfLivePath = join(
-      liveDirFor(cwd),
-      `${sanitizeLiveName(sessionIdentity(cwd, pi, selfCtx))}.${sanitizeLiveName(selfSessionId(ctx))}.json`,
-    );
-    // The live dir must exist before watch(): the first session in a project
-    // would otherwise miss its watcher forever (ENOENT swallowed, never
-    // retried). Not writable: skip the whole channel (best-effort liveness —
-    // peers still count us via the liveSessionCount self union).
-    try {
-      mkdirSync(liveDirFor(cwd), { recursive: true });
-    } catch {
-      selfLivePath = undefined;
-      return;
-    }
-    startLiveHeartbeat(cwd);
-    startLiveWatchers(cwd);
-  };
 
   const clearWidget = (): void => {
     if (widgetRegistered && uiContext?.hasUI) {
@@ -1365,12 +714,9 @@ export default function towerDoExtension(pi: ExtensionAPI): void {
   const updateWidget = (ctx?: ExtensionContext): void => {
     if (ctx) uiContext = ctx;
     if (!uiContext?.hasUI || uiContext.mode !== "tui") return;
-    // The widget survives an empty board: the git and live segments are
-    // independent of board content and should stay visible. Only when there
-    // is nothing to render in any segment is there no widget at all.
-    // Gate every segment on its rendered string, not data availability: a
-    // completed-only board or a clean repo both yield an empty string and
-    // would otherwise register a permanently blank widget.
+    // The widget shows the current workload only. Gate it on the rendered
+    // string, not on data availability: an empty board (and a completed-only
+    // board) yields an empty segment and must not register a blank widget.
     const tasks = getAllTasks(currentView);
     const unfinished = tasks.filter((task) => task.status !== "completed");
     const blocked = unfinished.filter((task) =>
@@ -1385,13 +731,7 @@ export default function towerDoExtension(pi: ExtensionAPI): void {
       blocked.length,
       unread,
     );
-    const gitSegment =
-      gitCounts !== undefined && !gitCounts.disabled
-        ? formatGitSegment(gitCounts.dirty, gitCounts.session)
-        : "";
-    const liveSegment =
-      liveSessions === undefined ? "" : formatLiveSegment(liveSessions.count);
-    if (boardSegment === "" && gitSegment === "" && liveSegment === "") {
+    if (boardSegment === "") {
       clearWidget();
       return;
     }
@@ -1407,27 +747,6 @@ export default function towerDoExtension(pi: ExtensionAPI): void {
               const blocked = unfinished.filter((task) =>
                 taskIsBlocked(task, currentView),
               );
-              const gitSegment =
-                gitCounts !== undefined && !gitCounts.disabled
-                  ? formatGitSegment(
-                      gitCounts.dirty,
-                      gitCounts.session,
-                      (n, which) =>
-                        theme.fg(
-                          which === "dirty" ? "warning" : "accent",
-                          theme.bold(String(n)),
-                        ),
-                      (s) => theme.fg("dim", s),
-                    )
-                  : "";
-              const liveSegment =
-                liveSessions === undefined
-                  ? ""
-                  : formatLiveSegment(
-                      liveSessions.count,
-                      (n) => theme.fg("success", theme.bold(String(n))),
-                      (s) => theme.fg("dim", s),
-                    );
               const identity = sessionIdentity(activeCwd, pi, selfCtx);
               const inboxForMe = unreadMessagesToMe(
                 currentView,
@@ -1436,7 +755,7 @@ export default function towerDoExtension(pi: ExtensionAPI): void {
               // Progress counts remaining work only: completed rows (often
               // pinned by the owner guard / dependsOn) never appear in the
               // glance, and neither does the monotonic CAS revision.
-              let header = formatBoardProgress(
+              const header = formatBoardProgress(
                 unfinished.length,
                 blocked.length,
                 inboxForMe,
@@ -1454,22 +773,10 @@ export default function towerDoExtension(pi: ExtensionAPI): void {
                     ? theme.fg("accent", theme.bold(s))
                     : theme.fg("dim", s),
               );
-              if (liveSegment !== "") {
-                header +=
-                  (header === "" ? "" : theme.fg("dim", " │ ")) + liveSegment;
-              }
-              if (gitSegment !== "") {
-                header +=
-                  (header === "" ? "" : theme.fg("dim", " │ ")) + gitSegment;
-              }
               const lines = [header];
               // WIDGET_TASK_LIMIT caps how many unfinished tasks the
-              // above-editor line shows; the rest fold into an overflow note.
-              // Rows are layered (mine → needs → other) and recency-first, so
-              // the cap shows the work the caller is in before peers. Counts
-              // stay board-wide.
-              // Show the most recently updated open tasks; the rest fold into
-              // one overflow line that still names their keys.
+              // above-editor line shows; the rest fold into one overflow line
+              // that still names their keys.
               const ordered = [...unfinished].sort(
                 (a, b) => b.updatedAt - a.updatedAt || (a.key < b.key ? -1 : 1),
               );
@@ -2462,28 +1769,7 @@ export default function towerDoExtension(pi: ExtensionAPI): void {
     currentView = await foldRetained(ctx.cwd);
     llmCallsSinceReminder = 0;
     uiContext = ctx;
-    // New session ⇒ new viewpoint: drop the previous session's counts
-    // *before* the first paint so /tree cannot flash a stale git segment.
-    // Also restart the liveness sidecar wiring: pi fires session_shutdown
-    // for the old instance before session_start/session_tree, but a
-    // defensive stop keeps double-restore idempotent.
-    stopLiveWatchers();
-    resetGitCounts();
     updateWidget(ctx);
-    void Promise.all([
-      refreshGitCounts(ctx.cwd),
-      refreshLiveSessions(ctx.cwd),
-    ]).then(() => {
-      updateWidget();
-      widgetTui?.requestRender();
-    });
-    // Announce self and stay fresh: the heartbeat makes this session visible
-    // to peers regardless of board activity; the watchers make peer
-    // enter/exit/write visible to us within one debounce tick. Gated on an
-    // existing board — see startLiveWiring.
-    startLiveWiring(ctx.cwd, ctx);
-    // Session boundary is the natural time to reclaim a board log that grew
-    // past the compaction threshold in an earlier session.
   };
 
   pi.on("session_start", async (_event, ctx) => {
@@ -2493,32 +1779,19 @@ export default function towerDoExtension(pi: ExtensionAPI): void {
     await restore(ctx);
   });
 
-  // Refresh dirty/session counts after each settled agent run (post-retry,
-  // cheaper and steadier than per-turn). TUI mode only — print/RPC never has
-  // a widget. Runs even when the widget is not (yet) registered: the git
-  // segment must initialize on an empty board too.
+  // Repaint after each settled agent run so peer board writes show up in the
+  // widget. TUI mode only — print/RPC never has a widget.
   pi.on("agent_settled", async () => {
-    // Late wiring: a board created mid-session (first tower_do call) still
-    // joins the live channel — cheap no-op once wired.
-    if (activeCwd !== undefined) startLiveWiring(activeCwd);
-    // A long session can outgrow the threshold between session starts; the
-    // settle boundary is the cheapest safe place to reclaim it (never during
-    // a write, and the compact takes the board lease itself).
-    if (activeCwd !== undefined && uiContext !== undefined) {
-    }
     if (
       uiContext?.mode !== "tui" ||
       !uiContext?.hasUI ||
       activeCwd === undefined
     )
       return;
-    // Peer cancels must show up without waiting for a tool call.
     const settledEntry = boards.entryFor(activeCwd);
     if (existsSync(settledEntry.board.file)) {
       currentView = await foldRetained(activeCwd);
     }
-    await refreshGitCounts(activeCwd);
-    await refreshLiveSessions(activeCwd);
     updateWidget();
     widgetTui?.requestRender();
   });
@@ -2575,18 +1848,11 @@ export default function towerDoExtension(pi: ExtensionAPI): void {
   });
 
   pi.on("session_shutdown", () => {
-    // Exit signal first (delete while selfLivePath is still known), then
-    // tear down the session-scoped wiring.
-    if (selfLivePath !== undefined) {
-      void unlink(selfLivePath).catch(() => {});
-    }
-    stopLiveWatchers();
     clearWidget();
     uiContext = undefined;
     selfCtx = undefined;
     activeCwd = undefined;
     currentView = createEmptyBoard();
-    resetGitCounts();
     llmCallsSinceReminder = 0;
     // Re-resolve project roots next session: the filesystem may have gained
     // or lost a `.git` boundary since this session started (e.g. `git init`

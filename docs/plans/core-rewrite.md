@@ -47,7 +47,7 @@
 | P3d 删 layers/presence + 收敛 status | `rw-view` | done |
 | P4a 消息投递（D2） | `rw-msg` | done |
 | P4b 身份（D4） | `rw-identity` | done |
-| P5 UI（D3） | `rw-ux` | open |
+| P5 UI（D3） | `rw-ux` | done |
 | P6 文档 | `rw-docs` | open |
 | P7 清理 | `rw-cleanup` | open |
 
