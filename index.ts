@@ -34,7 +34,6 @@
 
 import { StringEnum } from "@earendil-works/pi-ai";
 import {
-  CONFIG_DIR_NAME,
   DEFAULT_MAX_BYTES,
   DEFAULT_MAX_LINES,
   keyHint,
@@ -46,17 +45,13 @@ import {
 } from "@earendil-works/pi-coding-agent";
 import { Text, truncateToWidth, type TUI } from "@earendil-works/pi-tui";
 import {
-  cpSync,
   existsSync,
-  mkdirSync,
   readFileSync,
-  renameSync,
-  rmSync,
   statSync,
 } from "node:fs";
 import { createHash, randomUUID } from "node:crypto";
 import { homedir } from "node:os";
-import { basename, dirname, join, resolve } from "node:path";
+import { basename, dirname, join } from "node:path";
 import { Type } from "typebox";
 
 import {
@@ -236,63 +231,6 @@ function loadConfig(): TowerDoConfig {
   }
 }
 
-/** One-time migration from the retired per-project layout: move the legacy
- * state dir wholesale into the global records home so no task/history data
- * is silently abandoned and no session gets bricked by a leftover. A pinned
- * identity rides along to the global config path unless the user already has
- * one there — BEFORE any board logic, so a config-only leftover still
- * reaches the global path even when the state dir was already migrated (the
- * retired layout documented config.json as safe to commit, so it can
- * reappear from git). If the target already exists, leftover project dirs
- * are ignored: the global records home is authoritative. */
-function migrateLegacyState(cwd: string): void {
-  const legacy = join(projectRoot(cwd), CONFIG_DIR_NAME, "tower-do");
-  if (resolve(legacy) === resolve(homeDir(), ".pi", "tower-do")) return;
-  if (!existsSync(legacy)) return;
-  const legacyConfig = join(legacy, "config.json");
-  const globalConfig = configFile();
-  if (existsSync(legacyConfig) && !existsSync(globalConfig)) {
-    mkdirSync(dirname(globalConfig), { recursive: true });
-    try {
-      moveDir(legacyConfig, globalConfig);
-    } catch (error) {
-      throw new Error(
-        `tower-do config ${legacyConfig} could not be migrated to ${globalConfig}: ${error instanceof Error ? error.message : String(error)}`,
-      );
-    }
-  }
-  const target = stateDirFor(cwd);
-  if (existsSync(target)) return;
-  try {
-    mkdirSync(dirname(target), { recursive: true });
-    moveDir(legacy, target);
-  } catch (error) {
-    // Silent abandonment would drop a pinned identity / task history — the
-    // exact silent-wrong class this extension exists to prevent. Fail loud
-    // with both paths; the user can fix the filesystem issue and retry.
-    throw new Error(
-      `tower-do state ${legacy} could not be migrated to ${target}: ${error instanceof Error ? error.message : String(error)}`,
-    );
-  }
-}
-
-/** Move a file or directory across the migration boundary. rename(2) is
- * atomic but fails with EXDEV when the project and $HOME live on different
- * filesystems; fall back to copy + remove only for that case. If `to`
- * already exists (lost the race with another session), leave the source
- * unread — the global path is authoritative and leftover project dirs
- * must not brick or overwrite. */
-function moveDir(from: string, to: string): void {
-  try {
-    renameSync(from, to);
-  } catch (error) {
-    if (existsSync(to)) return;
-    if ((error as NodeJS.ErrnoException).code !== "EXDEV") throw error;
-    cpSync(from, to, { recursive: true });
-    rmSync(from, { recursive: true, force: true });
-  }
-}
-
 class BoardCache {
   private readonly entries = new Map<string, BoardEntry>();
 
@@ -300,7 +238,6 @@ class BoardCache {
     const file = boardFileFor(cwd);
     let entry = this.entries.get(file);
     if (entry === undefined) {
-      migrateLegacyState(cwd);
       entry = {
         board: new TowerBoard(file),
         config: loadConfig(),
@@ -1073,8 +1010,7 @@ export default function towerDoExtension(pi: ExtensionAPI): void {
             "send recipient must be a single line",
           );
         }
-        // Same agent, not just the same string: a session that migrated from a
-        // legacy label must not be able to address itself.
+        // Self-send is rejected: a session must not address itself.
         if (to === caller)
           throw new TowerDoValidationError(
             "cannot send an inbox message to yourself",

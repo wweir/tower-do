@@ -1401,8 +1401,7 @@ export function isStaleClaim(
 }
 
 /** Remediation hint attached to a full open-task budget (see writeBoardSnapshot):
- * what the caller can free, and how a board holding nothing but completed rows
- * is compacted. */
+ * what the caller can free before adding another row. */
 export const OPEN_TASK_BUDGET_HINT =
   ' — free a slot by completing or removing an existing open task (remove: ["key"]) first';
 

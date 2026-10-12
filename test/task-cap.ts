@@ -384,7 +384,7 @@ async function main(): Promise<void> {
         },
         "worker",
       ),
-    /omitting your own or an unowned task, or compact a finished board with an as: "tower" write/,
+    /free a slot by completing or removing an existing open task/,
   );
 
   // --- 6. Dependencies still resolve across the budget ---
