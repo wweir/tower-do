@@ -1,45 +1,32 @@
 /**
  * tower-do — shared multi-agent task board (disk layer).
  *
- * Load-bearing Tower design choice: the board is a plain append-only JSONL
- * file (one per project, under `~/.pi/tower-do/<slug>-<hash>/board.jsonl`),
- * i.e. file-as-state. Any agent
- * session or subagent that can read the file can see everyone's tasks, and any
- * writer appends events. Folding events yields the current view; the
- * monotonic `revision` is derived from the file (tool-read, never
- * self-reported) and backs the stale-write guard.
+ * The board is a plain append-only JSONL file (one per project, under
+ * `~/.pi/tower-do/<slug>-<hash>/board.jsonl`), i.e. file-as-state. Any agent
+ * session or subagent that can read the file sees the same tasks; folding the
+ * events yields the current view, and the monotonic `revision` is derived from
+ * the file (never self-reported) and backs the stale-write guard.
  *
- * Concurrency notes: appends are serialized per process on a promise chain and
- * written with a single `O_APPEND` `write` syscall (verified on Bun 1.4/linux:
- * a 2 MB payload is one `write(2)`), so a line cannot tear *in practice* — a
- * short write is still a POSIX possibility (signal, ENOSPC, NFS), and the two
- * halves would not be atomic as a pair. The lease, not that property, is what
- * serializes writers; the O_APPEND fallback only covers the unlocked degrade
- * path. One window no userspace lease can close: a holder paused past
- * STALE_LOCK_MS between the compact's final ownership proof and its rename.
- * The compact therefore re-proves the lease right AFTER the rename and, on a
- * steal, attempts a PROVABLE reconcile under a freshly taken lease (only when
- * the live file is still its compaction plus appends and the preserved log is
- * the fold's source plus appends) — `content + P + W`, P before W. When the
- * shape cannot be proved it fails loud and keeps the pre-compact log as a
- * hard-linked evidence file (`<board>.prev-*`, named in the error); it never
- * rolls the inode back, because a rollback could clobber writes the new
- * holder made after the rename. Across processes, `append` and `compact` both
- * take a per-board write
- * LEASE (a directory whose ownership is a token file inside it); the
- * `baseRevision` guard remains the conflict-awareness layer for decision
- * races that span a read-modify-append (see `withWriteLock`).
+ * Concurrency: appends are serialized per process on a promise chain and
+ * written as ONE `open(O_APPEND)` + `write(2)` call, so two processes appending
+ * concurrently cannot interleave inside a batch. There is no cross-process
+ * lease and no log compaction: the log only grows by the events actually
+ * written (one per changed entity), and folding a few hundred kilobytes is
+ * cheap. A future `gc` can be added with its own concurrency proof, but it is
+ * an optimisation, never a correctness requirement.
+ *
+ * Readers never lock and never mutate. `fold()` treats a missing file as an
+ * empty board; any other read error throws (an unreadable file must not look
+ * like a cleared board).
  */
 
-import { appendFile, link, lstat, mkdir, open, readdir, readFile, rename, rmdir, stat, unlink, utimes, writeFile } from "node:fs/promises";
-import { createHash, randomUUID } from "node:crypto";
-import { dirname, join } from "node:path";
+import { mkdir, open, readFile } from "node:fs/promises";
+import { dirname } from "node:path";
 
 import {
   createEmptyBoard,
   isEpochMs,
   isRecord,
-  MAX_BOARD_ARCHIVES,
   normalizeIdentity,
   readPersistedFinding,
   readPersistedMessage,
@@ -72,43 +59,39 @@ function errorCode(error: unknown): string | undefined {
     : undefined;
 }
 
-/** A held cross-process write lease. `assertHeld` re-proves ownership right
- *  before a mutation, so a holder that a peer reaped as stale (a long GC/
- *  debugger pause) fails loud instead of writing concurrently with the peer
- *  that took over — the failure the CAS in `compact` cannot detect. */
-interface BoardLease {
-  assertHeld(): Promise<void>;
+/** One O_APPEND write per batch: the kernel appends the whole buffer before
+ *  any other O_APPEND writer can, so a peer never sees half a batch. */
+async function appendBatch(file: string, text: string): Promise<void> {
+  await mkdir(dirname(file), { recursive: true });
+  const handle = await open(file, "a");
+  try {
+    await handle.write(text, null, "utf8");
+  } finally {
+    await handle.close();
+  }
 }
 
-/** Lease stand-in for an APPEND that could not lock at all (read-only dir):
- *  there is no lease to verify, and a single `O_APPEND` write stays atomic. */
-const UNLOCKED_LEASE: BoardLease = { assertHeld: async () => {} };
+const ignored: unique symbol = Symbol("ignored");
+type ReadEventResult = BoardEvent | typeof ignored | undefined;
 
-/** Cross-process lock timing (see TowerBoard.withLock).
- *
- * `LOCK_WAIT_MS` MUST exceed `STALE_LOCK_MS` (here by 5s): a waiter only sees a
- * dead holder's token as reapable one full staleness window after that holder's
- * `mkdir`, and two writers that arrive together (Tw ≈ Th, W having lost the
- * mkdir race) would otherwise reach their own deadline before reaping — timing
- * out with "locked by another writer" on exactly the crash-recovery path the
- * staleness rule exists for. */
-export const STALE_LOCK_MS = 30_000;
-export const LOCK_WAIT_MS = STALE_LOCK_MS + 5_000;
-const LOCK_RETRY_MS = 25;
-function readEvent(candidate: unknown): BoardEvent | undefined {
+function readEvent(candidate: unknown): ReadEventResult {
   if (!isRecord(candidate) || typeof candidate.kind !== "string")
     return undefined;
+  if (candidate.kind === "compact") {
+    // A pre-compaction header from an older writer. Compaction no longer
+    // exists, but old files open with one — it is valid and must not be
+    // counted as an unfoldable line.
+    return ignored;
+  }
   if (candidate.kind === "task") {
     if (candidate.op !== "upsert" && candidate.op !== "remove")
       return undefined;
     const key = typeof candidate.key === "string" ? candidate.key : undefined;
     const by = typeof candidate.by === "string" ? candidate.by : "?";
     // No `Date.now()` fallback: a task event's `at` IS the identity/ownership
-    // clock (the fold falls back to it for a missing `updatedAt`, and
-    // `staleTaskClaims` reads the result). Fabricating it would both make the
-    // fold non-deterministic — a different `updatedAt` on every read — and
-    // report a corrupt line as fresh, so the takeover window would never open.
-    // `parseActivityLine` rejects the same line; the two clocks must agree.
+    // clock (the fold falls back to it for a missing `updatedAt`). Fabricating
+    // it would make the fold non-deterministic between reads and report a
+    // corrupt line as permanently fresh.
     if (!isEpochMs(candidate.at)) return undefined;
     return { kind: "task", op: candidate.op, key, by, at: candidate.at };
   }
@@ -135,337 +118,10 @@ function readEvent(candidate: unknown): BoardEvent | undefined {
   return undefined;
 }
 
-/**
- * Keep the newest `MAX_BOARD_ARCHIVES` pre-compact logs under `dir` (by mtime)
- * and remove the rest. The compact writes one archive per run, so a cleanup
- * that never pruned them would just move the unbounded growth from
- * `board.jsonl` into `archive/`. `pinned` (this run's own archive) is never
- * removed — mtime ordering is an assumption, and a skewed clock (or a
- * restored archive set) must not delete the evidence of the swap that just
- * happened. Best-effort: the compaction has already swapped by the time this
- * runs, so a failed unlink must not fail the call.
- */
-async function pruneArchives(dir: string, pinned?: string): Promise<string[]> {
-  const removed: string[] = [];
-  let names: string[];
-  try {
-    names = await readdir(dir);
-  } catch {
-    return removed;
-  }
-  const files: { path: string; mtimeMs: number }[] = [];
-  for (const name of names) {
-    if (!name.endsWith(".jsonl")) continue;
-    const path = join(dir, name);
-    if (path === pinned) continue;
-    try {
-      const info = await stat(path);
-      if (info.isFile()) files.push({ path, mtimeMs: info.mtimeMs });
-    } catch {
-      // Raced away (a concurrent prune): skip it.
-    }
-  }
-  files.sort((a, b) => b.mtimeMs - a.mtimeMs);
-  // `pinned` counts against the retention budget even though it is exempt.
-  const budget = Math.max(0, MAX_BOARD_ARCHIVES - (pinned === undefined ? 0 : 1));
-  for (const { path } of files.slice(budget)) {
-    try {
-      await unlink(path);
-      removed.push(path);
-    } catch {
-      // Best-effort.
-    }
-  }
-  return removed;
-}
-
 export class TowerBoard {
   private chain: Promise<void> = Promise.resolve();
 
   constructor(readonly file: string) {}
-
-  /** Cross-process write LEASE: `<file>.lock` is a DIRECTORY (its creation via
-   * `mkdir` is atomic) holding a file named after this holder's random token.
-   * `append` and `compact` both take it, so a compaction can never race a peer
-   * append (previously a write landing between the CAS re-read and the rename
-   * went to the unlinked inode and was lost). While held, the holder refreshes
-   * its token file's mtime; only a token without a heartbeat for STALE_LOCK_MS
-   * may be removed. The directory mtime cannot decide staleness: between
-   * checking it and scanning its entries, a new owner may replace the directory.
-   *
-   * Release is safe by construction — which a `readFile` + `unlink` token check
-   * is NOT (it is a TOCTOU: a stalled holder that wakes up between the read and
-   * the unlink deletes the lease a peer just stole and recreated, re-opening
-   * the append-vs-rename window compact exists to close). A holder only ever
-   * (a) unlinks the file named after ITS OWN token, which a stealing peer
-   * already removed, and (b) calls `rmdir`, which refuses a non-empty
-   * directory — and the peer's token file keeps it non-empty. So a stolen
-   * holder's cleanup is a no-op instead of a takeover squash.
-   *
-   * Reads never lock (O_APPEND makes a single append atomic).
-   *
-   * ACQUISITION is proved by exclusivity, not by "the mkdir did not throw": a
-   * reaper that judged our (still empty) directory stale can `rmdir` it between
-   * our `mkdir` and our token write, and the write then lands inside the
-   * PEER's replacement directory without an error — two holders, the exact
-   * outcome this lease exists to prevent. So after writing the token the
-   * directory must hold exactly that token, or the token is an orphan and we
-   * retry. `assertHeld` re-runs the same proof before each mutation. */
-  private async withLock<T>(
-    run: (lease: BoardLease) => Promise<T>,
-    allowUnlocked = false,
-  ): Promise<T> {
-    const lock = `${this.file}.lock`;
-    const token = randomUUID();
-    const tokenFile = join(lock, token);
-    const deadline = Date.now() + LOCK_WAIT_MS;
-    try {
-      await mkdir(dirname(this.file), { recursive: true });
-    } catch {
-      // A directory we cannot create surfaces on the write itself below.
-    }
-    for (;;) {
-      // Deadline is checked EVERY iteration: the steal/back-off paths must not
-      // be able to spin forever.
-      if (Date.now() > deadline) {
-        throw new TowerDoValidationError(
-          "board is locked by another writer — retry shortly",
-        );
-      }
-      // `mkdir` is the atomic acquire: it either creates the lease directory or
-      // fails. Only `EEXIST` means "someone else holds it"; anything else (a
-      // missing parent, a non-directory on the path) is structural and must
-      // fail loud rather than masquerade as contention and spin to the
-      // deadline with a misleading "locked by another writer".
-      let created = false;
-      try {
-        await mkdir(lock);
-        created = true;
-      } catch (error) {
-        const code = errorCode(error);
-        if (code === "EACCES" || code === "EROFS" || code === "EPERM") {
-          // Locking is impossible (read-only dir / filesystem). An APPEND may
-          // degrade to unlocked (O_APPEND keeps a single append atomic), but a
-          // COMPACT must fail closed: running it unlocked would re-open the
-          // append-vs-rename window this lease exists to close.
-          if (allowUnlocked) return run(UNLOCKED_LEASE);
-        }
-        if (code !== "EEXIST") throw error;
-      }
-      let acquired = false;
-      if (created) {
-        let wrote = false;
-        try {
-          await writeFile(tokenFile, token, "utf8");
-          wrote = true;
-        } catch (error) {
-          // Clean up only a lease directory still holding nothing but our own
-          // (absent) token: a reaper may have replaced it already, and `rmdir`
-          // would then delete a PEER's lease.
-          // Unlink the token BEFORE rmdir: deleting an entry refreshes the
-          // directory mtime, and a leftover empty directory with a fresh mtime
-          // would not be reapable for a full STALE_LOCK_MS (spinning every
-          // waiter to the deadline on a lock nobody holds).
-          await unlink(tokenFile).catch(() => {});
-          const entries = await this.leaseEntries(lock);
-          if (entries !== undefined && entries.every((entry) => entry === token)) {
-            await rmdir(lock).catch(() => {});
-          }
-          const code = errorCode(error);
-          if (code === "EACCES" || code === "EROFS" || code === "EPERM") {
-            if (allowUnlocked) return run(UNLOCKED_LEASE);
-          }
-          // ONLY here can ENOENT mean contention: a stealer judged us stale and
-          // removed the directory between the mkdir and the token write. Retry
-          // instead of surfacing a spurious failure.
-          if (code !== "ENOENT") throw error;
-        }
-        if (wrote) {
-          if (await this.leaseIsExclusive(lock, token)) acquired = true;
-          // Not exclusive: our token landed in a directory a peer re-created
-          // after a reaper removed our empty one. Drop the orphan and retry
-          // rather than joining a lease we do not own.
-          else await unlink(tokenFile).catch(() => {});
-        }
-      } else {
-        // Held by another writer: reap only token files that themselves
-        // stopped heartbeating. A directory observed as stale can be replaced
-        // before we scan it, so its mtime cannot authorize deleting its entries.
-        await this.breakLock(lock);
-      }
-      if (acquired) break;
-      await new Promise((resolve) => setTimeout(resolve, LOCK_RETRY_MS));
-    }
-    const lease: BoardLease = {
-      assertHeld: async () => {
-        if (!(await this.leaseIsExclusive(lock, token))) {
-          throw new TowerDoValidationError(
-            "board write lease was stolen mid-write (a peer judged this holder dead) — retry the write",
-          );
-        }
-      },
-    };
-    const heartbeat = setInterval(() => {
-      void (async () => {
-        try {
-          // Our token file is gone => we were stolen: stop refreshing, or we
-          // would keep a peer's lease artificially fresh (and unstealable).
-          await stat(tokenFile);
-          const now = new Date();
-          await utimes(tokenFile, now, now);
-        } catch {
-          // Lease gone (stolen or removed): stop refreshing.
-        }
-      })();
-    }, Math.max(1000, Math.floor(STALE_LOCK_MS / 3)));
-    // Never keep the host process alive just for a heartbeat.
-    if (typeof heartbeat.unref === "function") heartbeat.unref();
-    try {
-      return await run(lease);
-    } finally {
-      clearInterval(heartbeat);
-      // Release only OUR lease (see the method docstring): both steps are
-      // no-ops when a peer already stole and recreated it.
-      await unlink(tokenFile).catch(() => {});
-      await rmdir(lock).catch(() => {});
-    }
-  }
-
-  /** Directory entries of a lease path, or undefined when it is gone or not a
-   *  readable directory (legacy file lock / dangling symlink / released). */
-  private async leaseEntries(lock: string): Promise<string[] | undefined> {
-    try {
-      return await readdir(lock);
-    } catch {
-      return undefined;
-    }
-  }
-
-  /** Ownership proof for a directory lease: our token file is the ONLY entry.
-   *  An empty directory means a creator is mid-acquire; any foreign entry means
-   *  the directory was recycled by a peer and this holder no longer owns it. */
-  private async leaseIsExclusive(
-    lock: string,
-    token: string,
-  ): Promise<boolean> {
-    const entries = await this.leaseEntries(lock);
-    return (
-      entries !== undefined && entries.length === 1 && entries[0] === token
-    );
-  }
-
-  /** A stale observation of the directory cannot authorize deleting a new
-   * owner's token after release/recreate. Each token is checked by its own
-   * mtime and unlinked only by its unique name; `rmdir` can only remove an
-   * empty directory. Legacy file locks and dangling symlinks are not followed. */
-  private async breakLock(lock: string): Promise<void> {
-    let info;
-    try {
-      info = await lstat(lock);
-    } catch {
-      return; // already released
-    }
-    if (!info.isDirectory()) {
-      if (info.isSymbolicLink()) {
-        // A symlink is never a lease (acquisition uses mkdir). Never follow it
-        // into an unrelated directory, regardless of its age.
-        await unlink(lock).catch(() => {});
-        return;
-      }
-      if (Date.now() - info.mtimeMs > STALE_LOCK_MS)
-        await unlink(lock).catch(() => {}); // stale legacy file lock
-      return;
-    }
-    let entries: string[];
-    try {
-      entries = await readdir(lock);
-    } catch {
-      return;
-    }
-    if (entries.length === 0) {
-      // A creator can pause between mkdir and writing its token. Its empty
-      // directory gets the same grace; if replaced before rmdir, the new
-      // creator's token write either protects it or fails ENOENT and retries.
-      if (Date.now() - info.mtimeMs > STALE_LOCK_MS)
-        await rmdir(lock).catch(() => {});
-      return;
-    }
-    for (const entry of entries) {
-      const tokenFile = join(lock, entry);
-      try {
-        const tokenInfo = await stat(tokenFile);
-        if (Date.now() - tokenInfo.mtimeMs > STALE_LOCK_MS)
-          await unlink(tokenFile).catch(() => {});
-      } catch {
-        // Token disappeared during a concurrent release or steal.
-      }
-    }
-    await rmdir(lock).catch(() => {});
-  }
-
-  /** Last-resort reconcile after a rename-window steal (see `compact`).
-   *
-   *  The rename already happened, so the peer's pre-rename appends (`P`) live
-   *  only in the preserved inode while any post-rename appends (`W`) are in
-   *  the live file. This restores both ONLY in the case that can be proved by
-   *  byte prefixes and a CAS under a FRESHLY taken lease:
-   *    - the preserved log is `raw` + `P` (its suffix is what the rename
-   *      orphaned),
-   *    - the live file is still `content` + `W` (nobody rewrote it), and
-   *    - the live file is byte-identical at the moment of the swap.
-   *  The result is `content + P + W` (P before W: LWW reads the real order).
-   *  Any deviation — a peer that compacted in the window, a truncation, a
-   *  lease that cannot be re-taken — returns false and the caller keeps the
-   *  evidence and fails loud. Never a blind rollback, never an unlocked write. */
-  private async reconcileStolenCompact(args: {
-    raw: string;
-    content: string;
-    prev: string;
-  }): Promise<boolean> {
-    const { raw, content, prev } = args;
-    try {
-      const preserved = await readFile(prev, "utf8");
-      // `P` is only well-defined as a suffix of the exact bytes we CAS'd.
-      if (!preserved.startsWith(raw)) return false;
-      const pending = preserved.slice(raw.length);
-      // An empty `pending` does NOT prove the live file is ours: a peer that
-      // compacted (or rewrote) in the window can leave no append behind while
-      // the live board is a DIFFERENT compaction. Skip the rewrite, but only
-      // after proving the live shape under a fresh lease — otherwise the
-      // caller reports "reconciled" and drops `prev` while its own compaction
-      // is not even live.
-      return await this.withLock(async (lease) => {
-        const live = await readFile(this.file, "utf8");
-        // Pure appends on top of our compaction are the only provable shape;
-        // a peer compaction (or any rewrite) is not recoverable this way.
-        if (!live.startsWith(content)) return false;
-        const after = live.slice(content.length);
-        if (pending.trim().length === 0) return true; // nothing was orphaned
-        const tmp = `${this.file}.reconcile-${randomUUID().slice(0, 8)}`;
-        try {
-          const handle = await open(tmp, "w");
-          try {
-            await handle.writeFile(`${content}${pending}${after}`, "utf8");
-            await handle.sync();
-          } finally {
-            await handle.close();
-          }
-          // CAS the live file at the moment of the swap.
-          if ((await readFile(this.file, "utf8")) !== live) return false;
-          await lease.assertHeld();
-          await rename(tmp, this.file);
-          // One attempt only: a second steal here is reported as `false`
-          // (evidence kept, loud failure) rather than retried in a loop.
-          await lease.assertHeld();
-          return true;
-        } finally {
-          await unlink(tmp).catch(() => {});
-        }
-      });
-    } catch {
-      return false;
-    }
-  }
 
   private serialize<T>(task: () => Promise<T>): Promise<T> {
     const run = this.chain.then(task, task);
@@ -495,11 +151,10 @@ export class TowerBoard {
     let revision = 0;
     let skipped = 0;
     let index = 0;
-    // A compact header line (Layer 3) may open the file. It carries the
-    // explicit logical revision and the number of following last-wins
-    // snapshot lines. Snapshot lines rebuild the maps WITHOUT bumping the
-    // revision (the header already accounts for it); every line after the
-    // snapshot block behaves exactly as before. No header -> legacy log.
+    // A legacy compact header may open the file (written by a version that had
+    // compaction). It carries the logical `revision` and the number of
+    // following last-wins snapshot lines; those lines rebuild the maps WITHOUT
+    // bumping the revision (the header already accounts for it).
     const lines = raw.split("\n");
     const firstIndex = lines.findIndex((line) => line.trim().length > 0);
     let start = 0;
@@ -507,9 +162,6 @@ export class TowerBoard {
     if (firstIndex >= 0) {
       try {
         const header: unknown = JSON.parse(lines[firstIndex].trim());
-        // Only accept a WELL-FORMED header: a compact line without a valid
-        // snapshotLines would leave the snapshot block counted as ordinary
-        // events (double-counting the revision), so it is ignored instead.
         if (
           isRecord(header) &&
           header.kind === "compact" &&
@@ -521,11 +173,6 @@ export class TowerBoard {
           header.snapshotLines >= 0
         ) {
           revision = header.revision;
-          // `header.skipped` is HISTORICAL audit metadata (how many unfoldable
-          // lines the compact dropped), NOT live board state: after a
-          // dropSkipped compact the board no longer holds those lines, so
-          // re-reporting them as `skipped` would be false and would block
-          // every future compact forever.
           snapshotLines = header.snapshotLines;
           start = firstIndex + 1;
         }
@@ -535,10 +182,8 @@ export class TowerBoard {
     }
     // Snapshot membership is counted by CONSUMED snapshot events, not by
     // physical line index: a blank, foreign, or unfoldable line inside the
-    // block advances `li` without being one of the compactor's snapshot rows,
-    // so an index window (`li < start + snapshotLines`) would let the trailing
-    // snapshot events fall outside it and bump the revision the block must not
-    // bump.
+    // block must not let the trailing snapshot events fall outside it and bump
+    // the revision the block is not allowed to bump.
     let snapshotConsumed = 0;
     for (let li = 0; li < lines.length; li += 1) {
       const line = lines[li];
@@ -552,22 +197,18 @@ export class TowerBoard {
       } catch {
         // Tolerate foreign/corrupt lines (they never bump the revision), but
         // COUNT them: a silently skipped line is data the board holds and no
-        // participant can see, which is the silent-wrong class this extension
-        // exists to prevent. `skipped` is disclosed by tower_do_status.
+        // participant can see.
         skipped += 1;
         continue;
       }
       const event = readEvent(candidate);
+      if (event === ignored) continue;
       if (event === undefined) {
         skipped += 1;
         continue;
       }
-      // Only a line the fold can turn into an event was written by the
-      // compactor as a snapshot row, so only it consumes a snapshot slot. A
-      // foreign/unfoldable line inside the block is skipped and consumes
-      // nothing, keeping the trailing real snapshot events inside the block
-      // (an index or a pre-parse counter would let them fall out and bump the
-      // revision the header already accounts for).
+      // Only a line the fold can turn into an event was written as a snapshot
+      // row, so only it consumes a snapshot slot.
       if (inSnapshot) snapshotConsumed += 1;
       if (event.kind === "task") {
         if (event.op === "remove") {
@@ -607,19 +248,14 @@ export class TowerBoard {
         continue;
       }
       if (event.kind === "message" && event.message !== undefined) {
-        // LWW by id (same as findings): a later event carrying the same id
-        // (e.g. a read/ack update) replaces the earlier snapshot instead of
-        // accumulating duplicate message rows in the folded view.
+        // LWW by id: a later event carrying the same id (a read/ack update)
+        // replaces the earlier row instead of accumulating duplicates.
         const message = event.message;
         const foldedSoFar = messages.get(message.id);
         if (message.to === "all" && message.audience === undefined) {
           // Back-fill the audience snapshot for pre-audience broadcasts. The
-          // tasks map at THIS replay point mirrors the board when the event
-          // was written (the log is in order), which is exactly the owners
-          // the broadcast could address. Deriving from the map rather than an
-          // incrementally-maintained owner set stays correct across owner
-          // transfers (upsert that swaps owner without a remove). Keep an
-          // already-folded audience if a later re-emission (ack) lacks one.
+          // tasks map at THIS replay point mirrors the board when the event was
+          // written, which is exactly the owners the broadcast could address.
           const currentOwners = [
             ...new Set(
               [...tasks.values()]
@@ -629,10 +265,9 @@ export class TowerBoard {
           ];
           const audience =
             foldedSoFar?.audience ??
-            // Delivery/display layer: exclude the sender by AGENT, not by exact
-            // string, so a legacy label of the same session is not left in the
-            // audience (a self-broadcast is never in its own inbox and can
-            // never ack, which would pin the retention budget).
+            // Exclude the sender by AGENT, so a legacy label of the same
+            // session is not left in the audience (a self-broadcast can never
+            // be acked).
             currentOwners.filter((owner) => !sameAgent(owner, message.from));
           messages.set(message.id, { ...message, audience });
         } else {
@@ -662,52 +297,35 @@ export class TowerBoard {
   async append(events: readonly BoardEvent[]): Promise<void> {
     if (events.length === 0) return;
     return this.serialize(async () => {
-      await mkdir(dirname(this.file), { recursive: true });
       const lines = events.map((event) => `${JSON.stringify(event)}\n`);
-      // Serialize against compact() across processes, not just in-process: a
-      // compaction that renames the file would otherwise orphan this append.
-      await this.withLock(async (lease) => {
-        await lease.assertHeld();
-        await appendFile(this.file, lines.join(""), "utf8");
-      }, true);
+      await appendBatch(this.file, lines.join(""));
     });
   }
 
-  /** Run `fn` while holding the cross-process write lease, handing it an append
-   * that does NOT re-take the lease. Use this when a DECISION must be computed
-   * and acted on atomically across processes (e.g. a budget count): checking
-   * then calling `append` separately is a race, because `append` only takes the
-   * lease after the check. NOTE: inside `fn` you MUST use the handed
-   * `appendLocked`; calling `this.append` deadlocks, because both `append` and
-   * `withWriteLock` run on the same non-reentrant `serialize` chain. */
-  async withWriteLock<T>(
+  /** Run `fn` while holding the in-process write chain, handing it an append
+   *  that does NOT re-enter it. Use this when a DECISION must be computed and
+   *  acted on without another local write interleaving (e.g. a budget count);
+   *  checking and then calling `append` separately would let a local writer slip
+   *  in between. The `baseRevision` file guard covers cross-process races.
+   *  NOTE: inside `fn` you MUST use the handed append; calling `this.append`
+   *  deadlocks, because both share the non-reentrant `serialize` chain. */
+  async withWrite<T>(
     fn: (append: (events: readonly BoardEvent[]) => Promise<void>) => Promise<T>,
   ): Promise<T> {
-    return this.serialize(() =>
-      this.withLock(async (lease) => {
-        const appendLocked = async (
-          events: readonly BoardEvent[],
-        ): Promise<void> => {
-          if (events.length === 0) return;
-          await mkdir(dirname(this.file), { recursive: true });
-          const lines = events.map((event) => `${JSON.stringify(event)}\n`);
-          // Re-prove ownership immediately before the write: a lease stolen
-          // during this (arbitrarily long) critical section must fail loud
-          // rather than append concurrently with the peer that took over.
-          await lease.assertHeld();
-          await appendFile(this.file, lines.join(""), "utf8");
-        };
-        return fn(appendLocked);
-      }),
-    );
+    return this.serialize(async () => {
+      const append = async (
+        events: readonly BoardEvent[],
+      ): Promise<void> => {
+        if (events.length === 0) return;
+        const lines = events.map((event) => `${JSON.stringify(event)}\n`);
+        await appendBatch(this.file, lines.join(""));
+      };
+      return fn(append);
+    });
   }
 
-  /** Full event log (newest lines last). `fold()` already reads the whole
-   *  file, so callers needing a COMPLETE activity view (the stale-owner
-   *  permission gate, which must never misread an active owner as idle
-   *  because their events fell out of a bounded tail) pay no extra
-   *  asymptotic cost. I/O errors throw — a missing or unreadable file is
-   *  not "no activity". */
+  /** Full event log (oldest lines first). I/O errors throw — a missing or
+   *  unreadable file is not "no activity". */
   async rawLines(): Promise<string[]> {
     const raw = await readFile(this.file, "utf8");
     return raw
@@ -718,373 +336,12 @@ export class TowerBoard {
 
   /** Raw tail of the event log (newest lines last). */
   async rawTail(lines: number = 50): Promise<string[]> {
-    // slice(-0) is slice(0) — the whole log — so a non-positive request must
-    // be an empty tail, not a full read that looks bounded. `!Number.isFinite`
+    // slice(-0) is slice(0) — the whole log — so a non-positive request must be
+    // an empty tail, not a full read that looks bounded. `!Number.isFinite`
     // also catches NaN, for which `NaN <= 0` is false and `slice(-NaN)`
     // silently becomes `slice(0)`.
     if (!Number.isFinite(lines) || lines <= 0) return [];
     return (await this.rawLines()).slice(-lines);
-  }
-
-  /**
-   * Explicit last-wins compaction (Layer 3). Rewrites the live file as one
-   * compact header plus one snapshot event per surviving entity, under a
-   * content CAS: the live file is re-read after the temp file is fsynced and
-   * the rename happens only if it is still byte-identical. Every crash point
-   * (archive, temp write, CAS abort) leaves the old file intact. Never
-   * periodic. The explicit `gc` path is orchestrator-only (index.ts enforces
-   * that); the threshold-triggered path runs the same compaction under the
-   * same safety envelope, with the header's `by` naming the caller. The header
-   * carries the logical `revision`, so a refold after
-   * compaction reports exactly the revision it did before.
-   *
-   * The pre-compact inode is hard-linked before the rename and the lease is
-   * re-proven right after it: a holder paused past STALE_LOCK_MS inside that
-   * window is detected and the call fails loud. Before failing it attempts a
-   * provable reconcile (see `reconcileStolenCompact`) that restores the
-   * window's writes as `content + P + W` under a freshly taken lease; when the
-   * shape cannot be proved it keeps the preserved log as evidence instead of
-   * guessing. Nothing is ever rolled back blindly.
-   */
-  async compact(options: {
-    by: string;
-    archive?: boolean;
-    dropSkipped?: boolean;
-    now?: number;
-    /** Test-only seam: async hooks that fire at the CAS and pre-rename crash
-     * points so the abort/atomicity behaviour can be asserted deterministically.
-     * Never set by production callers. */
-    testHooks?: {
-      beforeCasCheck?: () => Promise<void> | void;
-      beforeRename?: () => Promise<void> | void;
-      /** Between the final ownership proof/CAS and the rename: simulates a
-       *  steal in the pre-rename window. */
-      beforeSwap?: () => Promise<void> | void;
-      /** Between the rename and the post-rename ownership re-proof: simulates
-       *  a steal whose peer writes land AFTER the rename. */
-      afterSwap?: () => Promise<void> | void;
-    };
-  }): Promise<{
-    revision: number;
-    kept: { tasks: number; messages: number; findings: number };
-    /** Unfoldable lines the compact discarded (0 unless `dropSkipped`). */
-    skipped: number;
-    bytesBefore: number;
-    bytesAfter: number;
-    archived?: string;
-    /** Older pre-compact logs removed by this run's archive retention. */
-    prunedArchives?: string[];
-  }> {
-    return this.serialize(() =>
-      this.withLock(async (lease) => {
-      let raw: string;
-      try {
-        raw = await readFile(this.file, "utf8");
-      } catch (error) {
-        if (errorCode(error) === "ENOENT") {
-          throw new TowerDoValidationError(
-            "nothing to compact: the board file does not exist",
-          );
-        }
-        throw error;
-      }
-      const sourceSha256 = createHash("sha256").update(raw).digest("hex");
-      const bytesBefore = Buffer.byteLength(raw, "utf8");
-      // Dropping unfoldable lines is only safe when the verbatim pre-compact
-      // log is archived first (it is the only remaining copy). Refuse the
-      // combination rather than trusting every caller to pair them.
-      if (options.dropSkipped === true && options.archive !== true) {
-        throw new TowerDoValidationError(
-          "dropSkipped requires archive: true — the pre-compact log is the only copy of the unfoldable lines, so they may only be discarded alongside an archive",
-        );
-      }
-      const view = await this.fold();
-      if (view.skipped > 0 && options.dropSkipped !== true) {
-        throw new TowerDoValidationError(
-          `refusing to compact: ${String(view.skipped)} log line(s) could not be folded and compaction would drop them. Fix the log, or pass dropSkipped=true to discard them explicitly (recorded in the compact header).`,
-        );
-      }
-      const now = options.now ?? Date.now();
-      // Preserve the per-owner/per-task activity clock across the rewrite: the
-      // snapshot event's `at` is what the activity feed and the stale-owner
-      // takeover derivation read, so stamping every row with `task.updatedAt`
-      // would credit an owner with a LATER edit made by someone else (a
-      // takeover or a `tower` edit) and silently revoke/grant a takeover
-      // after a gc.
-      const taskClock = new Map<string, number>();
-      // Findings store only the filer (`from`), never the last actor; a
-      // snapshot that stamped `by: finding.from` with the transition's `at`
-      // would credit a peer's status change to the filer and make a dead filer
-      // look freshly active after a gc. Recover the latest event's writer per
-      // finding id from the raw log.
-      const findingActor = new Map<string, { by: string; at: number }>();
-      for (const line of raw.split("\n")) {
-        const trimmed = line.trim();
-        if (!trimmed) continue;
-        let candidate: unknown;
-        try {
-          candidate = JSON.parse(trimmed);
-        } catch {
-          continue;
-        }
-        const event = readEvent(candidate);
-        if (event === undefined) continue;
-        if (event.kind === "task" && event.key !== undefined) {
-          const clockKey = `${event.by}\u0000${event.key}`;
-          const prior = taskClock.get(clockKey);
-          if (prior === undefined || event.at > prior) {
-            taskClock.set(clockKey, event.at);
-          }
-        } else if (event.kind === "finding" && event.finding !== undefined) {
-          const id = event.finding.id;
-          const prior = findingActor.get(id);
-          if (prior === undefined || event.at > prior.at) {
-            findingActor.set(id, { by: event.by, at: event.at });
-          }
-        }
-      }
-      const snapshotEvents: BoardEvent[] = [];
-      for (const task of view.tasks) {
-        const clock =
-          task.owner === undefined
-            ? undefined
-            : taskClock.get(`${task.owner}\u0000${task.key}`);
-        snapshotEvents.push({
-          kind: "task",
-          op: "upsert",
-          key: task.key,
-          task,
-          // Attribute the snapshot to the actual owner, not the compactor: the
-          // activity feed / presence derivation reads `by`, and crediting
-          // `tower` would make every owner look freshly active after a gc.
-          by: task.owner ?? options.by,
-          // The owner's real last activity on this task when the log has it;
-          // the row's `updatedAt` only when the owner never touched it.
-          at: clock ?? task.updatedAt,
-        });
-      }
-      for (const message of view.messages) {
-        snapshotEvents.push({
-          kind: "message",
-          message,
-          by: message.from,
-          at: message.at,
-        });
-      }
-      for (const finding of view.findings) {
-        snapshotEvents.push({
-          kind: "finding",
-          finding,
-          by: findingActor.get(finding.id)?.by ?? finding.from,
-          at: finding.at,
-        });
-      }
-      const header = {
-        kind: "compact",
-        revision: view.revision,
-        at: now,
-        by: options.by,
-        sourceSha256,
-        skipped: view.skipped,
-        snapshotLines: snapshotEvents.length,
-        counts: {
-          tasks: view.tasks.length,
-          messages: view.messages.length,
-          findings: view.findings.length,
-        },
-      };
-      const content = `${[JSON.stringify(header), ...snapshotEvents.map((event) => JSON.stringify(event))].join("\n")}\n`;
-      // Only the archive PATH is decided here; the write happens after the
-      // FIRST CAS (the pre-rename content check) and before the hard link and
-      // the FINAL CAS, deliberately outside the [final CAS, rename] window.
-      // Writing it earlier leaves an archive that claims a compaction which
-      // then aborted; writing it inside the final window widens the one
-      // residual append race that window exists to keep narrow.
-      let archived: string | undefined;
-      let prunedArchives: string[] = [];
-      if (options.archive === true) {
-        const dir = join(dirname(this.file), "archive");
-        await mkdir(dir, { recursive: true });
-        const stamp = new Date(now).toISOString().replace(/[:.]/g, "-");
-        archived = join(
-          dir,
-          // The random suffix keeps two compacts of the same revision in the
-          // same millisecond from overwriting each other's evidence (the
-          // `now` test seam makes that collision deterministic).
-          `board-rev${String(view.revision)}-${stamp}-${randomUUID().slice(0, 8)}.jsonl`,
-        );
-      }
-      const tmp = `${this.file}.tmp`;
-      // Track what a failed compact must clean up: an archive written for a
-      // swap that never happened describes a compaction that did not occur.
-      let archivedWritten = false;
-      let renamed = false;
-      // CAS: with the write lease held no well-behaved peer can append here,
-      // but an unlocked writer (older extension) still could. Re-check right
-      // before the rename so the exposure window is one syscall wide.
-      const assertUnchanged = async (): Promise<void> => {
-        let liveNow: string;
-        try {
-          liveNow = await readFile(this.file, "utf8");
-        } catch {
-          throw new TowerDoValidationError(
-            "compaction aborted: the board file disappeared mid-compact",
-          );
-        }
-        if (
-          createHash("sha256").update(liveNow).digest("hex") !== sourceSha256
-        ) {
-          throw new TowerDoValidationError(
-            "compaction aborted: a peer appended to the board since the fold — re-read and retry",
-          );
-        }
-      };
-      try {
-        // The WHOLE write is guarded so a failure in open/write/sync/close
-        // also removes a partial temp file, not just a CAS/rename failure.
-        const handle = await open(tmp, "w");
-        try {
-          await handle.writeFile(content, "utf8");
-          await handle.sync();
-        } finally {
-          await handle.close();
-        }
-        await options.testHooks?.beforeCasCheck?.();
-        await assertUnchanged();
-        await options.testHooks?.beforeRename?.();
-        // Archive BEFORE the [final-CAS, rename] window opens. That window is
-        // where a lease-ignoring older writer's append can still slip in, and
-        // the CAS exists to keep it one syscall wide — a whole-file archive
-        // write inside it would widen the very race it covers. The flag is set
-        // BEFORE the write so a partial archive is removed on any later abort
-        // (a compaction that never swapped must leave no archive claiming it
-        // did).
-        if (archived !== undefined) {
-          archivedWritten = true;
-          await writeFile(archived, raw, "utf8");
-        }
-        // PRESERVE the pre-compact inode before the swap (hard link): if the
-        // lease is stolen in the rename window — this holder paused past
-        // STALE_LOCK_MS between the proof below and the rename — a peer's
-        // pre-rename appends landed in THIS inode and the rename would
-        // orphan them. The link keeps them as evidence.
-        const prev = `${this.file}.prev-${randomUUID().slice(0, 8)}`;
-        let keepPrev = false;
-        await link(this.file, prev);
-        try {
-          // Final ownership proof: a compact must never rename over a board
-          // a peer now owns (its own rename would then land on a lost
-          // append).
-          await lease.assertHeld();
-          let liveNow: string;
-          try {
-            // Read through the link: these are exactly the bytes the rename
-            // will swap away, so the CAS covers the preserved inode too.
-            liveNow = await readFile(prev, "utf8");
-          } catch {
-            throw new TowerDoValidationError(
-              "compaction aborted: the board file disappeared mid-compact",
-            );
-          }
-          if (
-            createHash("sha256").update(liveNow).digest("hex") !==
-            sourceSha256
-          ) {
-            throw new TowerDoValidationError(
-              "compaction aborted: a peer appended to the board since the fold — re-read and retry",
-            );
-          }
-          await options.testHooks?.beforeSwap?.();
-          // The path must still name the preserved inode. A peer that
-          // compacted in this window (stolen lease, or an older unlocked
-          // writer) renamed a NEW inode over the path; our rename would then
-          // silently swap that peer's board away, and `prev`/`raw` (the OLD
-          // inode) cannot reveal it — the reconcile would see an empty
-          // `pending` and falsely report a provable recovery. Abort before the
-          // swap instead: nothing is lost, the peer's board stays live.
-          let liveIno: number;
-          let prevIno: number;
-          try {
-            liveIno = (await stat(this.file)).ino;
-            prevIno = (await stat(prev)).ino;
-          } catch {
-            throw new TowerDoValidationError(
-              "compaction aborted: the board file disappeared mid-compact",
-            );
-          }
-          if (liveIno !== prevIno) {
-            throw new TowerDoValidationError(
-              "compaction aborted: a peer replaced the board in the rename window — re-read and retry (the peer's board is live and untouched)",
-            );
-          }
-          await rename(tmp, this.file);
-          renamed = true;
-          await options.testHooks?.afterSwap?.();
-          // The rename WINDOW closes here. A holder paused past
-          // STALE_LOCK_MS between the proof above and this line resumes to
-          // find the lease stolen and a peer already writing. Detect it and
-          // fail LOUD. Do NOT roll the inode back: the holder that took over
-          // may already have written AFTER our rename, and restoring would
-          // clobber those writes — a rollback is not a CAS. Instead attempt a
-          // PROVABLE reconcile: re-take the lease and, only if the live file
-          // is still our compaction plus appends and the preserved log is
-          // `raw` plus appends, rebuild `content + P + W` under the same
-          // CAS+lease discipline (P before W, preserving real-time LWW
-          // order). Anything unprovable keeps the evidence and stays loud.
-          try {
-            await lease.assertHeld();
-          } catch {
-            const recovered = await this.reconcileStolenCompact({
-              raw,
-              content,
-              prev,
-            });
-            keepPrev = !recovered;
-            throw new TowerDoValidationError(
-              recovered
-                ? "board write lease was stolen in the compact's rename window (this holder was paused past the staleness limit) — the compacted board is live and any peer writes from the window were preserved (reconciled under a fresh lease); re-read the board"
-                : `board write lease was stolen in the compact's rename window (this holder was paused past the staleness limit) — the compacted board is live, but writes a peer made between the fold and the rename could not be provably restored; the pre-compact log is preserved at ${prev}`,
-            );
-          }
-          await unlink(prev).catch(() => {});
-          // Success path only: the swap landed and the evidence link is gone,
-          // so this run's archive is safely on disk. Bound the archive set now
-          // — the cleanup must not itself accumulate whole-log copies. This
-          // run's archive is pinned, so a skewed mtime cannot prune it.
-          if (archived !== undefined) {
-            prunedArchives = await pruneArchives(dirname(archived), archived);
-          }
-        } catch (error) {
-          if (!keepPrev) await unlink(prev).catch(() => {});
-          throw error;
-        }
-      } catch (error) {
-        await unlink(tmp).catch(() => {});
-        // A compaction that did not swap must not leave an archive claiming it
-        // did; also removes a half-written archive from a failed writeFile.
-        if (archivedWritten && !renamed && archived !== undefined) {
-          await unlink(archived).catch(() => {});
-        }
-        throw error;
-      }
-      return {
-        revision: view.revision,
-        kept: {
-          tasks: view.tasks.length,
-          messages: view.messages.length,
-          findings: view.findings.length,
-        },
-        /** Unfoldable lines the compact discarded. Non-zero only when the
-         * caller opted in (`dropSkipped`); the pre-compact log that holds them
-         * is in `archive/`, so nothing is lost silently. */
-        skipped: view.skipped,
-        bytesBefore,
-        bytesAfter: Buffer.byteLength(content, "utf8"),
-        ...(archived === undefined ? {} : { archived }),
-        ...(prunedArchives.length === 0 ? {} : { prunedArchives }),
-      };
-      }),
-    );
   }
 }
 
@@ -1092,15 +349,15 @@ export interface TowerDoConfig {
   /**
    * Optional fixed identity; otherwise resolved from the session. The ONLY
    * user-configurable key — every other tuning constant lives in index.ts
-   * (internal, never user-facing; see DECISIONS.md).
+   * (internal, never user-facing).
    */
   identity?: string;
 }
 
 /**
- * Validate config.json. Fail loud: a silently-reset config would drop a
- * pinned identity and corrupt owner matching / message addressing. Unknown
- * keys are ignored (forward compatibility after retired knobs).
+ * Validate config.json. Fail loud: a silently-reset config would drop a pinned
+ * identity and corrupt owner matching / message addressing. Unknown keys are
+ * ignored (forward compatibility after retired knobs).
  */
 export function normalizeBoardConfig(value: unknown): TowerDoConfig {
   if (typeof value !== "object" || value === null || Array.isArray(value)) {

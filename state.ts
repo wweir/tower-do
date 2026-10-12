@@ -85,31 +85,6 @@ export const MESSAGE_PENDING_RETIRE_MS = 14 * 24 * 60 * 60_000;
  * `PRESENCE_IDLE_MS` display hint: ownership dies on the task-relevant
  * activity clock, not on unrelated board chatter (see staleTaskClaims). */
 export const TASK_CLAIM_STALE_MS = 6 * 60 * 60_000;
-/** Log-size thresholds. `BOARD_COMPACT_HINT_BYTES` is BOTH the automatic
- * compaction trigger (`shouldAutoCompactBoard`, a cheap `stat` at a
- * session/settle boundary) and a `tower_do_status` hint; `BOARD_COMPACT_HINT_LINES`
- * is disclosed by status only (the auto path does not read the whole file to
- * count lines). A compact is named (header `by`), archived (the pre-compact log
- * is kept under `archive/`) and lease/CAS-guarded, so a threshold-triggered run
- * is as auditable as an explicit `gc` — leaving the cleanup purely advisory is
- * what let every board in `~/.pi/tower-do` grow without bound.
- *
- * Never PERIODIC: the trigger is a file-size observation at a session/settle
- * boundary, never a timer. */
-export const BOARD_COMPACT_HINT_LINES = 10_000;
-export const BOARD_COMPACT_HINT_BYTES = 1024 * 1024;
-/** Pre-compact logs kept per board under `<board-dir>/archive/`. A compact
- * writes one archive per run, so without a bound the cleanup would itself
- * accumulate whole-log copies forever; the newest N survive for audit (they
- * are also the evidence for the unfoldable legacy lines a `gc` discards). */
-export const MAX_BOARD_ARCHIVES = 3;
-
-/** Whether a board log has crossed the automatic compaction threshold. Pure so
- * the threshold has one definition and one test. Byte-based on purpose: the
- * trigger sits on the session/settle path and must stay a cheap `stat`. */
-export function shouldAutoCompactBoard(bytes: number): boolean {
-  return bytes >= BOARD_COMPACT_HINT_BYTES;
-}
 
 /** Checkpoint custom-entry type carrying the bounded digest (Layer 4). The old
  * `TOWER_DO_BOARD_TYPE` full-snapshot entries stay readable. */

@@ -89,10 +89,8 @@ import {
   zipHashObject,
 } from "./git-count.ts";
 import {
-  BOARD_COMPACT_HINT_BYTES,
-  BOARD_COMPACT_HINT_LINES,
-  classifyTaskLayers,
   checkpointDigest,
+  classifyTaskLayers,
   cloneBoard,
   createEmptyBoard,
   DASHBOARD_FINDING_LINE_CHARS,
@@ -139,7 +137,6 @@ import {
   liveSessionCount,
   parseLiveRecord,
   MAX_CHANGED_FILES,
-  MAX_BOARD_ARCHIVES,
   MAX_FINDING_LOCATION_CHARS,
   MAX_FINDING_REASON_CHARS,
   MAX_FINDING_SUGGESTED_FIX_CHARS,
@@ -175,7 +172,6 @@ import {
   readByWith,
   sameAgent,
   sessionLabel,
-  shouldAutoCompactBoard,
   TASK_KEY_PATTERN,
   textLength,
   transportLimit,
@@ -586,18 +582,6 @@ const TowerDoTaskSchema = Type.Object({
 });
 
 const TowerDoParamsSchema = Type.Object({
-  action: Type.Optional(
-    StringEnum(["gc"] as const, {
-      description:
-        'Explicit log compaction (Layer 3). Requires the orchestrator identity "tower" and an empty tasks list. Rewrites board.jsonl as one compact header plus last-wins snapshot events under a content CAS (a concurrent peer append aborts it); the previous log is archived under archive/ after the first content check and before the hard link/final CAS, so an aborted compact leaves no archive. The extension also runs the SAME compact automatically when a board log crosses its size threshold (never periodic); this action compacts now. Unfoldable legacy lines no longer block it because the pre-compact log is archived — the count moved there is reported. Revision is preserved so baseRevision stays valid.',
-    }),
-  ),
-  dropSkipped: Type.Optional(
-    Type.Boolean({
-      description:
-        "gc only: drop log lines the fold cannot turn into events (a legacy row past a retuned limit) instead of refusing. Defaults to true for the gc action because it always archives the verbatim pre-compact log and reports how many lines moved there. Pass false to keep the strict refusal — inspect the raw lines first.",
-    }),
-  ),
   tasks: Type.Array(TowerDoTaskSchema, {
     description:
       `Complete authoritative task list to retain: every key you want kept must appear here, because any current key omitted from the list is removed. An omitted task owned by another agent (and not stale) makes the write fail rather than dropping it; replay peers' and unowned tasks you did not mean to remove. Existing keys may omit unchanged fields (they are preserved per field), so send only what changes — a rejected payload is echoed back verbatim by the host, and a small replay keeps that echo cheap. New keys require subject and status. Capacity: at most ${MAX_TOWER_DO_OPEN_TASKS} non-completed tasks — completed rows are receipts, they replay free and never block a new plan; one write may introduce at most ${MAX_TOWER_DO_OPEN_TASKS} NEW completed rows (replaying an existing receipt is free, split larger batches across successive writes).`,
@@ -1001,15 +985,6 @@ export default function towerDoExtension(pi: ExtensionAPI): void {
   let hasSettledOnce = false;
   // Sequence token guarding refreshGitCounts write-backs (see above).
   let gitRefreshSeq = 0;
-  // Automatic log compaction (Layer 3): one in-flight compact per board file,
-  // so a burst of writes cannot stack compactions; `lastAttempt` is a
-  // failure/contention cooldown so `agent_settled` does not retry a board a
-  // peer keeps busy on every run; `blockedAt` remembers the size of a board
-  // the unattended path refused (unfoldable lines) so an unchanged log is not
-  // re-lease/re-folded on every settle.
-  const autoCompactsInFlight = new Set<string>();
-  const autoCompactCooldown = new Map<string, number>();
-  const autoCompactBlockedAt = new Map<string, number>();
 
   const git = (cwd: string, args: string[]): Promise<string | undefined> =>
     new Promise((resolve) => {
@@ -2008,76 +1983,9 @@ export default function towerDoExtension(pi: ExtensionAPI): void {
 
     async execute(_toolCallId, params, signal, _onUpdate, ctx) {
       throwIfAborted(signal, "TowerDo update");
-      if (params.action === "gc") {
-        // Explicit, never periodic: the explicit path is orchestrator-gated and
-        // must not carry task rows. (The extension also auto-compacts a
-        // board log that crosses the size threshold at session/settle
-        // boundaries; that path is lease/CAS/archive-guarded too and never
-        // drops unfoldable lines — see `scheduleAutoCompact`.)
-        const gc = await prepare(ctx, params.as);
-        if (params.tasks.length > 0) {
-          throw new TowerDoValidationError(
-            'action="gc" compacts the log and takes no task rows — pass tasks: []',
-          );
-        }
-        if (gc.caller !== TOWER_IDENTITY) {
-          throw new TowerDoValidationError(
-            `action="gc" requires the orchestrator identity "${TOWER_IDENTITY}" (got "${gc.caller}") — compaction rewrites the shared log`,
-          );
-        }
-        // The only destructive path without an abort check until now: a
-        // cancelled call must not rewrite and archive the shared log. Checked
-        // again once the in-process queue is actually held (the wait for it
-        // can be long).
-        throwIfAborted(signal, "TowerDo gc");
-        const result = await withFileMutationQueue(gc.board.file, () => {
-          throwIfAborted(signal, "TowerDo gc");
-          return gc.board.compact({
-            by: gc.caller,
-            archive: true,
-            // gc ALWAYS archives the verbatim pre-compact log, so an unfoldable
-            // legacy line is preserved there. Refusing by default left exactly
-            // the boards whose hint asked for a gc un-cleanable (a retuned
-            // field limit makes old rows partial/foreign to the fold). The
-            // strict behaviour stays reachable with `dropSkipped: false`.
-            dropSkipped: params.dropSkipped !== false,
-          });
-        });
-        currentView = await foldRetained(ctx.cwd);
-        updateWidget(ctx);
-        return {
-          content: [
-            {
-              type: "text",
-              text:
-                `TowerDo log compacted at revision ${String(result.revision)} — ` +
-                `${String(result.kept.tasks)} task(s), ${String(result.kept.messages)} message(s), ${String(result.kept.findings)} finding(s) kept; ` +
-                `${(result.bytesBefore / 1024).toFixed(0)}KB → ${(result.bytesAfter / 1024).toFixed(0)}KB` +
-                (result.archived === undefined
-                  ? ""
-                  : `\narchived: ${result.archived}`) +
-                (result.skipped === 0
-                  ? ""
-                  : `\n${String(result.skipped)} unfoldable legacy line(s) moved to the archive (the live board no longer holds them; the archive survives only the next ${String(MAX_BOARD_ARCHIVES)} compact(s) — read it now if you need them)`) +
-                (result.prunedArchives === undefined
-                  ? ""
-                  : `\npruned ${String(result.prunedArchives.length)} older archive(s) (keeping the newest ${String(MAX_BOARD_ARCHIVES)})`),
-            },
-          ],
-          details: { caller: gc.caller, gc: result },
-        };
-      }
-      // `dropSkipped` is a gc-only knob; a full-replacement write never
-      // compacts, so silently ignoring it would surprise the caller (the talk
-      // tool rejects taskKey on non-send for the same reason).
-      if (params.dropSkipped !== undefined) {
-        throw new TowerDoValidationError(
-          'dropSkipped applies to action:"gc" only — a task write never compacts the log',
-        );
-      }
       const { board, caller } = await prepare(ctx, params.as);
       return withFileMutationQueue(board.file, async () => {
-        const { details, activity } = await board.withWriteLock(async (appendLocked) => {
+        const { details, activity } = await board.withWrite(async (appendLocked) => {
         // Re-fold inside both queues: the revision guard must observe peer
         // appends before it decides whether the full replacement is stale.
         throwIfAborted(signal, "TowerDo update");
@@ -2322,7 +2230,7 @@ export default function towerDoExtension(pi: ExtensionAPI): void {
         // AFTER those checks, so a peer could delete the task in between and
         // the persisted message would carry a dangling taskKey (the same
         // reason tower_do and the finding paths use withWriteLock).
-        await board.withWriteLock(async (appendLocked) => {
+        await board.withWrite(async (appendLocked) => {
           throwIfAborted(signal, "TowerDo talk");
           const fresh = await foldRetained(ctx.cwd);
           throwIfAborted(signal, "TowerDo talk");
@@ -2484,7 +2392,7 @@ export default function towerDoExtension(pi: ExtensionAPI): void {
         // There IS something to ack: the fold, the ack set and the append must
         // be one atomic step across processes, or two peers acking the same
         // message lose one `readBy` entry to last-write-wins.
-        return board.withWriteLock(async (appendLocked) => {
+        return board.withWrite(async (appendLocked) => {
           throwIfAborted(signal, "TowerDo talk");
           const fresh = await readFold();
           throwIfAborted(signal, "TowerDo talk");
@@ -2607,7 +2515,7 @@ export default function towerDoExtension(pi: ExtensionAPI): void {
             `finding owner may only be reassigned by ${TOWER_IDENTITY} (got "${explicitOwner}")`,
           );
         }
-        const updatedFindings = await board.withWriteLock(
+        const updatedFindings = await board.withWrite(
           async (appendLocked) => {
             throwIfAborted(signal, "TowerDo talk");
             // Re-fold inside the lease: the findings may have changed since
@@ -2804,7 +2712,7 @@ export default function towerDoExtension(pi: ExtensionAPI): void {
         from: caller,
         at: now,
       };
-      await board.withWriteLock(async (appendLocked) => {
+      await board.withWrite(async (appendLocked) => {
         throwIfAborted(signal, "TowerDo talk");
         const fresh = await foldRetained(ctx.cwd);
         throwIfAborted(signal, "TowerDo talk");
@@ -3239,32 +3147,11 @@ export default function towerDoExtension(pi: ExtensionAPI): void {
               : ` · compact rev ${String(compactRev)}`),
         );
       }
-      const logIsLarge =
-        logLines >= BOARD_COMPACT_HINT_LINES ||
-        logBytes >= BOARD_COMPACT_HINT_BYTES;
-      // The AUTOMATIC trigger is the byte threshold only (a cheap stat on the
-      // session/settle path); the line threshold is a status hint.
-      const logBytesTriggerAuto = logBytes >= BOARD_COMPACT_HINT_BYTES;
-      if (logIsLarge || view.skipped > 0) {
+      // Compaction is gone, so a large log is expected — only unfoldable
+      // lines are worth surfacing (data the board holds and nobody can see).
+      if (view.skipped > 0) {
         lines.push(
-          (logIsLarge
-            ? `Log is large (${String(logLines)} lines, ${(logBytes / (1024 * 1024)).toFixed(1)}MB)`
-            : `Log holds unfoldable data (${String(logLines)} lines, ${(logBytes / (1024 * 1024)).toFixed(1)}MB)`) +
-            (view.skipped > 0
-              ? `${logIsLarge ? " and" : ""} ${String(view.skipped)} line(s) cannot be folded`
-              : "") +
-            // A byte-large log WITHOUT unfoldable lines is reclaimed
-            // automatically at the next session/settle boundary; a board that
-            // holds them is left alone by the automatic path (it must not
-            // discard data it cannot parse) and needs this explicit gc, which
-            // archives them and reports the count. A line-large log under the
-            // byte threshold is never auto-compacted — say so, or the reader
-            // waits for a compaction that cannot happen.
-            (view.skipped > 0
-              ? ' — compact now with tower_do action:"gc" (tower only; archives the old log first), which moves the unfoldable lines into the archive and reports the count. A log with unfoldable lines is NOT compacted automatically.'
-              : logBytesTriggerAuto
-                ? ' — compact now with tower_do action:"gc" (tower only; archives the old log first). A log this large is compacted automatically at the session/settle boundary (never periodic).'
-                : ` — it exceeds the line hint but not the ${BOARD_COMPACT_HINT_BYTES / (1024 * 1024)}MiB byte threshold, which is what triggers automatic compaction; compact now with tower_do action:"gc" (tower only).`),
+          `Log holds unfoldable data: ${String(view.skipped)} line(s) cannot be folded (of ${String(logLines)} lines, ${(logBytes / (1024 * 1024)).toFixed(1)}MB)`,
         );
       }
       // D4: board liveness at a glance. revision is monotonic but silent —
@@ -3652,94 +3539,6 @@ export default function towerDoExtension(pi: ExtensionAPI): void {
   // Lifecycle: restore, compact checkpoints, reminders, shutdown
   // -------------------------------------------------------------------------
 
-  /**
-   * Compact a board log whose size has crossed the documented threshold
-   * (Layer 3), using the SAME safety envelope as an explicit `gc`: the
-   * per-board cross-process lease, the content CAS, and an archive of the
-   * verbatim pre-compact log. Never periodic — it is a size observation at a
-   * session/settle boundary — and always attributed in the compact header, so
-   * it stays auditable. Best-effort: a contended or failed auto-compact must
-   * never break the session, and the explicit `gc` remains the manual path.
-   */
-  const scheduleAutoCompact = (
-    cwd: string,
-    ctx: ExtensionContext | undefined,
-  ): void => {
-    const entry = boards.entryFor(cwd);
-    const file = entry.board.file;
-    if (autoCompactsInFlight.has(file)) return;
-    let bytes: number;
-    try {
-      bytes = statSync(file).size;
-    } catch {
-      return;
-    }
-    if (!shouldAutoCompactBoard(bytes)) return;
-    // Refused at this exact size already: retrying means taking the lease and
-    // folding the whole log only to refuse again. Any size change re-arms it.
-    if (autoCompactBlockedAt.get(file) === bytes) return;
-    const lastAttempt = autoCompactCooldown.get(file);
-    if (lastAttempt !== undefined && Date.now() - lastAttempt < 600_000) return;
-    // Resolve the identity BEFORE registering the in-flight guard: a throw here
-    // (a misbehaving host) would otherwise leave the entry behind forever and
-    // disable auto-compaction for this board for the instance's lifetime.
-    const identity = sessionIdentity(cwd, pi, ctx);
-    autoCompactsInFlight.add(file);
-    void withFileMutationQueue(file, async () => {
-      // Re-check after queuing: a peer (or a previous auto-compact) may have
-      // compacted the board since the stat.
-      let size: number;
-      try {
-        size = statSync(file).size;
-      } catch {
-        return;
-      }
-      if (!shouldAutoCompactBoard(size)) return;
-      try {
-        await entry.board.compact({
-          by: identity,
-          archive: true,
-          // NEVER drop unfoldable lines from an unattended path: a legacy row
-          // the fold cannot parse (a retuned field limit) is invisible in the
-          // view but still recoverable from the raw log — an auto-compact that
-          // discarded it, with the archive itself pruned after a few runs,
-          // would be silent, permanent data loss. Such a board simply stays
-          // uncompacted and `tower_do_status` keeps disclosing `skipped > 0`
-          // plus the explicit `gc` remedy (which reports the count).
-          dropSkipped: false,
-        });
-        autoCompactBlockedAt.delete(file);
-        if (activeCwd === cwd && existsSync(file)) {
-          currentView = await foldRetained(cwd);
-        }
-        // Re-check AFTER the await: a session/project switch during the fold
-        // must not have the old board repainted (and `updateWidget()` with no
-        // ctx keeps whichever context is current).
-        if (activeCwd === cwd) updateWidget();
-      } catch (error) {
-        // Only the "refusing to compact: N unfoldable lines" refusal is
-        // stable for a given size; pin THAT so the same unchanged log is not
-        // re-lease/re-folded every settle. A transient failure (contended
-        // lease, CAS) must stay retryable after the cooldown, so it does not
-        // pin.
-        if (
-          error instanceof TowerDoValidationError &&
-          error.message.startsWith("refusing to compact")
-        ) {
-          autoCompactBlockedAt.set(file, size);
-        }
-      }
-    })
-      .catch(() => {
-        // Queue registration failed (e.g. realpath threw): swallow it so the
-        // in-flight entry is released by `finally` instead of leaking, which
-        // would disable auto-compaction for this board for the whole instance.
-      })
-      .finally(() => {
-        autoCompactsInFlight.delete(file);
-        autoCompactCooldown.set(file, Date.now());
-      });
-  };
 
   const restore = async (ctx: ExtensionContext): Promise<void> => {
     clearWidget();
@@ -3816,7 +3615,6 @@ export default function towerDoExtension(pi: ExtensionAPI): void {
     startLiveWiring(ctx.cwd, ctx);
     // Session boundary is the natural time to reclaim a board log that grew
     // past the compaction threshold in an earlier session.
-    scheduleAutoCompact(ctx.cwd, ctx);
   };
 
   pi.on("session_start", async (_event, ctx) => {
@@ -3838,7 +3636,6 @@ export default function towerDoExtension(pi: ExtensionAPI): void {
     // settle boundary is the cheapest safe place to reclaim it (never during
     // a write, and the compact takes the board lease itself).
     if (activeCwd !== undefined && uiContext !== undefined) {
-      scheduleAutoCompact(activeCwd, uiContext);
     }
     // First settle arms the push wake (a resumed branch with conversation is
     // armed in restore), so a peer message that arrived during the turn is
