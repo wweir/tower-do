@@ -378,43 +378,6 @@ function layer2(): void {
       }),
     ) === undefined,
   );
-  // ...and the finding branch validates with the fold's reader too.
-  check(
-    "activity rejects a finding line the fold cannot fold",
-    parseActivityLine(
-      JSON.stringify({
-        kind: "finding",
-        finding: {
-          id: "f-x",
-          kind: "bug",
-          title: "t",
-          severity: "low",
-          status: "open",
-          from: "alice",
-          at: now,
-        },
-        by: "alice",
-        at: now,
-      }),
-    ) === undefined &&
-      parseActivityLine(
-        JSON.stringify({
-          kind: "finding",
-          finding: {
-            id: "f-x",
-            kind: "bug",
-            title: "t",
-            severity: "low",
-            status: "open",
-            summary: "s",
-            from: "alice",
-            at: now,
-          },
-          by: "alice",
-          at: now,
-        }),
-      ) !== undefined,
-  );
   // relativeTime's 60s boundary (the 45s."0m ago" regression had no test).
   check(
     "relativeTime: 59.9s is 'just now'",

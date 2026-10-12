@@ -26,7 +26,6 @@
  * Run: bun run test/view-layers.ts
  */
 import {
-  DASHBOARD_FINDING_LINE_CHARS,
   DASHBOARD_ROW_BUDGET,
   TOWER_DO_SCHEMA_VERSION,
   classifyTaskLayers,
@@ -395,12 +394,6 @@ eq(
   truncateChars("😀😀😀", 2),
   "😀😀…",
 );
-check(
-  "the finding line limit is a real bound",
-  DASHBOARD_FINDING_LINE_CHARS > 0 && DASHBOARD_FINDING_LINE_CHARS <= 1000,
-  String(DASHBOARD_FINDING_LINE_CHARS),
-);
-
 // --- 4. folded TUI dashboard ------------------------------------------------
 
 const folded = foldDashboardSections(

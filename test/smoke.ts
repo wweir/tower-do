@@ -21,9 +21,7 @@ import { TowerBoard } from "../board.ts";
 import {
   createEmptyBoard,
   findAllUnresolvedDeps,
-  FINDING_SNOOZE_MAX_MS,
   formatBoardReminder,
-  MAX_FINDING_REASON_CHARS,
   MAX_MESSAGE_BYTES,
   MAX_TOWER_DO_ALIASES,
   taskIsBlocked,
@@ -324,28 +322,12 @@ async function layer1(): Promise<void> {
       by: "alice",
       at: Date.now(),
     },
-    {
-      kind: "finding",
-      finding: {
-        id: "f-1",
-        kind: "vuln",
-        title: "gemm unchecked bounds",
-        severity: "high",
-        status: "open",
-        summary: "index overflow on M=0",
-        suggestedFix: "guard M",
-        from: "carol",
-        at: Date.now(),
-      },
-      by: "carol",
-      at: Date.now(),
-    },
   ]);
   const folded = await board.fold();
   check(
-    "message/finding folded back",
-    folded.messages.length === 1 && folded.findings.length === 1,
-    `msgs=${folded.messages.length} finds=${folded.findings.length}`,
+    "message folded back",
+    folded.messages.length === 1,
+    `msgs=${folded.messages.length}`,
   );
   check(
     "write revision matches refold revision",
@@ -953,19 +935,16 @@ async function layer2(): Promise<void> {
     selfMsg.slice(0, 60),
   );
 
-  // taskKey is a send-only thread: inbox/finding must reject it loudly rather
-  // than accept it and silently drop the link.
-  const taskKeyOnFinding = await runThrow("tower_do_talk", {
-    action: "finding",
-    kind: "bug",
-    title: "x",
-    summary: "y",
+  // taskKey is a send-only thread: inbox must reject it loudly rather than
+  // accept it and silently drop the link.
+  const taskKeyOnInbox = await runThrow("tower_do_talk", {
+    action: "inbox",
     taskKey: "auth",
   } as never);
   check(
     "taskKey rejected on non-send action",
-    /taskKey applies to action=send only/.test(taskKeyOnFinding),
-    taskKeyOnFinding.slice(0, 60),
+    /taskKey applies to action=send only/.test(taskKeyOnInbox),
+    taskKeyOnInbox.slice(0, 60),
   );
 
   // A node's own broadcast must not appear in its own inbox / status message
@@ -1008,48 +987,6 @@ async function layer2(): Promise<void> {
     readFileSync(boardFileFor(dir), "utf8").length === bobInboxBytes &&
       !/newly acked/.test(bobReread.text),
     `bytes ${String(bobInboxBytes)} -> ${String(readFileSync(boardFileFor(dir), "utf8").length)}`,
-  );
-
-  // Finding filed by a reviewer identity, visible in status.
-  await run("tower_do_talk", {
-    action: "finding",
-    kind: "vuln",
-    severity: "high",
-    title: "token parser overflow",
-    summary: "input not bounded",
-    location: "src/auth/token.ts",
-    suggestedFix: "clamp length",
-  } as never);
-  const s2 = await run("tower_do_status", {});
-  check(
-    "finding visible on dashboard",
-    s2.text.includes("token parser overflow"),
-    "finding surfaced",
-  );
-
-  // The list truncates each finding to one line, so the full text needs its
-  // own read path; an unknown id must fail loud.
-  const findingId = s2.text.match(/- \[(f-[0-9a-f-]+)\]/)?.[1] ?? "";
-  const findingDetail = await run(
-    "tower_do_status",
-    { findingId } as never,
-  );
-  check(
-    "findingId returns the full finding text",
-    findingId !== "" &&
-      findingDetail.text.includes("token parser overflow") &&
-      findingDetail.text.includes("input not bounded") &&
-      findingDetail.text.includes("clamp length") &&
-      findingDetail.text.includes("- summary:"),
-    findingDetail.text.split("\n")[0],
-  );
-  const missingFinding = await runThrow("tower_do_status", {
-    findingId: "f-nope",
-  } as never);
-  check(
-    "unknown findingId is rejected",
-    /no finding with id/.test(missingFinding),
-    missingFinding.slice(0, 80),
   );
 
   // Stale write rejected via baseRevision (gate).
@@ -1214,40 +1151,6 @@ async function layer2(): Promise<void> {
     "a message body over 32 KiB is rejected",
     /body too large/.test(bigBody),
     bigBody.slice(0, 90),
-  );
-  // File one finding of our own: the shared `idA` fixture is created further
-  // down, and these bounds are independent of it.
-  const boundFiled = await run("tower_do_talk", {
-    action: "finding",
-    kind: "bug",
-    title: "bound fixture",
-    summary: "s",
-    as: "alice",
-  } as never);
-  const boundId =
-    (boundFiled.text.match(/\((f-[0-9a-f-]+)\)/) ?? [])[1] ?? "";
-  const longReason = await runThrow("tower_do_talk", {
-    action: "finding",
-    findingId: boundId,
-    status: "done",
-    reason: "r".repeat(MAX_FINDING_REASON_CHARS + 1),
-  } as never);
-  check(
-    "a finding reason over the cap is rejected",
-    /reason is \d+ characters/.test(longReason),
-    longReason.slice(0, 90),
-  );
-  const pastSnooze = await runThrow("tower_do_talk", {
-    action: "finding",
-    findingIds: [boundId],
-    status: "snoozed",
-    reason: "later",
-    snoozeUntil: Date.now() + FINDING_SNOOZE_MAX_MS + 86_400_000,
-  } as never);
-  check(
-    "a snooze beyond the 30d cap is rejected",
-    /more than 30d ahead/.test(pastSnooze),
-    pastSnooze.slice(0, 90),
   );
   // Invalid status filter is a loud error, not a silent empty board.
   const badFilter = await runThrow("tower_do_status", {
@@ -1831,167 +1734,6 @@ async function layer2(): Promise<void> {
     coupledNeeds.text.split("\n").slice(3, 12).join(" / "),
   );
 
-  // Detail reads are bounded like the dashboard: a long summary is cut with
-  // the cut disclosed. The dashboard path hits the byte cap first (its rows
-  // are long), so drive the LINE cap through one finding whose summary is
-  // thousands of one-character lines.
-  await run("tower_do_talk", {
-    action: "finding",
-    kind: "improve",
-    severity: "low",
-    title: "many lines",
-    summary: Array.from({ length: 2000 }, () => "x").join("\n"),
-  } as never);
-  const longSummaryId =
-    (
-      (await run("tower_do_status", {})).text.match(
-        /- \[(f-[0-9a-f-]+)\] \[low\/improve\] many lines/,
-      ) ?? []
-    )[1] ?? "";
-  const longDetail = await run(
-    "tower_do_status",
-    { findingId: longSummaryId } as never,
-  );
-  check(
-    "a multi-thousand-line finding detail is cut at the line budget and says so",
-    longSummaryId !== "" &&
-      longDetail.text.includes(
-        "… finding detail truncated: showing the last",
-      ) &&
-      longDetail.text.split("\n").length <= 2000,
-    (longDetail.text.split("\n").at(-1) ?? "").slice(0, 120),
-  );
-
-  // -------------------------------------------------------------------------
-  // Finding exit mechanism (Layer 1/2): reason-gated close, claim defaulting,
-  // atomic batch update, and `inbox all` reading view-retired messages.
-  // -------------------------------------------------------------------------
-  const findingIdOf = (text: string): string =>
-    (text.match(/\((f-[0-9a-f-]+)\)/) ?? [])[1] ?? "";
-
-  const filedA = await run("tower_do_talk", {
-    action: "finding",
-    kind: "bug",
-    severity: "high",
-    title: "close me",
-    summary: "summary",
-  } as never);
-  const idA = findingIdOf(filedA.text);
-  check("filing a finding returns its id", idA !== "", filedA.text.slice(0, 80));
-
-  const closeNoReason = await runThrow("tower_do_talk", {
-    action: "finding",
-    findingId: idA,
-    status: "done",
-  } as never);
-  check(
-    "closing a finding without a reason is rejected",
-    /requires a reason/.test(closeNoReason),
-    closeNoReason.slice(0, 80),
-  );
-
-  await run("tower_do_talk", {
-    action: "finding",
-    findingId: idA,
-    status: "accepted",
-  } as never);
-  const claimDetail = await run(
-    "tower_do_status",
-    { findingId: idA } as never,
-  );
-  check(
-    "claiming with no owner defaults to the caller",
-    claimDetail.text.includes("- owner: smoke-session"),
-    claimDetail.text.split("\n").slice(0, 6).join(" / "),
-  );
-
-  const filedB = await run("tower_do_talk", {
-    action: "finding",
-    kind: "improve",
-    severity: "low",
-    title: "batch b",
-    summary: "summary",
-  } as never);
-  const idB = findingIdOf(filedB.text);
-  const batched = await run("tower_do_talk", {
-    action: "finding",
-    findingIds: [idA, idB],
-    status: "done",
-    reason: "fixed in smoke",
-  } as never);
-  check(
-    "a batch close updates every id, each with its own event",
-    idA !== "" && batched.text.includes(idA) && batched.text.includes(idB),
-    batched.text.slice(0, 120),
-  );
-  const closedB = await run("tower_do_status", { findingId: idB } as never);
-  check(
-    "a closed finding records its reason",
-    closedB.text.includes("- reason: fixed in smoke"),
-    closedB.text.split("\n").slice(0, 7).join(" / "),
-  );
-  // Read BOTH ids back from the board: the batch text is built from the
-  // computed rows, so only the persisted state proves every id got its own
-  // event (an `events.slice(-1)` append would still render both ids).
-  const closedA = await run("tower_do_status", { findingId: idA } as never);
-  check(
-    "every batched id is persisted, not just the last",
-    closedA.text.includes("- status: done") &&
-      closedA.text.includes("- reason: fixed in smoke") &&
-      closedB.text.includes("- status: done"),
-    closedA.text.split("\n").slice(0, 7).join(" / "),
-  );
-  const filedS = await run("tower_do_talk", {
-    action: "finding",
-    kind: "idea",
-    title: "snooze wording",
-    summary: "check dashboard text",
-  } as never);
-  const idS = findingIdOf(filedS.text);
-  await run("tower_do_talk", {
-    action: "finding",
-    findingId: idS,
-    status: "snoozed",
-    reason: "defer in smoke",
-    snoozeUntil: Date.now() + 2 * 86_400_000,
-  } as never);
-  const snoozedView = await run("tower_do_status", { view: "all" } as never);
-  const snoozedLine = snoozedView.text.split("\n").find((line) => line.includes(`[${idS}]`)) ?? "";
-  check(
-    "snoozed finding renders days without a literal dollar or trailing space",
-    idS !== "" && /snoozed 2d more$/.test(snoozedLine) && !snoozedLine.includes("$"),
-    snoozedLine.slice(0, 120),
-  );
-
-  const mixedBatch = await runThrow("tower_do_talk", {
-    action: "finding",
-    findingId: idA,
-    findingIds: [idB],
-    status: "open",
-  } as never);
-  check(
-    "findingId and findingIds are mutually exclusive",
-    /not both/.test(mixedBatch),
-    mixedBatch.slice(0, 80),
-  );
-
-  // Creating a NEW finding must not silently swallow update-only fields: a
-  // caller that passes status/owner expects a claimed row, and filing an
-  // open, unowned one instead is the silent-wrong class this board prevents.
-  const createWithStatus = await runThrow("tower_do_talk", {
-    action: "finding",
-    kind: "bug",
-    title: "must not be created claimed",
-    summary: "summary",
-    status: "accepted",
-    owner: "smoke-session",
-  } as never);
-  check(
-    "status/owner on a finding CREATE is rejected, not silently ignored",
-    /apply to a finding UPDATE/.test(createWithStatus),
-    createWithStatus.slice(0, 90),
-  );
-
   // A message old enough to leave the default view (unread, past the age
   // valve) is still readable via inbox all, but the default inbox hides it.
   const retiredAt = Date.now() - 30 * 24 * 60 * 60_000;
@@ -2040,278 +1782,6 @@ async function layer2(): Promise<void> {
     inboxAll.text.slice(0, 80),
   );
 
-  // Layer 3/C: the dashboard discloses the log size and the finding budget.
-  const boardState = await run("tower_do_status", {} as never);
-  check(
-    "the dashboard prints the log State line",
-    /(^|\n)State: .*log \d+ line\(s\)/.test(boardState.text),
-    boardState.text.split("\n").find((line) => line.startsWith("State:")) ??
-      "(missing)",
-  );
-  check(
-    "the findings header discloses the non-closed budget",
-    /## Open findings \(\d+\/50 non-closed/.test(boardState.text),
-    boardState.text.split("\n").find((line) => line.startsWith("## Open findings")) ??
-      "(missing)",
-  );
-
-  // Reopening (`status=open`) must not bypass the non-closed budget: the
-  // update path enforces the same cap as the create path.
-  const reopenDir = mkdtempSync(join(tmpdir(), "tower-do-reopen-"));
-  const reopenBoard = new TowerBoard(boardFileFor(reopenDir));
-  const findingRow = (
-    id: string,
-    status: "open" | "done",
-  ): Record<string, unknown> => ({
-    kind: "finding",
-    finding: {
-      id,
-      kind: "bug",
-      title: id,
-      severity: "low",
-      status,
-      summary: "s",
-      from: "seed",
-      at: Date.now(),
-    },
-    by: "seed",
-    at: Date.now(),
-  });
-  await reopenBoard.append([
-    ...Array.from({ length: 50 }, (_, i) =>
-      findingRow(`f-open-${String(i)}`, "open"),
-    ),
-    findingRow("f-closed", "done"),
-  ] as never);
-  const reopenRejected = await runThrow(
-    "tower_do_talk",
-    { action: "finding", findingId: "f-closed", status: "open" } as never,
-    reopenDir,
-  );
-  check(
-    "reopening a closed finding over the budget is rejected",
-    /over the budget/.test(reopenRejected),
-    reopenRejected.slice(0, 90),
-  );
-
-  // The other half of the same guard: a legacy board ALREADY over the cap must
-  // still be able to DRAIN. Closing is allowed while the total stays above 50
-  // (only a write that INCREASES the count is rejected), otherwise an
-  // over-cap board could never be brought back under the budget.
-  const drainDir = mkdtempSync(join(tmpdir(), "tower-do-drain-"));
-  const drainBoard = new TowerBoard(boardFileFor(drainDir));
-  await drainBoard.append([
-    ...Array.from({ length: 52 }, (_, i) =>
-      findingRow(`f-over-${String(i)}`, "open"),
-    ),
-  ] as never);
-  const drainOutcome = await runThrow(
-    "tower_do_talk",
-    { action: "finding", findingId: "f-over-0", status: "done", reason: "drain" } as never,
-    drainDir,
-  );
-  const drained = await run(
-    "tower_do_status",
-    { findingId: "f-over-0" } as never,
-    drainDir,
-  );
-  check(
-    "an over-cap legacy board can drain (closing above the cap is allowed)",
-    drainOutcome === "NO ERROR" &&
-      /- status: done/.test(drained.text) &&
-      /- reason: drain/.test(drained.text),
-    drainOutcome === "NO ERROR"
-      ? drained.text.split("\n").slice(0, 7).join(" / ")
-      : drainOutcome.slice(0, 140),
-  );
-
-  // `view=all` must ENUMERATE every row, not just lift the state filter: the
-  // default page cap applies to the same slice, so without an explicit
-  // view=all branch the disclosure "view=all lists every row" is false and the
-  // hidden ids are unreachable by any tool call. 52 rows here (> the 20-row
-  // page).
-  const drainAll = await run("tower_do_status", { view: "all" } as never, drainDir);
-  const listedFindings = drainAll.text
-    .split("\n")
-    .filter((line) => /^- \[f-over-\d+\]/.test(line)).length;
-  check(
-    "view=all enumerates every finding row, not just the default page",
-    listedFindings === 52 && !/more finding\(s\) not shown/.test(drainAll.text),
-    `listed=${String(listedFindings)}`,
-  );
-  const drainDefault = await run("tower_do_status", {} as never, drainDir);
-  check(
-    "the default finding view pages and points at view=all",
-    /more finding\(s\) not shown — view=all lists every row/.test(drainDefault.text),
-    drainDefault.text
-      .split("\n")
-      .find((line) => line.includes("more finding")) ?? "(none)",
-  );
-
-  // Takeover: a claim owned by a non-live identity is adoptable — the guard
-  // lets a non-owner through only when that owner has no fresh heartbeat, and
-  // the claim must then move to the adopter.
-  const takeoverDir = mkdtempSync(join(tmpdir(), "tower-do-takeover-"));
-  const takeoverBoard = new TowerBoard(boardFileFor(takeoverDir));
-  await takeoverBoard.append([
-    {
-      kind: "finding",
-      finding: {
-        id: "f-ghost",
-        kind: "bug",
-        title: "ghost claim",
-        severity: "low",
-        status: "accepted",
-        summary: "s",
-        owner: "ghost",
-        from: "ghost",
-        at: Date.now(),
-      },
-      by: "ghost",
-      at: Date.now(),
-    },
-  ] as never);
-  const takeoverLiveDir = join(dirname(boardFileFor(takeoverDir)), "live");
-  mkdirSync(takeoverLiveDir, { recursive: true });
-  writeFileSync(
-    join(takeoverLiveDir, "smoke-session.x.json"),
-    JSON.stringify({ identity: "smoke-session", at: Date.now() }),
-    "utf8",
-  );
-  await run(
-    "tower_do_talk",
-    { action: "finding", findingId: "f-ghost", status: "accepted" } as never,
-    takeoverDir,
-  );
-  const takeoverDetail = await run(
-    "tower_do_status",
-    { findingId: "f-ghost" } as never,
-    takeoverDir,
-  );
-  check(
-    "claiming a non-live owner's finding moves the owner to the claimer",
-    /- owner: smoke-session/.test(takeoverDetail.text) &&
-      !/- owner: ghost/.test(takeoverDetail.text),
-    takeoverDetail.text
-      .split("\n")
-      .filter((line) => line.startsWith("- owner"))
-      .join(","),
-  );
-
-  // Permission is EXACT, never aliased: a legacy `session-<time8>` and the
-  // current `session-<time8>-<rand8>` in the same bucket alias for DELIVERY
-  // (sameAgent) but must never grant write authority over the other's claim.
-  const exactDir = mkdtempSync(join(tmpdir(), "tower-do-exact-"));
-  const exactBoard = new TowerBoard(boardFileFor(exactDir));
-  const currentLabel = "session-01a0b444-abcdef12";
-  const legacyLabel = "session-01a0b444";
-  await exactBoard.append([
-    {
-      kind: "finding",
-      finding: {
-        id: "f-exact",
-        kind: "bug",
-        title: "exact permission",
-        severity: "low",
-        status: "accepted",
-        summary: "s",
-        owner: currentLabel,
-        from: currentLabel,
-        at: Date.now(),
-      },
-      by: currentLabel,
-      at: Date.now(),
-    },
-  ] as never);
-  const exactLiveDir = join(dirname(boardFileFor(exactDir)), "live");
-  mkdirSync(exactLiveDir, { recursive: true });
-  writeFileSync(
-    join(exactLiveDir, `${currentLabel}.x.json`),
-    JSON.stringify({ identity: currentLabel, at: Date.now() }),
-    "utf8",
-  );
-  const siblingRefusal = await runThrow(
-    "tower_do_talk",
-    {
-      action: "finding",
-      findingId: "f-exact",
-      status: "done",
-      reason: "stolen",
-      as: legacyLabel,
-    } as never,
-    exactDir,
-  );
-  check(
-    "a bucket-sibling label cannot change another session's live claim",
-    /claimed by/.test(siblingRefusal),
-    siblingRefusal.slice(0, 140),
-  );
-  const ownerUpdate = await run(
-    "tower_do_talk",
-    {
-      action: "finding",
-      findingId: "f-exact",
-      status: "done",
-      reason: "mine",
-      as: currentLabel,
-    } as never,
-    exactDir,
-  );
-  check(
-    "the exact owner can still close its own claim",
-    /f-exact/.test(ownerUpdate.text),
-    ownerUpdate.text.slice(0, 140),
-  );
-  // Read it back: the update text is built from the request, so only the
-  // persisted row proves the close actually happened.
-  const exactDetail = await run(
-    "tower_do_status",
-    { findingId: "f-exact" } as never,
-    exactDir,
-  );
-  check(
-    "the exact owner's close is persisted with its reason",
-    /- status: done/.test(exactDetail.text) &&
-      /- reason: mine/.test(exactDetail.text),
-    exactDetail.text.split("\n").slice(0, 7).join(" / "),
-  );
-
-  // Budget boundary: with 49 non-closed seeded, two concurrent reopens must
-  // not both land (the lease spans fold + count + append).
-  const budgetDir = mkdtempSync(join(tmpdir(), "tower-do-budget-"));
-  const budgetBoard = new TowerBoard(boardFileFor(budgetDir));
-  await budgetBoard.append([
-    ...Array.from({ length: 49 }, (_, i) =>
-      findingRow(`f-nc-${String(i)}`, "open"),
-    ),
-    findingRow("f-c1", "done"),
-    findingRow("f-c2", "done"),
-  ] as never);
-  const reopenResults = await Promise.allSettled([
-    run(
-      "tower_do_talk",
-      { action: "finding", findingId: "f-c1", status: "open" } as never,
-      budgetDir,
-    ),
-    run(
-      "tower_do_talk",
-      { action: "finding", findingId: "f-c2", status: "open" } as never,
-      budgetDir,
-    ),
-  ]);
-  const reopenOk = reopenResults.filter(
-    (result) => result.status === "fulfilled",
-  ).length;
-  const budgetStatus = await run("tower_do_status", {} as never, budgetDir);
-  const nonClosed = Number(
-    budgetStatus.text.match(/## Open findings \((\d+)\/50/)?.[1] ?? "-1",
-  );
-  check(
-    "concurrent reopens cannot exceed the finding budget",
-    reopenOk === 1 && nonClosed === 50,
-    `ok=${reopenOk} nonClosed=${nonClosed}`,
-  );
-
   // The snapshot write must hand out arrays that do not alias the input view:
   // a caller mutating the result would otherwise mutate the board it folded.
   {
@@ -2322,11 +1792,10 @@ async function layer2(): Promise<void> {
       "tower",
     );
     (aliasWrite.view.messages as unknown[]).push({ nope: true });
-    (aliasWrite.view.findings as unknown[]).push({ nope: true });
     check(
       "writeBoardSnapshot returns arrays that do not alias the input view",
-      aliasView.messages.length === 0 && aliasView.findings.length === 0,
-      `messages=${String(aliasView.messages.length)} findings=${String(aliasView.findings.length)}`,
+      aliasView.messages.length === 0,
+      `messages=${String(aliasView.messages.length)}`,
     );
   }
 

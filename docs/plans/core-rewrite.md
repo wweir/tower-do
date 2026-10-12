@@ -42,7 +42,7 @@
 | P2 磁盘层（D1） | `rw-disk` | done |
 | P1 写入语义 | `rw-core` | done |
 | P3a digest 退役 | `rw-digest` | done |
-| P3b findings 退役 | `rw-findings` | open |
+| P3b findings 退役 | `rw-findings` | done |
 | P3c 剪枝（scope / receipts / layers / presence） | `rw-trim` | open |
 | P4a 消息投递（D2） | `rw-msg` | open |
 | P4b 身份（D4） | `rw-identity` | open |
@@ -65,8 +65,9 @@
   `session_compact`/`before_agent_start` 两个 checkpoint handler、`checkpointFallback`、
   `contextCheckpointNeeded`、`REMINDER_ARMED`。restore 直接 fold 文件（缺文件=空板）。
   删 `test/finding-exit.ts`（digest↔findings 往返测试）与 smoke/presence-retention 的 checkpoint 用例。tsc + 16 套件全绿。
-- [ ] **P3b findings 退役** — 删 findings 类型/契约/预算/生命周期，`tower_do_talk` 的 finding action
-  与 `tower_do_status` 的 findings 章节。
+- [x] **P3b findings 退役** — 删 findings 类型/常量/校验/预算/生命周期（state.ts）；board.ts 忽略旧
+  `finding` 行；`tower_do_talk` 只剩 send/inbox（删 finding action 与全部 schema 字段）；
+  `tower_do_status` 删 findings 章节与 `findingId` 详情模式。测试同步删改。tsc + 16 套件全绿。
 - [ ] **P3c 剪枝** — 删 scope / changedFiles 收据 / dashboard layers / presence，`tower_do_status`
   收敛为 open tasks + completed 键账目 + unread + activity。
 - [ ] **P4b 身份（D4）** — identity = `as` > config `identity` > session id；删 `sessionLabel`

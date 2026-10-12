@@ -52,30 +52,6 @@ export const DEFAULT_IDENTITY = "main";
 export const TOWER_IDENTITY = "tower";
 export const MAX_MESSAGE_BYTES = 32 * 1024;
 export const MAX_MESSAGE_SUBJECT_CHARS = 200;
-export const MAX_FINDING_TITLE_CHARS = 200;
-export const MAX_FINDING_SUMMARY_CHARS = 4000;
-export const MAX_FINDING_LOCATION_CHARS = 256;
-export const MAX_FINDING_SUGGESTED_FIX_CHARS = 2_000;
-/** Finding exit mechanism (see CONTRACTS.md, "Finding contracts"): open work
- * is bounded, closing is auditable, and nothing actionable is ever retired by
- * age alone. These are semantic constants, not tuning knobs. */
-/** Non-closed findings a board may carry (open + accepted + snoozed, expired
- * snoozes included). "Snooze" and "claim" both occupy a slot; only a terminal
- * status frees one — otherwise deferral would be a free way to clear the
- * budget and the digest could grow without bound again. */
-export const MAX_TOWER_DO_OPEN_FINDINGS = 50;
-/** A claimed finding older than this is an unfulfilled close obligation: its
- * owner must `done|rejected|snooze` before filing a new finding. Also the
- * default-view grace period for closed findings (visible, then view-retired). */
-export const FINDING_CLOSE_GRACE_MS = 7 * 24 * 60 * 60_000;
-/** Upper bound on how far a snooze may push a finding (`snoozeUntil <= now +
- * this`). An expired snooze flows back to `actionable`; a snooze never removes
- * the finding, it only leaves the default list. */
-export const FINDING_SNOOZE_MAX_MS = 30 * 24 * 60 * 60_000;
-/** Close/snooze reason: single line, stored in the event, shown in the detail
- * read. Closing without a reason is the silent-wrong class this board exists to
- * prevent, so the field is required for terminal/held transitions. */
-export const MAX_FINDING_REASON_CHARS = 256;
 /** Age after which an unread message leaves the default view even though nobody
  * acked it. The message stays on disk and is readable via `inbox all` — this is
  * a VIEW retirement (Layer 2), never a delete. */
@@ -161,38 +137,12 @@ export function transportLimit(limit: number): number {
 }
 
 export type TowerDoStatus = "pending" | "in_progress" | "completed" | "blocked";
-export type FindingKind = "bug" | "improve" | "vuln" | "idea";
-export type FindingSeverity = "low" | "medium" | "high";
-export type FindingStatus =
-  | "open"
-  | "accepted"
-  | "snoozed"
-  | "rejected"
-  | "done";
 
 export const TOWER_DO_STATUSES: ReadonlySet<string> = new Set([
   "pending",
   "in_progress",
   "completed",
   "blocked",
-]);
-export const FINDING_KINDS: ReadonlySet<string> = new Set([
-  "bug",
-  "improve",
-  "vuln",
-  "idea",
-]);
-export const FINDING_SEVERITIES: ReadonlySet<string> = new Set([
-  "low",
-  "medium",
-  "high",
-]);
-export const FINDING_STATUSES: ReadonlySet<string> = new Set([
-  "open",
-  "accepted",
-  "snoozed",
-  "rejected",
-  "done",
 ]);
 
 export function isTowerDoStatus(value: unknown): value is TowerDoStatus {
@@ -248,50 +198,19 @@ export interface TowerDoMessage {
   audience?: string[];
 }
 
-export interface TowerDoFinding {
-  id: string;
-  kind: FindingKind;
-  title: string;
-  severity: FindingSeverity;
-  status: FindingStatus;
-  summary: string;
-  location?: string;
-  suggestedFix?: string;
-  /** Accountability owner (Layer 1): set on `claim`, displaceable by the same
-   * stale-owner takeover rules as a task. Optional — legacy rows and unclaimed
-   * findings have none. */
-  owner?: string;
-  /** Close/snooze reason (required for done|rejected|snoozed). Single line. */
-  reason?: string;
-  /** Wall-clock ms the finding returns to `actionable` (only for `snoozed`). */
-  snoozeUntil?: number;
-  from: string;
-  /** Last write time — for `closed`/`snoozed` rows this is the transition time,
-   * so the close-age grace and the snooze deadline read it directly. */
-  at: number;
-}
-
 export interface TowerBoardView {
   schemaVersion: typeof TOWER_DO_SCHEMA_VERSION;
   revision: number;
   tasks: TowerDoTask[];
   messages: TowerDoMessage[];
-  findings: TowerDoFinding[];
   /** Non-empty log lines the fold could not turn into an event (corrupt JSON,
    * foreign shapes, a task payload that no longer validates). Data the board
    * still holds but cannot show — never silent: the dashboard discloses it.
    * Not part of `revision` (which counts folded task events only). */
   skipped: number;
-  /** True when this view was rebuilt from a bounded digest because the board
-   * file was missing (Layer 4). Display-only fallback: it carries open tasks
-   * and finding titles, NOT full content or history, and must be disclosed.
-   * Never persisted into a board event. */
+  /** True when this view was rebuilt from a bounded checkpoint because the
+   * board file was missing. Display-only, never persisted into a board event. */
   incomplete?: boolean;
-  /** Digest-only: the finding counts captured when the checkpoint was written.
-   * A restored digest carries no closed rows, so re-summarizing it would
-   * report `closed: 0 / retired: 0` as fact; renderers must prefer this
-   * snapshot when present. Never persisted into a board event. */
-  findingCountsAtCheckpoint?: FindingCounts;
 }
 
 interface TowerDoChangeSummary {
@@ -330,7 +249,6 @@ export function createEmptyBoard(): TowerBoardView {
     revision: 0,
     tasks: [],
     messages: [],
-    findings: [],
     skipped: 0,
   };
 }
@@ -354,9 +272,6 @@ export function cloneBoard(view: TowerBoardView): TowerBoardView {
     revision: view.revision,
     skipped: view.skipped,
     ...(view.incomplete === undefined ? {} : { incomplete: view.incomplete }),
-    ...(view.findingCountsAtCheckpoint === undefined
-      ? {}
-      : { findingCountsAtCheckpoint: { ...view.findingCountsAtCheckpoint } }),
     tasks: view.tasks.map(cloneTask),
     messages: view.messages.map((message) => ({
       ...message,
@@ -365,7 +280,6 @@ export function cloneBoard(view: TowerBoardView): TowerBoardView {
         ? {}
         : { audience: [...message.audience] }),
     })),
-    findings: view.findings.map((finding) => ({ ...finding })),
   };
 }
 
@@ -805,7 +719,6 @@ export function writeBoardSnapshot(
     tasks: nextTasks,
     // Fresh arrays: the returned view must not alias the caller's board.
     messages: [...current.messages],
-    findings: [...current.findings],
     skipped: current.skipped,
   };
 
@@ -1448,57 +1361,6 @@ export function readPersistedMessage(
   };
 }
 
-export function readPersistedFinding(
-  candidate: unknown,
-): TowerDoFinding | undefined {
-  if (!isRecord(candidate)) return undefined;
-  if (
-    typeof candidate.id !== "string" ||
-    typeof candidate.kind !== "string" ||
-    typeof candidate.title !== "string" ||
-    typeof candidate.severity !== "string" ||
-    typeof candidate.status !== "string" ||
-    typeof candidate.summary !== "string" ||
-    typeof candidate.from !== "string" ||
-    !isEpochMs(candidate.at)
-  ) {
-    return undefined;
-  }
-  if (
-    !FINDING_KINDS.has(candidate.kind) ||
-    !FINDING_SEVERITIES.has(candidate.severity) ||
-    !FINDING_STATUSES.has(candidate.status)
-  ) {
-    return undefined;
-  }
-  return {
-    id: candidate.id,
-    kind: candidate.kind as FindingKind,
-    title: candidate.title,
-    severity: candidate.severity as FindingSeverity,
-    status: candidate.status as FindingStatus,
-    summary: candidate.summary,
-    ...(typeof candidate.location === "string"
-      ? { location: candidate.location }
-      : {}),
-    ...(typeof candidate.suggestedFix === "string"
-      ? { suggestedFix: candidate.suggestedFix }
-      : {}),
-    // Optional accountability fields (Layer 1). Absent on legacy rows — an old
-    // finding must not be reported as `skipped` because it predates the model.
-    ...(typeof candidate.owner === "string" ? { owner: candidate.owner } : {}),
-    ...(typeof candidate.reason === "string"
-      ? { reason: candidate.reason }
-      : {}),
-    ...(typeof candidate.snoozeUntil === "number" &&
-    Number.isFinite(candidate.snoozeUntil)
-      ? { snoozeUntil: candidate.snoozeUntil }
-      : {}),
-    from: candidate.from,
-    at: candidate.at,
-  };
-}
-
 // ---------------------------------------------------------------------------
 // Bounded checkpoint digest (Layer 4)
 // ---------------------------------------------------------------------------
@@ -1715,260 +1577,6 @@ export function deliveredMailIds(
   return ids;
 }
 
-// ---------------------------------------------------------------------------
-// Finding exit mechanism (Layer 1/2) — pure derivation, never writes.
-// ---------------------------------------------------------------------------
-
-export type FindingState = "actionable" | "claimed" | "snoozed" | "closed";
-
-export const FINDING_STATES: ReadonlySet<string> = new Set([
-  "actionable",
-  "claimed",
-  "snoozed",
-  "closed",
-]);
-
-export function isFindingClosed(finding: TowerDoFinding): boolean {
-  return finding.status === "done" || finding.status === "rejected";
-}
-
-/**
- * Derived lifecycle state. `accepted` only counts as `claimed` while its owner
- * is alive; a dead owner's claim collapses back to `actionable` so the finding
- * can be taken over. Liveness never means "resolved" — only the terminal
- * statuses do (see CONTRACTS.md).
- */
-export function deriveFindingState(
-  finding: TowerDoFinding,
-  now: number,
-  liveOwners: ReadonlySet<string>,
-): FindingState {
-  if (isFindingClosed(finding)) return "closed";
-  if (finding.status === "snoozed") {
-    return finding.snoozeUntil !== undefined && finding.snoozeUntil > now
-      ? "snoozed"
-      : "actionable";
-  }
-  if (finding.status === "accepted") {
-    return finding.owner !== undefined && liveOwners.has(finding.owner)
-      ? "claimed"
-      : "actionable";
-  }
-  return "actionable";
-}
-
-/**
- * Age past which a closed finding leaves the DEFAULT view (it stays in the
- * fold and stays readable via `view=all` / `findingId`). `at` is the
- * transition time, set by the close event, so this is the close age.
- */
-export function findingViewRetired(
-  finding: TowerDoFinding,
-  now: number,
-): boolean {
-  return isFindingClosed(finding) && now - finding.at > FINDING_CLOSE_GRACE_MS;
-}
-
-/** Keep every non-closed finding; view-retire closed ones past the grace. This
- * is the Layer 2 "default view" primitive: the dashboard's own state filter is
- * narrower today, but retirement must stay the outer bound so a future list
- * change cannot silently un-retire closed rows. */
-export function retainFindings(
-  findings: readonly TowerDoFinding[],
-  now: number,
-): TowerDoFinding[] {
-  return findings.filter((finding) => !findingViewRetired(finding, now));
-}
-
-export interface FindingCounts {
-  actionable: number;
-  claimed: number;
-  snoozed: number;
-  closed: number;
-  retired: number;
-}
-
-export function summarizeFindings(
-  findings: readonly TowerDoFinding[],
-  now: number,
-  liveOwners: ReadonlySet<string>,
-): FindingCounts {
-  const counts: FindingCounts = {
-    actionable: 0,
-    claimed: 0,
-    snoozed: 0,
-    closed: 0,
-    retired: 0,
-  };
-  for (const finding of findings) {
-    const state = deriveFindingState(finding, now, liveOwners);
-    if (state === "actionable") counts.actionable += 1;
-    else if (state === "claimed") counts.claimed += 1;
-    else if (state === "snoozed") counts.snoozed += 1;
-    else if (findingViewRetired(finding, now)) counts.retired += 1;
-    else counts.closed += 1;
-  }
-  return counts;
-}
-
-/** Non-closed findings a board carries — the budget's charge. */
-export function openFindingCount(
-  findings: readonly TowerDoFinding[],
-): number {
-  return findings.filter((finding) => !isFindingClosed(finding)).length;
-}
-
-/** Finding counts for a possibly digest-restored view. Only `closed`/`retired`
- *  are taken from the checkpoint: a digest carries no closed rows, so
- *  recomputing them would report 0 as fact. `actionable`/`claimed`/`snoozed`
- *  are always recomputed — liveness and snooze deadlines move on, and a frozen
- *  count would contradict the per-row state rendered on the same screen. */
-export function findingCountsFor(
-  view: TowerBoardView,
-  now: number,
-  liveOwners: ReadonlySet<string>,
-): FindingCounts {
-  const fresh = summarizeFindings(view.findings, now, liveOwners);
-  const carried = view.findingCountsAtCheckpoint;
-  return carried === undefined
-    ? fresh
-    : { ...fresh, closed: carried.closed, retired: carried.retired };
-}
-
-/** Overdue actionable: waiting longer than the close grace. */
-function findingOverdue(
-  finding: TowerDoFinding,
-  now: number,
-  state: FindingState,
-): boolean {
-  return state === "actionable" && now - finding.at > FINDING_CLOSE_GRACE_MS;
-}
-
-/**
- * Pressure order for the list: overdue actionable first (oldest of those
- * first — they are the rows the old `at DESC` page hid forever), then plain
- * actionable (newest first), claimed, snoozed (soonest deadline first), then
- * closed (newest first). Pure; the caller applies the page cut and discloses
- * it.
- *
- * "Oldest" is measured from `at`, the LAST transition (a claim, a snooze, a
- * reopen), not from first filing: a re-opened or re-claimed row ranks as
- * freshly active, which is what a reader triaging debt needs. There is
- * deliberately no separate `filedAt` (a persisted field nothing else reads).
- */
-export function findingPressureOrder(
-  findings: readonly TowerDoFinding[],
-  now: number,
-  liveOwners: ReadonlySet<string>,
-): TowerDoFinding[] {
-  const rank = (finding: TowerDoFinding): number => {
-    const state = deriveFindingState(finding, now, liveOwners);
-    if (findingOverdue(finding, now, state)) return 0;
-    if (state === "actionable") return 1;
-    if (state === "claimed") return 2;
-    if (state === "snoozed") return 3;
-    return 4;
-  };
-  return [...findings].sort((a, b) => {
-    const ra = rank(a);
-    const rb = rank(b);
-    if (ra !== rb) return ra - rb;
-    if (ra === 3) {
-      const ua = a.snoozeUntil ?? 0;
-      const ub = b.snoozeUntil ?? 0;
-      if (ua !== ub) return ua - ub;
-    }
-    // Overdue and claimed: longest-waiting first. Everything else: newest.
-    if (ra === 0 || ra === 2) return a.at - b.at;
-    return b.at - a.at;
-  });
-}
-
-function ageDays(ms: number): number {
-  return Math.max(0, Math.floor(ms / 86_400_000));
-}
-
-/**
- * Error message when filing a NEW finding must be rejected, else undefined.
- * Two independent bars, both executable by the caller:
- *  - close obligation: a live owner holding an overdue claimed finding;
- *  - budget: all non-closed findings (snoozed included) at the cap.
- * The budget error names the highest-pressure rows, because the failure the
- * old model produced was precisely that the backlog was invisible.
- */
-export function findingBudgetRejection(
-  findings: readonly TowerDoFinding[],
-  now: number,
-  liveOwners: ReadonlySet<string>,
-  caller: string,
-): string | undefined {
-  const owed = findings.filter(
-    (finding) =>
-      deriveFindingState(finding, now, liveOwners) === "claimed" &&
-      finding.owner !== undefined &&
-      // EXACT owner match, like every other permission/obligation check:
-      // aliasing here would make a bucket sibling carry (or escape) a claim
-      // that is not theirs (CONTRACTS.md "permission is exact").
-      finding.owner === caller &&
-      now - finding.at > FINDING_CLOSE_GRACE_MS,
-  );
-  if (owed.length > 0) {
-    return (
-      `you hold ${owed.length} claimed finding(s) past the ${String(Math.round(FINDING_CLOSE_GRACE_MS / 86_400_000))}d close grace ` +
-      `(${owed.map((finding) => finding.id).join(", ")}) — close (done|rejected) or snooze them before filing another`
-    );
-  }
-  const open = findings.filter((finding) => !isFindingClosed(finding));
-  if (open.length >= MAX_TOWER_DO_OPEN_FINDINGS) {
-    // Annotate each candidate with WHO holds it, not just its age: the remedy
-    // asks the caller to free a slot, and closing a row a live owner holds is
-    // a different act from draining an unheld backlog row. The finding update
-    // guard keys on owner liveness (not on the derived state), so the
-    // annotation must too: `snoozed` is not automatically drainable (a claim
-    // carried into the snooze stays held), and an `accepted` row whose owner
-    // died is. Without the hold state the caller's only options read as blind
-    // judgment calls on rows it cannot see (the 30-day unclaimed backlog this
-    // names today).
-    const ranked = findingPressureOrder(open, now, liveOwners).map(
-      (finding) => {
-        const heldByLive =
-          finding.owner !== undefined && liveOwners.has(finding.owner);
-        const state = deriveFindingState(finding, now, liveOwners);
-        const hold = heldByLive
-          ? `held by ${finding.owner} (live)`
-          : state === "snoozed"
-            ? "snoozed, no live holder"
-            : "no live claim";
-        return { finding, drainable: !heldByLive, hold };
-      },
-    );
-    const formatRow = (row: { finding: TowerDoFinding; hold: string }): string =>
-      `${row.finding.id} (${String(ageDays(now - row.finding.at))}d, ${row.finding.severity}/${row.finding.kind}, ${row.hold})`;
-    const top = ranked.slice(0, 5);
-    const drainableRows = ranked.filter((row) => row.drainable);
-    // The pressure order shows only the top 5. A drainable row can rank below
-    // claimed rows only when it is an unheld *snoozed* one (rank 3) — and the
-    // default dashboard list hides snoozed rows — so when the top 5 are all
-    // held, name the highest-pressure drainable row explicitly: otherwise the
-    // remedy points at a row the caller cannot locate. The label is not
-    // "oldest": within snoozed rows the pressure order is soonest-deadline.
-    const drainTarget =
-      drainableRows.length > 0 && !top.some((row) => row.drainable)
-        ? `  drain target: ${formatRow(drainableRows[0]!)}\n`
-        : "";
-    return (
-      `non-closed findings are at the budget (${String(MAX_TOWER_DO_OPEN_FINDINGS)}): close one first — a snooze still occupies a slot, so it frees nothing.\n` +
-      `  most pressing: ${top.map(formatRow).join(", ")}\n` +
-      drainTarget +
-      (drainableRows.length > 0
-        ? `  remedy: draining the budget is not a judgment on the finding — a row with no live claim is nobody's to defend, so close it as a budget drain: ` +
-          `tower_do_talk action=finding findingIds=[…] status=rejected reason="budget overflow: stale unclaimed finding"`
-        : `  remedy: every non-closed row is held by a live owner — a snooze frees nothing, so ask that owner (or ${TOWER_IDENTITY}) to close one, or wait for that owner to go offline (the claim then becomes drainable)`)
-    );
-  }
-  return undefined;
-}
-
 /**
  * Retire fully-read history: keep at most `retention` fully-read messages
  * (oldest first) once the folded set exceeds the budget. Unread and
@@ -2006,11 +1614,11 @@ export function retainMessages(
 // ---------------------------------------------------------------------------
 
 export interface ActivityEntry {
-  kind: "task" | "message" | "finding";
+  kind: "task" | "message";
   by: string;
   at: number;
   glyph: string;
-  /** Human summary: task key / recipient / finding title. */
+  /** Human summary: task key / recipient / subject. */
   detail: string;
   /** Structured task key for task events (undefined otherwise). `detail` is a
    * display string (`key: subject`) and must never be parsed back — the
@@ -2109,19 +1717,6 @@ export function parseActivityLine(line: string): ActivityEntry | undefined {
         at,
         glyph: "✉",
         detail: `→${message.to}: ${message.subject}`,
-      };
-    }
-    return undefined;
-  }
-  if (kind === "finding") {
-    const finding = readPersistedFinding(record.finding);
-    if (finding !== undefined) {
-      return {
-        kind: "finding",
-        by,
-        at,
-        glyph: "⚑",
-        detail: `[${finding.severity}] ${finding.title}`,
       };
     }
     return undefined;
@@ -2829,13 +2424,6 @@ export function truncateToAtMost(value: string, max: number): string {
   return `${chars.slice(0, max - 1).join("")}…`;
 }
 
-/** Longest rendered `summary` prefix for one open finding in the dashboard.
- * A finding's `summary` is up to 4000 characters and the list is not the place
- * to read it — the full text is one `findingId` lookup away. The surrounding
- * title/location/from fields carry their own limits, so the rendered line is
- * longer than this. */
-export const DASHBOARD_FINDING_LINE_CHARS = 240;
-
 /** Default `tower_do_status` dashboard budget (rows rendered per call). The
  * open-task quota is 50, so this can only ever bind on a long completed
  * history or an explicit smaller `limit`. */
@@ -3106,7 +2694,7 @@ export function formatBoardReminder(
   ];
   if (view.incomplete === true) {
     lines.push(
-      "⚠ board file is missing — this is the last bounded checkpoint (open tasks and finding titles only). Full content (messages, completed receipts, finding bodies) is unavailable; writes fold the missing file as an empty board.",
+      "⚠ board file is missing — this is the last bounded checkpoint (open tasks only). Full content (messages, completed receipts) is unavailable; writes fold the missing file as an empty board.",
     );
   }
   const shown = attention.slice(0, REMINDER_TASK_LINE_CAP);

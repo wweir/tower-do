@@ -43,10 +43,6 @@ import { TowerBoard } from "../board.ts";
 import {
   MAX_BLOCKER_CHARS,
   MAX_CHANGED_FILES,
-  MAX_FINDING_LOCATION_CHARS,
-  MAX_FINDING_SUGGESTED_FIX_CHARS,
-  MAX_FINDING_SUMMARY_CHARS,
-  MAX_FINDING_TITLE_CHARS,
   MAX_IDENTITY_CHARS,
   MAX_MESSAGE_SUBJECT_CHARS,
   MAX_PATH_ENTRY_CHARS,
@@ -122,10 +118,6 @@ const TOP_LEVEL: Array<[string, string, number]> = [
   ["tower_do_talk", "as", MAX_IDENTITY_CHARS],
   ["tower_do_talk", "to", MAX_IDENTITY_CHARS],
   ["tower_do_talk", "subject", MAX_MESSAGE_SUBJECT_CHARS],
-  ["tower_do_talk", "title", MAX_FINDING_TITLE_CHARS],
-  ["tower_do_talk", "summary", MAX_FINDING_SUMMARY_CHARS],
-  ["tower_do_talk", "location", MAX_FINDING_LOCATION_CHARS],
-  ["tower_do_talk", "suggestedFix", MAX_FINDING_SUGGESTED_FIX_CHARS],
   ["tower_do_status", "owner", MAX_IDENTITY_CHARS],
 ];
 

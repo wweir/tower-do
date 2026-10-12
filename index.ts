@@ -75,7 +75,6 @@ import { Type } from "typebox";
 import {
   normalizeBoardConfig,
   TowerBoard,
-  type BoardEvent,
   type TowerDoConfig,
 } from "./board.ts";
 import {
@@ -92,21 +91,12 @@ import {
   classifyTaskLayers,
   cloneBoard,
   createEmptyBoard,
-  DASHBOARD_FINDING_LINE_CHARS,
   DASHBOARD_ROW_BUDGET,
   DASHBOARD_SCOPE_CONFLICT_LINES,
   DEFAULT_IDENTITY,
-  deriveFindingState,
   derivePresence,
   deliveredMailIds,
   findAllUnresolvedDeps,
-  findingBudgetRejection,
-  findingPressureOrder,
-  FINDING_CLOSE_GRACE_MS,
-  FINDING_KINDS,
-  FINDING_SEVERITIES,
-  FINDING_SNOOZE_MAX_MS,
-  FINDING_STATUSES,
   formatActivityFeed,
   formatBoardProgress,
   formatBoardReminder,
@@ -125,7 +115,6 @@ import {
   getAllTasks,
   isCallerLine,
   isTowerDoStatus,
-  truncateChars,
   knownIdentities,
   latestActivity,
   LIVE_HEARTBEAT_MS,
@@ -135,11 +124,6 @@ import {
   liveSessionCount,
   parseLiveRecord,
   MAX_CHANGED_FILES,
-  MAX_FINDING_LOCATION_CHARS,
-  MAX_FINDING_REASON_CHARS,
-  MAX_FINDING_SUGGESTED_FIX_CHARS,
-  MAX_FINDING_SUMMARY_CHARS,
-  MAX_FINDING_TITLE_CHARS,
   MAX_IDENTITY_CHARS,
   MAX_MESSAGE_BYTES,
   MAX_MESSAGE_SUBJECT_CHARS,
@@ -150,20 +134,16 @@ import {
   MAX_TASK_KEY_CHARS,
   MAX_TASK_SUBJECT_CHARS,
   MAX_TOWER_DO_ALIASES,
-  MAX_TOWER_DO_OPEN_FINDINGS,
   MAX_TOWER_DO_OPEN_TASKS,
   messagesToMe,
   normalizeIdentity,
-  openFindingCount,
   parseActivityLine,
   relativeTime,
-  retainFindings,
   retainMessages,
   selectWakeMessages,
   sliceScopeConflicts,
   sliceTaskDashboard,
   staleTaskClaims,
-  findingCountsFor,
   taskIsBlocked,
   identityListHas,
   identitySetHas,
@@ -185,12 +165,8 @@ import {
   unreadMessagesToMe,
   writeBoardSnapshot,
   type ActivityEntry,
-  type FindingKind,
-  type FindingSeverity,
-  type FindingStatus,
   type LiveRecord,
   type TowerBoardView,
-  type TowerDoFinding,
   type TowerDoMailDetails,
   type TowerDoMessage,
   type TowerDoStatus,
@@ -604,9 +580,9 @@ const TowerDoParamsSchema = Type.Object({
 });
 
 const TalkParamsSchema = Type.Object({
-  action: StringEnum(["send", "inbox", "finding"] as const, {
+  action: StringEnum(["send", "inbox"] as const, {
     description:
-      "send delivers a message (requires to + subject + body); inbox lists AND acknowledges your messages (optional limit; all=true reads view-retired messages too); finding files a structured finding (requires kind + title + summary), updates one or many (findingId or findingIds + status), and requires a reason to close or snooze.",
+      "send delivers a message (requires to + subject + body); inbox lists AND acknowledges your messages (optional limit; all=true reads view-retired messages too).",
   }),
   to: Type.Optional(
     Type.String({
@@ -623,90 +599,16 @@ const TalkParamsSchema = Type.Object({
   ),
   body: Type.Optional(
     Type.String({
-      description: `send: the message body (required for send), max ${Math.round(MAX_MESSAGE_BYTES / 1024)} KiB — split oversized content into multiple messages. Findings use the separate summary/suggestedFix fields, not body.`,
+      description: `send: the message body (required for send), max ${Math.round(MAX_MESSAGE_BYTES / 1024)} KiB — split oversized content into multiple messages.`,
     }),
   ),
   taskKey: Type.Optional(
     Type.String({
       description:
-        "send only: task key this message threads under (must exist on the board). Passing it with inbox/finding is an error — findings are board-level and carry no task link.",
+        "send only: task key this message threads under (must exist on the board). Passing it with inbox is an error.",
       minLength: 1,
       maxLength: MAX_TASK_KEY_CHARS,
       pattern: TASK_KEY_PATTERN.source,
-    }),
-  ),
-  kind: Type.Optional(
-    StringEnum(["bug", "improve", "vuln", "idea"] as const, {
-      description: "finding: kind (required when filing a new finding)",
-    }),
-  ),
-  severity: Type.Optional(
-    StringEnum(["low", "medium", "high"] as const, {
-      description: "finding: severity (default: medium)",
-    }),
-  ),
-  title: Type.Optional(
-    Type.String({
-      description: "finding: title (required when filing a new finding)",
-      maxLength: MAX_FINDING_TITLE_CHARS,
-    }),
-  ),
-  summary: Type.Optional(
-    Type.String({
-      description: "finding: summary (required when filing a new finding)",
-      maxLength: MAX_FINDING_SUMMARY_CHARS,
-    }),
-  ),
-  location: Type.Optional(
-    Type.String({
-      description: "finding: file/line location",
-      maxLength: MAX_FINDING_LOCATION_CHARS,
-    }),
-  ),
-  suggestedFix: Type.Optional(
-    Type.String({
-      description: "finding: suggested fix",
-      maxLength: MAX_FINDING_SUGGESTED_FIX_CHARS,
-    }),
-  ),
-  findingId: Type.Optional(
-    Type.String({
-      description:
-        "finding: id to update (with status). Mutually exclusive with findingIds.",
-    }),
-  ),
-  findingIds: Type.Optional(
-    Type.Array(Type.String(), {
-      description:
-        "finding: ids to update in one atomic batch (each appends its own event). Mutually exclusive with findingId; status/reason/snoozeUntil apply to every id.",
-      maxItems: transportLimit(MAX_TOWER_DO_OPEN_FINDINGS),
-    }),
-  ),
-  owner: Type.Optional(
-    Type.String({
-      description:
-        "finding: accountability owner. Set together with status=accepted to claim; omitted on a claim defaults to you. A non-tower caller may pass only its OWN identity (only tower may name a different owner); a stale, non-live claim stays adoptable by another agent through status=accepted without owner.",
-      maxLength: transportLimit(MAX_IDENTITY_CHARS),
-    }),
-  ),
-  reason: Type.Optional(
-    Type.String({
-      description:
-        `finding: single-line reason. Required for status=done|rejected|snoozed — closing without a reason is the silent-wrong class this board prevents.`,
-      maxLength: transportLimit(MAX_FINDING_REASON_CHARS),
-    }),
-  ),
-  snoozeUntil: Type.Optional(
-    Type.Integer({
-      description:
-        `finding: epoch ms when status=snoozed returns to actionable. Must be in the future and at most ${Math.round(FINDING_SNOOZE_MAX_MS / 86_400_000)}d ahead.`,
-      minimum: 0,
-    }),
-  ),
-  status: Type.Optional(
-    StringEnum(["open", "accepted", "snoozed", "rejected", "done"] as const, {
-      description:
-        "finding update: new status; requires findingId or findingIds. done|rejected|snoozed require a reason; accepted claims (owner defaults to you); open reopens.",
     }),
   ),
   all: Type.Optional(
@@ -739,13 +641,6 @@ const StatusParamsSchema = Type.Object({
       minLength: 1,
       maxLength: MAX_TASK_KEY_CHARS,
       pattern: TASK_KEY_PATTERN.source,
-    }),
-  ),
-  findingId: Type.Optional(
-    Type.String({
-      description:
-        "When set, return the FULL text of this single finding (summary + suggestedFix) instead of the dashboard — the list renders at most a truncated first line; takes precedence over taskKey. Error if the id is unknown.",
-      minLength: 1,
     }),
   ),
   owner: Type.Optional(
@@ -1387,9 +1282,6 @@ export default function towerDoExtension(pi: ExtensionAPI): void {
     const all = new Set(live.owners);
     for (const task of view.tasks) {
       if (task.owner !== undefined) all.add(task.owner);
-    }
-    for (const finding of view.findings) {
-      if (finding.owner !== undefined) all.add(finding.owner);
     }
     return all;
   };
@@ -2148,13 +2040,11 @@ export default function towerDoExtension(pi: ExtensionAPI): void {
     name: TOWER_DO_TALK_TOOL_NAME,
     label: "TowerDo Talk",
     description:
-      `Cross-agent communication on the shared tower-do board. action=send delivers an inbox message to "all", the orchestrator identity "tower", a current task owner, or anyone with recent board activity (self-send rejected); taskKey optionally threads it under a task. action=inbox lists messages addressed to you or "all", newest first, and ACKS the ones it shows (marks them read; acked messages can be retired) — use tower_do_status to read messages without acking. action=finding files a structured out-of-scope finding (bug|improve|vuln|idea) with severity/location/suggestedFix, or updates one or many (findingId or findingIds + status): accepted claims it (owner defaults to you), done|rejected|snoozed require a reason, snoozed needs a future snoozeUntil, and open reopens. Non-closed findings are budgeted (${MAX_TOWER_DO_OPEN_FINDINGS}); a snooze still occupies a slot, so close (done|rejected) to free one before filing past the cap. Every open finding is listed oldest-debt-first. Use findings instead of silently editing other-owned tasks.`,
+      `Cross-agent communication on the shared tower-do board. action=send delivers an inbox message to "all", the orchestrator identity "tower", a current task owner, or anyone with recent board activity (self-send rejected); taskKey optionally threads it under a task. action=inbox lists messages addressed to you or "all", newest first, and ACKS the ones it shows (marks them read; acked messages can be retired) — use tower_do_status to read messages without acking.`,
     promptSnippet:
-      "Send addressed messages or file findings on the shared multi-agent board",
+      "Send addressed messages on the shared multi-agent board",
     promptGuidelines: [
       'Use tower_do_talk to communicate with task owners on the shared board instead of editing owned tasks directly; the recipient must be "all", "tower", a current task owner, or someone with recent board activity (e.g. a peer whose tasks are all completed).',
-      "Use action=finding (not direct edits) when you discover an out-of-scope problem — file it with kind/severity/summary/suggestedFix so the owning agent and reviewers can route it.",
-      `Findings have a lifecycle, not just a create: claim one you take on (status=accepted, owner defaults to you), and close it (done/rejected) or snooze it with a reason when you are finished — a live owner sitting on a claimed finding past the grace period is blocked from filing new ones, and the non-closed budget is ${MAX_TOWER_DO_OPEN_FINDINGS}.`,
       "Keep message bodies brief and reference files by path; the board persists everything, so pointer-style notes keep context lean.",
       "Prefer tower_do_status over action=inbox when you only need to read messages: inbox acknowledges what it shows, status does not.",
     ],
@@ -2219,7 +2109,7 @@ export default function towerDoExtension(pi: ExtensionAPI): void {
         // audience snapshot and the append: `append` alone takes the lease
         // AFTER those checks, so a peer could delete the task in between and
         // the persisted message would carry a dangling taskKey (the same
-        // reason tower_do and the finding paths use withWriteLock).
+        // reason tower_do uses withWrite).
         await board.withWrite(async (appendLocked) => {
           throwIfAborted(signal, "TowerDo talk");
           const fresh = await foldRetained(ctx.cwd);
@@ -2412,333 +2302,11 @@ export default function towerDoExtension(pi: ExtensionAPI): void {
         });
       }
 
-      // action === finding (update one or a batch)
-      if (params.findingId !== undefined && params.findingIds !== undefined) {
-        throw new TowerDoValidationError(
-          "finding update accepts either findingId or findingIds, not both",
-        );
-      }
-      const targetIds =
-        params.findingIds !== undefined
-          ? [
-              ...new Set(
-                params.findingIds.map((id) => id.trim()).filter(Boolean),
-              ),
-            ]
-          : params.findingId !== undefined
-            ? [params.findingId]
-            : undefined;
-      if (targetIds !== undefined) {
-        if (targetIds.length === 0) {
-          throw new TowerDoValidationError(
-            "findingIds must name at least one finding",
-          );
-        }
-        if (targetIds.length > MAX_TOWER_DO_OPEN_FINDINGS) {
-          throw new TowerDoValidationError(
-            `findingIds names ${String(targetIds.length)} findings (max ${String(MAX_TOWER_DO_OPEN_FINDINGS)}) — split the batch across successive calls`,
-          );
-        }
-        if (!FINDING_STATUSES.has(params.status ?? "")) {
-          throw new TowerDoValidationError(
-            "finding update requires status in open|accepted|snoozed|rejected|done",
-          );
-        }
-        const nextStatus = params.status as FindingStatus;
-        const reason = params.reason?.trim();
-        // Closing/held without a reason is the silent-wrong class the board
-        // exists to prevent: the transition must say why.
-        if (
-          (nextStatus === "done" ||
-            nextStatus === "rejected" ||
-            nextStatus === "snoozed") &&
-          !reason
-        ) {
-          throw new TowerDoValidationError(
-            `finding status=${nextStatus} requires a reason (single line, max ${MAX_FINDING_REASON_CHARS} chars)`,
-          );
-        }
-        if (reason && /[\r\n\u2028\u2029]/.test(reason)) {
-          throw new TowerDoValidationError(
-            "finding reason must be a single line",
-          );
-        }
-        if (reason && textLength(reason) > MAX_FINDING_REASON_CHARS) {
-          throw new TowerDoValidationError(
-            `finding reason is ${textLength(reason)} characters (max ${MAX_FINDING_REASON_CHARS}) — shorten it`,
-          );
-        }
-        let snoozeUntil: number | undefined;
-        if (nextStatus === "snoozed") {
-          snoozeUntil = params.snoozeUntil ?? now + FINDING_SNOOZE_MAX_MS;
-          if (!Number.isSafeInteger(snoozeUntil) || snoozeUntil <= now) {
-            throw new TowerDoValidationError(
-              "finding snoozeUntil must be a future epoch-ms value",
-            );
-          }
-          if (snoozeUntil > now + FINDING_SNOOZE_MAX_MS) {
-            throw new TowerDoValidationError(
-              `finding snoozeUntil is more than ${String(Math.round(FINDING_SNOOZE_MAX_MS / 86_400_000))}d ahead — a snooze defers a finding, it never resolves it`,
-            );
-          }
-        }
-        const explicitOwner = params.owner?.trim();
-        if (explicitOwner && /[\r\n\u2028\u2029]/.test(explicitOwner)) {
-          throw new TowerDoValidationError(
-            "finding owner must be a single line",
-          );
-        }
-        if (explicitOwner && textLength(explicitOwner) > MAX_IDENTITY_CHARS) {
-          throw new TowerDoValidationError(
-            `finding owner is ${textLength(explicitOwner)} characters (max ${MAX_IDENTITY_CHARS}) — shorten it`,
-          );
-        }
-        if (
-          explicitOwner &&
-          // Permission is EXACT, never aliased: `sameAgent` would hand a
-          // bucket sibling (a different session inside the same 65.5s label
-          // bucket) authority over someone else's claim.
-          explicitOwner !== caller &&
-          caller !== TOWER_IDENTITY
-        ) {
-          throw new TowerDoValidationError(
-            `finding owner may only be reassigned by ${TOWER_IDENTITY} (got "${explicitOwner}")`,
-          );
-        }
-        const updatedFindings = await board.withWrite(
-          async (appendLocked) => {
-            throwIfAborted(signal, "TowerDo talk");
-            // Re-fold inside the lease: the findings may have changed since
-            // the pre-queue fold in prepare(). The lease spans the fold, the
-            // budget check and the append, so a concurrent process cannot
-            // slip an extra non-closed finding between them.
-            const fresh = await foldRetained(ctx.cwd);
-            throwIfAborted(signal, "TowerDo talk");
-            const byId = new Map(
-              fresh.findings.map((finding) => [finding.id, finding]),
-            );
-            const missing = targetIds.filter((id) => !byId.has(id));
-            if (missing.length > 0) {
-              throw new TowerDoValidationError(
-                `unknown finding ${missing.join(", ")}`,
-              );
-            }
-            const liveRead = await readLiveOwners(ctx.cwd);
-            const events: BoardEvent[] = [];
-            const next: TowerDoFinding[] = [];
-            for (const id of targetIds) {
-              const existing = byId.get(id)!;
-              // Accountability guard: a LIVE claim belongs to its owner (or
-              // tower). A stale/dead claim is adoptable — liveness only
-              // decides who may act, never whether the finding is resolved.
-              // EXACT label match: CONTRACTS.md "permission is exact, only
-              // delivery and display alias" — a legacy/current bucket sibling
-              // must not be able to change this claim.
-              if (
-                existing.owner !== undefined &&
-                existing.owner !== caller &&
-                caller !== TOWER_IDENTITY &&
-                (!liveRead.complete || liveRead.owners.has(existing.owner))
-              ) {
-                throw new TowerDoValidationError(
-                  `finding ${id} is claimed by "${existing.owner}" (live) — only its owner or ${TOWER_IDENTITY} may change it`,
-                );
-              }
-              const effectiveOwner =
-                nextStatus === "accepted"
-                  ? (explicitOwner ??
-                    (existing.owner === undefined
-                      ? caller
-                      : existing.owner === caller ||
-                          caller === TOWER_IDENTITY
-                        ? existing.owner
-                        : // Reaching here means the guard let a non-owner,
-                          // non-tower caller through because the claim was not
-                          // live: this is a takeover, so the claimer owns it.
-                          caller))
-                  : nextStatus === "open"
-                    ? undefined
-                    : existing.owner;
-              const row: TowerDoFinding = {
-                ...existing,
-                status: nextStatus,
-                at: now,
-              };
-              if (effectiveOwner === undefined) delete row.owner;
-              else row.owner = effectiveOwner;
-              if (reason === undefined) delete row.reason;
-              else row.reason = reason;
-              if (nextStatus === "snoozed" && snoozeUntil !== undefined) {
-                row.snoozeUntil = snoozeUntil;
-              } else {
-                delete row.snoozeUntil;
-              }
-              next.push(row);
-              events.push({
-                kind: "finding",
-                finding: row,
-                by: caller,
-                at: now,
-              });
-            }
-            throwIfAborted(signal, "TowerDo talk");
-            // Reopening (`status=open`) a closed finding adds a non-closed row,
-            // so the update path must enforce the same budget the create path
-            // does — otherwise close/reopen cycles bypass the cap.
-            const byIdNextProbe = new Map(
-              next.map((finding) => [finding.id, finding]),
-            );
-            const mergedFindings = fresh.findings.map(
-              (finding) => byIdNextProbe.get(finding.id) ?? finding,
-            );
-            const beforeOpen = openFindingCount(fresh.findings);
-            const afterOpen = openFindingCount(mergedFindings);
-            // Only an increase can breach the budget — and only a reopen can
-            // increase it. Blocking any over-cap update would make a legacy
-            // board (e.g. the 73-open motivating case) impossible to drain:
-            // closing one row from 52 leaves 51, still > 50, and must be
-            // allowed.
-            if (
-              afterOpen > beforeOpen &&
-              afterOpen > MAX_TOWER_DO_OPEN_FINDINGS
-            ) {
-              throw new TowerDoValidationError(
-                `this update would grow non-closed findings over the budget (${String(MAX_TOWER_DO_OPEN_FINDINGS)}): ${String(beforeOpen)} -> ${String(afterOpen)}. A snooze still occupies a slot, so close one first — draining an unheld row is not a judgment on it: tower_do_talk action=finding findingIds=[…] status=rejected reason="budget overflow: stale unclaimed finding"`,
-              );
-            }
-            await appendLocked(events);
-            const byIdNext = new Map(
-              next.map((finding) => [finding.id, finding]),
-            );
-            currentView = cloneBoard({
-              ...fresh,
-              findings: fresh.findings.map(
-                (finding) => byIdNext.get(finding.id) ?? finding,
-              ),
-            });
-            updateWidget(ctx);
-            return next;
-          },
-        );
-        const ids = updatedFindings.map((finding) => finding.id);
-        return {
-          content: [
-            {
-              type: "text",
-              text:
-                ids.length === 1
-                  ? `TowerDo finding ${ids[0]} updated → ${nextStatus}`
-                  : `TowerDo findings updated → ${nextStatus}: ${ids.join(", ")}`,
-            },
-          ],
-          details: { caller, findingIds: ids, status: nextStatus },
-        };
-      }
-      if (
-        params.status !== undefined ||
-        params.owner !== undefined ||
-        params.reason !== undefined ||
-        params.snoozeUntil !== undefined
-      ) {
-        throw new TowerDoValidationError(
-          "status/owner/reason/snoozeUntil apply to a finding UPDATE (pass findingId or findingIds); a new finding is always filed open — file it, then claim it via status=accepted",
-        );
-      }
-      const kind = params.kind as FindingKind | undefined;
-      if (!kind || !FINDING_KINDS.has(kind)) {
-        throw new TowerDoValidationError(
-          "finding requires kind in bug|improve|vuln|idea",
-        );
-      }
-      const severity =
-        (params.severity as FindingSeverity | undefined) ?? "medium";
-      if (!FINDING_SEVERITIES.has(severity)) {
-        throw new TowerDoValidationError(
-          "finding severity must be low|medium|high",
-        );
-      }
-      const title = params.title?.trim();
-      if (!title) throw new TowerDoValidationError("finding requires a title");
-      if (/[\r\n\u2028\u2029]/.test(title)) {
-        throw new TowerDoValidationError("finding title must be a single line");
-      }
-      const summary = params.summary?.trim();
-      if (!summary)
-        throw new TowerDoValidationError("finding requires a summary");
-      const location = params.location?.trim();
-      if (location && /[\r\n\u2028\u2029]/.test(location)) {
-        throw new TowerDoValidationError(
-          "finding location must be a single line",
-        );
-      }
-      if (location && textLength(location) > MAX_FINDING_LOCATION_CHARS) {
-        throw new TowerDoValidationError(
-          `finding location is ${textLength(location)} characters (max ${MAX_FINDING_LOCATION_CHARS}) — shorten it`,
-        );
-      }
-      const suggestedFix = params.suggestedFix?.trim();
-      if (suggestedFix && /[\r\n\u2028\u2029]/.test(suggestedFix)) {
-        throw new TowerDoValidationError(
-          "finding suggestedFix must be a single line",
-        );
-      }
-      if (
-        suggestedFix &&
-        textLength(suggestedFix) > MAX_FINDING_SUGGESTED_FIX_CHARS
-      ) {
-        throw new TowerDoValidationError(
-          `finding suggestedFix is ${textLength(suggestedFix)} characters (max ${MAX_FINDING_SUGGESTED_FIX_CHARS}) — shorten it`,
-        );
-      }
-      const finding: TowerDoFinding = {
-        id: `f-${randomUUID().slice(0, 12)}`,
-        kind,
-        title,
-        severity,
-        status: "open",
-        summary,
-        ...(location ? { location } : {}),
-        ...(suggestedFix ? { suggestedFix } : {}),
-        from: caller,
-        at: now,
-      };
-      await board.withWrite(async (appendLocked) => {
-        throwIfAborted(signal, "TowerDo talk");
-        const fresh = await foldRetained(ctx.cwd);
-        throwIfAborted(signal, "TowerDo talk");
-        // Exit mechanism (Layer 1): the budget is charged to every non-closed
-        // finding, and a live owner with an overdue claim must close it first.
-        // Both bars carry an executable remedy in the message. The lease held
-        // by withWriteLock makes the count-and-append atomic across processes.
-        const liveOwners = effectiveLiveOwners(
-          fresh,
-          await readLiveOwners(ctx.cwd),
-        );
-        const rejection = findingBudgetRejection(
-          fresh.findings,
-          now,
-          liveOwners,
-          caller,
-        );
-        if (rejection !== undefined) {
-          throw new TowerDoValidationError(rejection);
-        }
-        await appendLocked([{ kind: "finding", finding, by: caller, at: now }]);
-        currentView = cloneBoard({
-          ...fresh,
-          findings: [...fresh.findings, finding],
-        });
-        updateWidget(ctx);
-      });
-      return {
-        content: [
-          {
-            type: "text",
-            text: `TowerDo finding filed: [${severity}/${kind}] ${title} (${finding.id})`,
-          },
-        ],
-        details: { caller, findingId: finding.id },
-      };
+      // Unreachable: the arg schema allows only send|inbox. Kept so the
+      // exhaustiveness is explicit rather than an implicit `undefined` return.
+      throw new TowerDoValidationError(
+        `unsupported tower_do_talk action: ${String(params.action)}`,
+      );
     },
 
     renderCall(args, theme, context) {
@@ -2749,9 +2317,6 @@ export default function towerDoExtension(pi: ExtensionAPI): void {
       let detail = "";
       if (action === "send") {
         detail = typeof args.to === "string" && args.to ? ` → ${args.to}` : "";
-      } else if (action === "finding") {
-        detail =
-          typeof args.title === "string" && args.title ? `: ${args.title}` : "";
       }
       text.setText(
         theme.fg("toolTitle", theme.bold(`tower_do_talk ${action}${detail}`)),
@@ -2777,15 +2342,6 @@ export default function towerDoExtension(pi: ExtensionAPI): void {
         text.setText(theme.fg("success", `sent ${details.messageId}`));
         return text;
       }
-      if (typeof details.findingId === "string") {
-        text.setText(
-          theme.fg(
-            "success",
-            `${details.findingId} ${typeof details.status === "string" ? details.status : "filed"}`,
-          ),
-        );
-        return text;
-      }
       const output = toolResultText(result);
       text.setText(
         output
@@ -2803,9 +2359,9 @@ export default function towerDoExtension(pi: ExtensionAPI): void {
   pi.registerTool({
     name: TOWER_DO_STATUS_TOOL_NAME,
     label: "TowerDo Status",
-    description: `Read the shared tower-do board: everyone's tasks (owner, status, deps, scope, blocks), messages addressed to you, open findings, and the recent activity tail. Unfinished work is caller-centred: your own rows and the peer rows you are coupled to (your unfinished work awaits it, it awaits yours, unread mail threads under it, or its declared scope intersects yours) render in full, recency-first, while every other unfinished row folds into one shape summary plus a \`key status @owner\` ledger — keys stay enumerable so you can target a single row, and completed rows stay a compact key ledger (their detail is one taskKey lookup away). Still bounded by the dashboard budget and the byte/line caps, which disclose what they cut. Also prints the board file path and the current revision (pass it back as baseRevision) so subagents can read state directly (file-as-state). Reading here does NOT ack messages (tower_do_talk action=inbox does). Pass taskKey for the FULL detail of one task, findingId for the full text of one finding, view=all to expand the folded layer, or view=mine to narrow to your own rows. Output is bounded to ${Math.round(DEFAULT_MAX_BYTES / 1024)}KB / ${String(DEFAULT_MAX_LINES)} lines from the TAIL (the head — header, revision, board file path and open-task rows — is dropped first) and says so in a footer when that happens.`,
+    description: `Read the shared tower-do board: everyone's tasks (owner, status, deps, scope, blocks), messages addressed to you, and the recent activity tail. Unfinished work is caller-centred: your own rows and the peer rows you are coupled to (your unfinished work awaits it, it awaits yours, unread mail threads under it, or its declared scope intersects yours) render in full, recency-first, while every other unfinished row folds into one shape summary plus a \`key status @owner\` ledger — keys stay enumerable so you can target a single row, and completed rows stay a compact key ledger (their detail is one taskKey lookup away). Still bounded by the dashboard budget and the byte/line caps, which disclose what they cut. Also prints the board file path and the current revision (pass it back as baseRevision) so subagents can read state directly (file-as-state). Reading here does NOT ack messages (tower_do_talk action=inbox does). Pass taskKey for the FULL detail of one task, view=all to expand the folded layer, or view=mine to narrow to your own rows. Output is bounded to ${Math.round(DEFAULT_MAX_BYTES / 1024)}KB / ${String(DEFAULT_MAX_LINES)} lines from the TAIL (the head — header, revision, board file path and open-task rows — is dropped first) and says so in a footer when that happens.`,
     promptSnippet:
-      "Show the shared multi-agent task board: tasks, messages, findings, activity",
+      "Show the shared multi-agent task board: tasks, messages, activity",
     promptGuidelines: [
       "Use tower_do_status before starting work to see who owns what on the shared board, and before finishing work to reconcile your own tasks.",
       "When a tower_do write is rejected as stale, call tower_do_status first to re-read the current revision, then merge your changes and retry with the new baseRevision.",
@@ -2864,39 +2420,6 @@ export default function towerDoExtension(pi: ExtensionAPI): void {
       const allMyMessages = messagesToMe(view, caller).sort((a, b) => b.at - a.at);
       const myMessages = allMyMessages.slice(0, DASHBOARD_LIST_LIMIT);
       const myUnread = unreadMessagesToMe(view, caller).length;
-      // Finding exit mechanism (Layer 1/2): liveness decides claimed vs
-      // actionable, every non-closed row is budget, and the page is ordered by
-      // PRESSURE (oldest overdue first) so the dashboard and the budget error
-      // name the same rows. `view=all` widens to every row including snoozed
-      // and closed-within-grace; the default list is the actionable/claimed
-      // set and the rest are counts plus a disclosure.
-      const liveOwners = effectiveLiveOwners(
-        view,
-        await readLiveOwners(ctx.cwd),
-      );
-      // A digest-restored view carries no closed rows, so a fresh summarize
-      // would report `closed: 0 / retired: 0` as fact; the helper takes those
-      // two from the checkpoint and keeps the live states fresh.
-      const findingCounts = findingCountsFor(view, now, liveOwners);
-      const findingOpenCount = openFindingCount(view.findings);
-      // Layer 2 outer bound first (closed past the grace are retired), then the
-      // default state filter (actionable/claimed). `view=all` ignores both.
-      const visibleFindings = retainFindings(view.findings, now);
-      const findingRows =
-        params.view === "all"
-          ? findingPressureOrder(view.findings, now, liveOwners)
-          : findingPressureOrder(
-              visibleFindings.filter((finding) => {
-                const state = deriveFindingState(finding, now, liveOwners);
-                return state === "actionable" || state === "claimed";
-              }),
-              now,
-              liveOwners,
-            );
-      const openFindings =
-        params.view === "all"
-          ? findingRows
-          : findingRows.slice(0, DASHBOARD_LIST_LIMIT);
       // Derived scope × changedFiles advisory. Pure read, rendered as a
       // dedicated section (not per-row suffix) so long scope lists don't
       // explode every task line.
@@ -2945,69 +2468,6 @@ export default function towerDoExtension(pi: ExtensionAPI): void {
           `Revision ${String(view.revision)} · board file ${board.file}`;
         return `${kept.content}\n${footer}`;
       };
-
-      // Single-finding detail mode: a finding's summary is capped at 4000
-      // characters and the dashboard list shows one truncated line, so the
-      // full text needs its own read path.
-      if (params.findingId !== undefined) {
-        const finding = view.findings.find(
-          (entry) => entry.id === params.findingId,
-        );
-        if (finding === undefined) {
-          throw new TowerDoValidationError(
-            `no finding with id "${params.findingId}" on the board (revision ${view.revision})`,
-          );
-        }
-        const detail = [
-          `TowerDo finding ${finding.id} — revision ${view.revision} (board file: ${board.file})`,
-          `- id: ${finding.id}`,
-          `- kind/severity: ${finding.kind} / ${finding.severity}`,
-          `- status: ${finding.status}`,
-        ];
-        detail.push(
-          view.incomplete === true
-            ? "- from: unavailable (restored from a bounded checkpoint — no timestamp or author is kept)"
-            : `- from: ${finding.from} (${new Date(finding.at).toISOString()})`,
-        );
-        if (finding.owner !== undefined) {
-          detail.push(`- owner: ${finding.owner}`);
-        }
-        if (finding.reason !== undefined) {
-          detail.push(`- reason: ${finding.reason}`);
-        }
-        if (finding.snoozeUntil !== undefined) {
-          detail.push(
-            `- snoozeUntil: ${new Date(finding.snoozeUntil).toISOString()}`,
-          );
-        }
-        if (finding.location !== undefined) {
-          detail.push(`- location: ${finding.location}`);
-        }
-        detail.push(`- title: ${finding.title}`);
-        detail.push("- summary:");
-        for (const row of finding.summary.split("\n")) detail.push(`  ${row}`);
-        if (finding.suggestedFix !== undefined) {
-          detail.push("- suggestedFix:");
-          for (const row of finding.suggestedFix.split("\n")) {
-            detail.push(`  ${row}`);
-          }
-        }
-        return {
-          content: [
-            {
-              type: "text",
-              text: boundedDetail(`${detail.join("\n")}\n`, "finding detail"),
-            },
-          ],
-          details: {
-            caller,
-            revision: view.revision,
-            board: board.file,
-            identity: caller,
-            findingId: finding.id,
-          },
-        };
-      }
 
       // Single-task detail mode: taskKey takes precedence over the dashboard
       // filters — the caller asked for one task's full record (description is
@@ -3086,11 +2546,11 @@ export default function towerDoExtension(pi: ExtensionAPI): void {
       lines.push(`Board file: ${board.file}`);
       if (view.incomplete === true) {
         lines.push(
-          "⚠ this view is a bounded checkpoint from a previous session's transcript (open tasks + finding titles only; full content unavailable) — the board file was missing when it was restored. Writes treat a missing file as an empty board.",
+          "⚠ this view is a bounded checkpoint from a previous session's transcript (open tasks only; full content unavailable) — the board file was missing when it was restored. Writes treat a missing file as an empty board.",
         );
       } else if (
         !existsSync(board.file) &&
-        view.tasks.length + view.messages.length + view.findings.length > 0
+        view.tasks.length + view.messages.length > 0
       ) {
         // A LEGACY full-board checkpoint restores as a complete view
         // (`incomplete` is undefined), so a non-empty view with a missing file
@@ -3371,66 +2831,6 @@ export default function towerDoExtension(pi: ExtensionAPI): void {
         );
       }
       if (myMessages.length === 0) lines.push("(none)");
-
-      lines.push("");
-      lines.push(
-        `${params.view === "all" ? "## Findings" : "## Open findings"} (${String(findingOpenCount)}/${String(MAX_TOWER_DO_OPEN_FINDINGS)} non-closed · ` +
-          `${String(findingCounts.actionable)} actionable · ${String(findingCounts.claimed)} claimed · ` +
-          `${String(findingCounts.snoozed)} snoozed · ${String(findingCounts.closed)} closed<${String(Math.round(FINDING_CLOSE_GRACE_MS / 86_400_000))}d` +
-          (findingCounts.retired > 0
-            ? ` · ${String(findingCounts.retired)} retired`
-            : "") +
-          ")",
-      );
-      for (const finding of openFindings) {
-        const location =
-          finding.location === undefined ? "" : ` @${finding.location}`;
-        // The list is a list: one truncated line per finding, the full text is
-        // one `findingId` lookup away. suggestedFix is dropped here for the
-        // same reason (a finding holds up to 4000 + 2000 characters).
-        const summary = truncateChars(
-          finding.summary.split("\n")[0] ?? "",
-          DASHBOARD_FINDING_LINE_CHARS,
-        );
-        const state = deriveFindingState(finding, now, liveOwners);
-        const age = Math.max(0, Math.floor((now - finding.at) / 86_400_000));
-        // A digest-only fallback carries no real timestamps (`at` is 0), so an
-        // age/overdue tag would read as decades old — omit it instead.
-        const tag =
-          view.incomplete === true
-            ? ""
-            : state === "snoozed"
-              ? ` snoozed ${String(
-                  Math.max(
-                    0,
-                    Math.ceil(((finding.snoozeUntil ?? now) - now) / 86_400_000),
-                  ),
-                )}d more`
-              : state === "claimed"
-                ? ` claimed by ${finding.owner ?? "?"} ${String(age)}d`
-                : now - finding.at > FINDING_CLOSE_GRACE_MS
-                  ? ` ${String(age)}d overdue`
-                  : ` ${String(age)}d`;
-        const owner =
-          finding.owner === undefined ? "" : ` (owed to ${finding.owner})`;
-        const from = finding.from === "" ? "" : ` (${finding.from})`;
-        lines.push(
-          `- [${finding.id}] [${finding.severity}/${finding.kind}] ${finding.title}${from}${owner}${location} — ${summary}${tag}`,
-        );
-      }
-      if (openFindings.length === 0) lines.push("(none)");
-      if (findingRows.length > openFindings.length) {
-        lines.push(
-          `  … +${String(findingRows.length - openFindings.length)} more finding(s) not shown — view=all lists every row (oldest debt first)`,
-        );
-      }
-      if (findingCounts.retired > 0) {
-        lines.push(
-          view.incomplete === true
-            ? `  … ${String(findingCounts.retired)} closed finding(s) retired beyond ${String(Math.round(FINDING_CLOSE_GRACE_MS / 86_400_000))}d — not in this checkpoint (the board file is missing; their full text is unavailable)`
-            : `  … ${String(findingCounts.retired)} closed finding(s) retired beyond ${String(Math.round(FINDING_CLOSE_GRACE_MS / 86_400_000))}d — view=all lists them, findingId reads full text`,
-        );
-      }
 
       lines.push("");
       lines.push("## Recent activity (newest first)");

@@ -28,7 +28,6 @@ import {
   isEpochMs,
   isRecord,
   normalizeIdentity,
-  readPersistedFinding,
   readPersistedMessage,
   readPersistedTask,
   sameAgent,
@@ -36,18 +35,16 @@ import {
   TOWER_IDENTITY,
   TowerDoValidationError,
   type TowerBoardView,
-  type TowerDoFinding,
   type TowerDoMessage,
   type TowerDoTask,
 } from "./state.ts";
 
 export interface BoardEvent {
-  kind: "task" | "message" | "finding";
+  kind: "task" | "message";
   op?: "upsert" | "remove";
   key?: string;
   task?: TowerDoTask;
   message?: TowerDoMessage;
-  finding?: TowerDoFinding;
   by: string;
   at: number;
 }
@@ -105,16 +102,9 @@ function readEvent(candidate: unknown): ReadEventResult {
     if (!message) return undefined;
     return { kind: "message", message, by, at };
   }
-  if (candidate.kind === "finding" && isRecord(candidate.finding)) {
-    const finding = readPersistedFinding(candidate.finding);
-    const by =
-      typeof candidate.by === "string" ? candidate.by : (finding?.from ?? "?");
-    const at = isEpochMs(candidate.at)
-      ? candidate.at
-      : (finding?.at ?? Date.now());
-    if (!finding) return undefined;
-    return { kind: "finding", finding, by, at };
-  }
+  // Findings are retired from the product: legacy lines are valid history, not
+  // corrupt, so they are ignored rather than counted as unfoldable.
+  if (candidate.kind === "finding") return ignored;
   return undefined;
 }
 
@@ -147,7 +137,6 @@ export class TowerBoard {
     }
     const tasks = new Map<string, TowerDoTask>();
     const messages = new Map<string, TowerDoMessage>();
-    const findings = new Map<string, TowerDoFinding>();
     let revision = 0;
     let skipped = 0;
     let index = 0;
@@ -275,9 +264,6 @@ export class TowerBoard {
         }
         continue;
       }
-      if (event.kind === "finding" && event.finding !== undefined) {
-        findings.set(event.finding.id, event.finding); // LWW by id
-      }
     }
     const orderedTasks = [...tasks.values()];
     orderedTasks.sort((a, b) => a.updatedAt - b.updatedAt);
@@ -288,7 +274,6 @@ export class TowerBoard {
       revision,
       tasks: orderedTasks,
       messages: orderedMessages,
-      findings: [...findings.values()],
       skipped,
     };
   }
