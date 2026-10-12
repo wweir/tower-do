@@ -331,6 +331,7 @@ async function main(): Promise<void> {
           tasks: fullCompleted.tasks
             .filter((t) => t.key !== "done-owned-0")
             .map((t) => ({ key: t.key })),
+          remove: ["done-owned-0"],
         },
         "fresh-session",
       ),
@@ -343,6 +344,9 @@ async function main(): Promise<void> {
       tasks: fullCompleted.tasks
         .filter((t) => t.owner !== undefined)
         .map((t) => ({ key: t.key })),
+      remove: fullCompleted.tasks
+        .filter((t) => t.owner === undefined)
+        .map((t) => t.key),
     },
     "fresh-session",
   );
@@ -359,6 +363,7 @@ async function main(): Promise<void> {
       tasks: fullCompleted.tasks
         .filter((t) => t.key !== "done-owned-0")
         .map((t) => ({ key: t.key })),
+      remove: ["done-owned-0"],
     },
     "session-0",
   );
@@ -418,10 +423,13 @@ async function main(): Promise<void> {
     () =>
       writeBoardSnapshot(
         depBoard,
-        { tasks: [{ key: "dep-open", dependsOn: ["dep-done"] }] },
+        {
+          tasks: [{ key: "dep-open", dependsOn: ["dep-done"] }],
+          remove: ["dep-done"],
+        },
         "worker",
       ),
-    /cannot remove task dep-done .* still depends on it/,
+    /cannot remove task dep-done: dep-open still depends on it/,
   );
 
   // --- summary ---

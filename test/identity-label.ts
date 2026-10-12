@@ -189,7 +189,12 @@ expectThrows(
 );
 expectThrows(
   "a bucket sibling CANNOT remove a legacy-owned row",
-  () => writeBoardSnapshot(legacyOwned, { baseRevision: 1, tasks: [] }, labelA),
+  () =>
+    writeBoardSnapshot(
+      legacyOwned,
+      { baseRevision: 1, tasks: [], remove: ["work"] },
+      labelA,
+    ),
   /is owned by/,
 );
 check(
@@ -219,7 +224,12 @@ expectThrows(
 );
 expectThrows(
   "a bucket sibling cannot remove a CURRENT-label row",
-  () => writeBoardSnapshot(plan(labelA), { baseRevision: 1, tasks: [] }, labelB),
+  () =>
+    writeBoardSnapshot(
+      plan(labelA),
+      { baseRevision: 1, tasks: [], remove: ["work"] },
+      labelB,
+    ),
   /is owned by/,
 );
 expectThrows(
@@ -231,7 +241,7 @@ check(
   "the owner may still drop its own row",
   writeBoardSnapshot(
     plan(labelA),
-    { baseRevision: 1, tasks: [] },
+    { baseRevision: 1, tasks: [], remove: ["work"] },
     labelA,
   ).view.tasks.length === 0,
 );

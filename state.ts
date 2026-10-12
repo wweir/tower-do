@@ -313,7 +313,12 @@ export interface TowerDoWriteDetails {
 }
 
 export interface TowerDoSnapshotInput {
+  /** Upsert list: each entry is created or merged as a patch onto the stored
+   *  row. A key omitted here is left untouched. */
   tasks: TowerDoTaskInput[];
+  /** Explicit deletions. A key not listed here is never deleted, so a partial
+   *  list can no longer drop a peer's work by omission. */
+  remove?: string[];
   baseRevision?: number;
 }
 
@@ -551,9 +556,11 @@ export function readByWith(
 }
 
 /**
- * Normalize one task input against the current board + existing task (merge
- * semantics like the reference todo: omitted fields preserve existing values,
- * new keys require subject + status).
+ * Apply one UPSERT write to the board: `tasks` are created or merged as patches
+ * (omitted fields preserve stored values; new keys require subject + status),
+ * and `remove` lists explicit deletions. A key absent from both is left alone —
+ * there is no implicit removal. Returns the produced view, the per-task change
+ * summary, and the events to append.
  */
 export function writeBoardSnapshot(
   current: TowerBoardView,
@@ -573,9 +580,11 @@ export function writeBoardSnapshot(
     );
   }
   const existingByKey = new Map(current.tasks.map((task) => [task.key, task]));
+
+  // `tasks` is an UPSERT list. An unmentioned key is left alone, so a partial
+  // write can never delete a peer's row by omission.
   const resolved: ResolvedTowerDoTaskInput[] = [];
   const keys = new Set<string>();
-
   for (const [index, patch] of input.tasks.entries()) {
     const key = normalizeTaskKey(patch.key, `tasks[${index}].key`);
     if (keys.has(key))
@@ -601,8 +610,7 @@ export function writeBoardSnapshot(
     if (owner !== undefined && owner.trim() !== "") {
       // Validate here too (fail fast before the merge), but with the key: an
       // element-level rejection must be attributable to a task. A blank owner
-      // is skipped because the layers below treat "" as "no owner" — checking
-      // it here would make this pre-check stricter than the layer it guards.
+      // is skipped because the layers below treat "" as "no owner".
       normalizeIdentity(owner, `tasks[${index}].owner (${key})`);
     }
     // Receipts describe a completed delivery: do not inherit one onto a
@@ -648,84 +656,34 @@ export function writeBoardSnapshot(
     );
   }
 
-  // Capacity is charged to open work, not to history: completed rows stay
-  // replayable without limit. Both checks run after normalization on purpose —
-  // the open quota is the common overflow and carries the remediation hint, so
-  // it must be the error the caller sees.
-  const openTaskCount = resolved.filter(
-    (task) => task.status !== "completed",
-  ).length;
-  if (openTaskCount > MAX_TOWER_DO_OPEN_TASKS) {
-    throw new TowerDoValidationError(
-      `open tasks support at most ${MAX_TOWER_DO_OPEN_TASKS} items (got ${openTaskCount}; completed rows do not count)` +
-        OPEN_TASK_BUDGET_HINT,
-    );
-  }
-  // What the budget bounds is fabricated history, not batch length: a delivered
-  // task is one the board already carries (replaying it is free), so this caps
-  // only the NEW completed rows a single write introduces. A length ceiling
-  // would reject an honest full replay as soon as the board outgrew any fixed
-  // number — the deadlock this budget exists to remove. The quota is
-  // deliberately the same constant as the open budget (one number, two
-  // readings: work a board carries / history one write may invent) — not a
-  // second knob whose value could drift from the first.
-  const newCompleted = resolved.filter(
-    (task) => task.status === "completed" && !existingByKey.has(task.key),
-  ).length;
-  if (newCompleted > MAX_TOWER_DO_OPEN_TASKS) {
-    throw new TowerDoValidationError(
-      `a write may introduce at most ${MAX_TOWER_DO_OPEN_TASKS} new completed tasks (got ${newCompleted}; replaying a completed row the board already holds is free — do not fabricate receipts, split deliveries across successive writes)`,
-    );
-  }
-
-  const removedTasks = current.tasks.filter((task) => !keys.has(task.key));
-
-  // Tower: workers may remove only their own (or unowned) tasks; the
-  // orchestrator may remove any. Without this, a partial-list update or a
-  // stray `tasks: []` would silently delete another agent's task.
-  // Stale-claim exception: a row whose own claim is idle past
-  // OWNER_TAKEOVER_MS may be removed by anyone (adoption via update is the
-  // gentler path, but a hopeless task should not need an adopter first).
-  // Completed tasks keep the full guard — a receipt cannot be dropped by a
-  // peer. The exception is asked PER ROW: an owner may be dead on one task and
-  // alive on another, so a row-level set is what keeps a live sibling safe.
-  for (const removed of removedTasks) {
-    // EXACT label match, not `sameAgent`: a legacy `session-<time8>` label
-    // cannot name one member of its 65.5 s bucket, so aliasing it here would
-    // hand every bucket sibling write rights over the row. Ambiguity is
-    // resolved strictly (the owner is unreachable ⇒ takeover/tower), never by
-    // guessing.
-    if (
-      removed.owner !== undefined &&
-      caller !== removed.owner &&
-      caller !== TOWER_IDENTITY
-    ) {
-      if (
-        isStaleClaim(staleClaims, removed.owner, removed.key) &&
-        removed.status !== "completed"
-      )
-        continue;
+  // Explicit removals. A key that is not on the board, or that also appears in
+  // `tasks`, is a caller bug — fail loud rather than pick a winner.
+  const removeKeys = new Set<string>();
+  for (const [index, rawKey] of (input.remove ?? []).entries()) {
+    const key = normalizeTaskKey(rawKey, `remove[${index}]`);
+    if (removeKeys.has(key))
       throw new TowerDoValidationError(
-        `task ${removed.key} is owned by "${removed.owner}" — only its owner or ${TOWER_IDENTITY} may remove it` +
-          staleClaimHint(removed, staleClaims),
+        `remove[${index}] is duplicated: ${key}`,
       );
-    }
+    if (keys.has(key))
+      throw new TowerDoValidationError(
+        `task ${key} appears in both tasks and remove — one write cannot upsert and delete it`,
+      );
+    if (!existingByKey.has(key))
+      throw new TowerDoValidationError(
+        `cannot remove task ${key}: no such task on the board`,
+      );
+    removeKeys.add(key);
   }
-
-  // tower_do is a FULL replacement: every key not in this batch is removed, so
-  // after the write the board contains exactly `resolved`. Dependency targets
-  // must therefore live in this batch — `assertDependenciesAreConsistent`
-  // below checks against `resolved` only, which also catches a batch task
-  // depending on a task this same write deletes (a pre-write board lookup
-  // would wrongly see the to-be-deleted task and let a dangling ref through).
-  assertDependenciesAreConsistent(resolved, current);
-  assertNoDependencyCycles(resolved);
 
   const now = Date.now();
   const taskEvents: BoardTaskEvent[] = [];
   const added: string[] = [];
   const updated: string[] = [];
-  const nextTasks: TowerDoTask[] = [];
+  // The board this write produces: existing rows, minus explicit removals, with
+  // each upsert applied. Budget, dependency checks and the returned view all
+  // read THIS map, never the input list.
+  const resultByKey = new Map(existingByKey);
 
   for (const task of resolved) {
     const existing = existingByKey.get(task.key);
@@ -743,36 +701,25 @@ export function writeBoardSnapshot(
         by: caller,
         at: now,
       });
-      nextTasks.push(candidate);
+      resultByKey.set(task.key, candidate);
       continue;
     }
     if (taskEquals(existing, candidate)) {
       // Content unchanged: no event, no revision bump, and the row keeps its
-      // original updatedAt — a no-op full-list replay must not drift it.
-      nextTasks.push(cloneTask(existing));
+      // original updatedAt — re-sending a row you already own must not drift it.
+      resultByKey.set(task.key, cloneTask(existing));
       continue;
     }
-    // Tower: only the owner or the orchestrator may change an owned task's
-    // fields (removal is guarded separately above). We only reach this point
-    // when taskEquals found a real field change, so a plain ownership check
-    // suffices — the every-field comparison already happened.
+    // Only the owner or the orchestrator may change an owned task's fields.
     // Stale-claim exception (takeover/adopt): strictly an ownership
     // displacement — the candidate must equal the existing task except for
-    // owner === caller. Any content edit (subject/status/deps/scope/…) of a
-    // stalled task stays rejected; the adopter re-plans in a second write
-    // once it owns the task. This keeps the every-field guard's promise
-    // intact: a peer can displace a dead ownership, never silently rewrite
-    // someone's content or forge a receipt. Per row, like the removal guard:
-    // adopting away a row the owner touched a minute ago is the same data loss
-    // as deleting it, so both sites ask about THIS key.
+    // owner === caller. Any content edit of a stalled task stays rejected.
     const adoptingStale =
       isStaleClaim(staleClaims, existing.owner, existing.key) &&
       existing.status !== "completed" &&
       task.owner === caller &&
       taskEquals(
         { ...existing, owner: task.owner },
-        // taskEquals ignores updatedAt; the spread only satisfies its
-        // TowerDoTask parameter (a resolved input carries no timestamp).
         { ...task, updatedAt: existing.updatedAt },
       );
     if (
@@ -796,20 +743,63 @@ export function writeBoardSnapshot(
       by: caller,
       at: now,
     });
-    nextTasks.push(candidate);
+    resultByKey.set(task.key, candidate);
   }
 
-  for (const removed of removedTasks) {
-    taskEvents.push({
-      kind: "task",
-      op: "remove",
-      key: removed.key,
-      by: caller,
-      at: now,
-    });
+  for (const key of removeKeys) {
+    const target = existingByKey.get(key)!;
+    // Workers may remove only their own (or unowned) tasks; the orchestrator
+    // may remove any. Stale-claim exception: a row whose own claim is idle past
+    // the takeover window may be removed by anyone. Completed receipts stay
+    // fully guarded — a peer cannot drop a delivery record.
+    if (
+      target.owner !== undefined &&
+      caller !== target.owner &&
+      caller !== TOWER_IDENTITY &&
+      !(
+        isStaleClaim(staleClaims, target.owner, key) &&
+        target.status !== "completed"
+      )
+    ) {
+      throw new TowerDoValidationError(
+        `task ${key} is owned by "${target.owner}" — only its owner or ${TOWER_IDENTITY} may remove it` +
+          staleClaimHint(target, staleClaims),
+      );
+    }
+    taskEvents.push({ kind: "task", op: "remove", key, by: caller, at: now });
+    resultByKey.delete(key);
   }
 
-  const removed = removedTasks.map((task) => task.key);
+  // Capacity is charged to open work on the PRODUCED board, not to history.
+  const openTaskCount = [...resultByKey.values()].filter(
+    (task) => task.status !== "completed",
+  ).length;
+  if (openTaskCount > MAX_TOWER_DO_OPEN_TASKS) {
+    throw new TowerDoValidationError(
+      `open tasks support at most ${MAX_TOWER_DO_OPEN_TASKS} items (got ${openTaskCount}; completed rows do not count)` +
+        OPEN_TASK_BUDGET_HINT,
+    );
+  }
+  // What the budget bounds is fabricated history, not batch length: a delivered
+  // task is one the board already carries (replaying it is free), so this caps
+  // only the NEW completed rows a single write introduces.
+  const newCompleted = resolved.filter(
+    (task) => task.status === "completed" && !existingByKey.has(task.key),
+  ).length;
+  if (newCompleted > MAX_TOWER_DO_OPEN_TASKS) {
+    throw new TowerDoValidationError(
+      `a write may introduce at most ${MAX_TOWER_DO_OPEN_TASKS} new completed tasks (got ${newCompleted}; replaying a completed row the board already holds is free — do not fabricate receipts, split deliveries across successive writes)`,
+    );
+  }
+
+  // Dependencies are checked against the PRODUCED board: an upsert may
+  // reference an untouched task that still exists, and a removal must not
+  // strand a surviving dependent.
+  assertDependenciesAreConsistent(resolved, resultByKey, removeKeys);
+  assertNoDependencyCycles([...resultByKey.values()]);
+
+  const nextTasks = [...resultByKey.values()].map(cloneTask);
+  const removed = [...removeKeys];
   // One revision bump per persisted task event, so a refold of the file yields
   // the exact same revision the write reported (the gate reads the file).
   const changed = taskEvents.length > 0;
@@ -818,8 +808,7 @@ export function writeBoardSnapshot(
     schemaVersion: TOWER_DO_SCHEMA_VERSION,
     revision: changed ? current.revision + taskEvents.length : current.revision,
     tasks: nextTasks,
-    // Fresh arrays: the returned view must not alias the caller's board (a
-    // caller mutating the result would otherwise mutate the input view).
+    // Fresh arrays: the returned view must not alias the caller's board.
     messages: [...current.messages],
     findings: [...current.findings],
     skipped: current.skipped,
@@ -1020,7 +1009,10 @@ function normalizeTask(
 }
 
 function assertNoDependencyCycles(
-  tasks: readonly ResolvedTowerDoTaskInput[],
+  tasks: readonly {
+    readonly key: string;
+    readonly dependsOn: readonly string[];
+  }[],
 ): void {
   const dependencies = new Map(tasks.map((task) => [task.key, task.dependsOn]));
   const visiting = new Set<string>();
@@ -1040,42 +1032,47 @@ function assertNoDependencyCycles(
 }
 
 /**
- * Every dependency must name a task present in the SAME batch. tower_do is a
- * full replacement, so an omitted dependency is being deleted, not merely
- * absent from this call. Mirrors the tower rule "deps must reference known
- * missions" and the reference todo's rule that in_progress/completed require
- * resolved deps (with `blocked` exempt — blocked explicitly means "waiting").
+ * Dependency targets must exist on the board the write PRODUCES, and an
+ * in_progress/completed task must have every dependency completed. With upsert
+ * semantics a target may live outside this batch (an untouched task), so the
+ * check runs over the produced board — not over the input list — and a removal
+ * must not strand a surviving dependent.
  */
 function assertDependenciesAreConsistent(
   tasks: readonly ResolvedTowerDoTaskInput[],
-  board: TowerBoardView,
+  board: ReadonlyMap<
+    string,
+    { readonly status: TowerDoStatus; readonly dependsOn: readonly string[] }
+  >,
+  removed: ReadonlySet<string>,
 ): void {
-  // tower_do is a FULL replacement: after the write the board holds exactly
-  // `tasks`, because every key not in this batch is removed. Dependency
-  // targets must therefore survive in this batch — a pre-write board entry
-  // that this write omits is being deleted and cannot satisfy a surviving
-  // task's dependency (looking it up on the old board would let a dangling
-  // reference through).
-  const byKey = new Map<string, { readonly status: TowerDoStatus }>();
-  for (const task of tasks) byKey.set(task.key, { status: task.status });
-  const boardByKey = new Map(board.tasks.map((task) => [task.key, task]));
-  for (const [index, task] of tasks.entries()) {
+  const indexOf = new Map(tasks.map((task, index) => [task.key, index]));
+  for (const [key, task] of board) {
+    const index = indexOf.get(key);
+    const at =
+      index === undefined ? `task ${key}` : `tasks[${String(index)}] (${key})`;
+    const unresolved: string[] = [];
     for (const dependency of task.dependsOn) {
-      if (byKey.has(dependency)) continue;
-      const omitted = boardByKey.get(dependency);
-      throw new TowerDoValidationError(
-        omitted === undefined
-          ? `tasks[${index}].dependsOn (${task.key}) references missing task ${dependency} — tower_do is a full replacement, so it must be included in this call`
-          : `cannot remove task ${dependency} (this write omits it): ${task.key} still depends on it — keep it in the batch or drop the dependency first`,
-      );
+      if (removed.has(dependency)) {
+        throw new TowerDoValidationError(
+          `cannot remove task ${dependency}: ${key} still depends on it — drop the dependency first`,
+        );
+      }
+      const target = board.get(dependency);
+      if (target === undefined) {
+        throw new TowerDoValidationError(
+          `${at}.dependsOn references missing task ${dependency}`,
+        );
+      }
+      if (target.status !== "completed") unresolved.push(dependency);
     }
-    if (task.status !== "in_progress" && task.status !== "completed") continue;
-    const unresolved = task.dependsOn.filter(
-      (dependency) => byKey.get(dependency)?.status !== "completed",
-    );
-    if (unresolved.length > 0) {
+    if (
+      index !== undefined &&
+      (task.status === "in_progress" || task.status === "completed") &&
+      unresolved.length > 0
+    ) {
       throw new TowerDoValidationError(
-        `tasks[${index}] (${task.key}) cannot be ${task.status} while dependencies are unresolved: ${unresolved.join(", ")}`,
+        `${at} cannot be ${task.status} while dependencies are unresolved: ${unresolved.join(", ")}`,
       );
     }
   }
@@ -2904,8 +2901,8 @@ function staleClaimHint(
 ): string {
   if (task.status === "completed")
     return site === "update"
-      ? ' (a completed task stays with its owner — replay the key unchanged to keep it, and enumerate every receipt you do not mean to drop; only that owner or an as: "tower" write may change it, and a peer cannot forge a receipt)'
-      : ' (a completed task stays with its owner — only that owner or an as: "tower" write that replays the rows to keep may drop it; a peer cannot forge a receipt. Keeping it means replaying its key: an omitted completed key is a removal, so the write must enumerate every receipt it does not mean to drop)';
+      ? ' (a completed task stays with its owner — only that owner or an as: "tower" write may change it, and a peer cannot forge a receipt)'
+      : ' (a completed task stays with its owner — only that owner or an as: "tower" write may drop it; a peer cannot forge a receipt)';
   if (!isStaleClaim(staleClaims, task.owner, task.key)) return "";
   return ` (owner idle past the ${formatTakeoverWindow()} takeover window: adopt it by setting owner to yourself and changing nothing else, then edit in a second write — or remove it)`;
 }

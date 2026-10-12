@@ -40,7 +40,7 @@
 | P0 门禁 | `rw-gate` | done |
 | 方式/计划 | `rw-plan` | done |
 | P2 磁盘层（D1） | `rw-disk` | done |
-| P1 写入语义 | `rw-core` | open |
+| P1 写入语义 | `rw-core` | done |
 | P3 tools 收敛 | `rw-tools` | open |
 | P4a 消息投递（D2） | `rw-msg` | open |
 | P4b 身份（D4） | `rw-identity` | open |
@@ -54,8 +54,9 @@
   `append` 改单次 O_APPEND 写；`withWriteLock` → `withWrite`；fold 保留（含旧 `compact` 头容错）。
   `index.ts` 删 `gc` action、自动压缩调度、相关状态与提示；`state.ts` 删压缩常量。
   删除 `test/board-compact.ts` 与 smoke 中的 gc/compact 断言。tsc + 17 套件全绿。
-- [ ] **P1 写入语义** — `tower_do.tasks` 改 upsert（列出即新建/合并补丁），删除走显式
-  `remove: [key]`；`writeBoardSnapshot` 去掉"省略即删除"的全量替换与随之而来的移除守卫。
+- [x] **P1 写入语义** — `tower_do.tasks` 改为 upsert（列出即新建/合并补丁），删除走显式
+  `remove: [key]`；`writeBoardSnapshot` 去掉“省略即删除”与随之而来的移除守卫；容量/依赖/环
+  检查改为基于“写入后产出的盘面”而非输入列表；tool schema 加 `remove` 参数。tsc + 17 套件全绿。
 - [ ] **P3 tools** — 删 findings / scope / changedFiles / dashboard layers / presence；
   `tower_do_status` 收敛为 open tasks + completed 键账目 + unread + activity。
 - [ ] **P4b 身份（D4）** — identity = `as` > config `identity` > session id；删 `sessionLabel`

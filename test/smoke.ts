@@ -364,16 +364,15 @@ async function layer1(): Promise<void> {
     `tasks=${otherView.tasks.length} msgs=${otherView.messages.length} rev=${otherView.revision}`,
   );
 
-  // tower_do is a FULL replacement: a batch that omits a task deletes it, so
-  // a surviving task may not depend on an omitted (being-removed) task — the
-  // old code looked up the pre-write board and let a dangling ref through.
+  // A surviving task may not depend on a task this write removes: removal is
+  // explicit, and the dependency check runs on the post-write graph.
   expectThrows(
     "surviving task cannot depend on a task this write removes",
     () =>
       writeBoardSnapshot(
         view,
         {
-          // omit gemm (owned by alice) but keep test, which depends on it
+          // keep test (which depends on gemm) and remove gemm explicitly
           tasks: view.tasks
             .filter((t) => t.key !== "gemm")
             .map((t) => ({
@@ -381,6 +380,7 @@ async function layer1(): Promise<void> {
               subject: t.subject,
               status: t.status,
             })),
+          remove: ["gemm"],
           baseRevision: view.revision,
         },
         "tower",
@@ -389,7 +389,7 @@ async function layer1(): Promise<void> {
   );
 
   // A dependent may drop the dependency and delete its target in one write:
-  // the full-replacement check runs on the POST-write graph, so this passes.
+  // the dependency check runs on the POST-write graph, so this passes.
   const cleanWrite = writeBoardSnapshot(
     view,
     {
@@ -410,6 +410,7 @@ async function layer1(): Promise<void> {
           dependsOn: [],
         },
       ],
+      remove: ["gemm"],
       baseRevision: view.revision,
     },
     "tower",
@@ -1066,8 +1067,8 @@ async function layer2(): Promise<void> {
 
   // --- review fixes: removal ownership, dangling deps, tower recipient ---
 
-  // bob submits a partial list that omits alice's auth → the [高] attack:
-  // without a removal guard this would silently delete alice's task.
+  // bob explicitly removes alice's auth → without a removal guard this would
+  // delete alice's task.
   const partialMsg = await runThrow("tower_do", {
     tasks: [
       {
@@ -1078,6 +1079,7 @@ async function layer2(): Promise<void> {
         dependsOn: ["auth"],
       },
     ],
+    remove: ["auth"],
     baseRevision: 2,
     as: "bob",
   } as never);
@@ -1098,6 +1100,7 @@ async function layer2(): Promise<void> {
         dependsOn: ["auth"],
       },
     ],
+    remove: ["auth"],
     baseRevision: 2,
     as: "alice",
   } as never);
@@ -1110,6 +1113,7 @@ async function layer2(): Promise<void> {
   // tower (orchestrator) may remove any owned task once its dependents go.
   const towerRemoval = await run("tower_do", {
     tasks: [],
+    remove: ["auth", "billing"],
     baseRevision: 2,
     as: "tower",
   } as never);
@@ -1585,6 +1589,7 @@ async function layer2(): Promise<void> {
             status: "in_progress",
           },
         ],
+        remove: ["stale-todo"],
         baseRevision: ctxFolded.revision,
       },
       "tower",
@@ -1696,6 +1701,7 @@ async function layer2(): Promise<void> {
           status: "in_progress",
         },
       ],
+      remove: ["stale-todo"],
       baseRevision: folded.revision,
     },
     "tower",
@@ -1736,6 +1742,7 @@ async function layer2(): Promise<void> {
           status: "in_progress",
         },
       ],
+      remove: ["live-todo"],
       baseRevision: afterCompact.revision,
     },
     "tower",

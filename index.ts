@@ -584,8 +584,21 @@ const TowerDoTaskSchema = Type.Object({
 const TowerDoParamsSchema = Type.Object({
   tasks: Type.Array(TowerDoTaskSchema, {
     description:
-      `Complete authoritative task list to retain: every key you want kept must appear here, because any current key omitted from the list is removed. An omitted task owned by another agent (and not stale) makes the write fail rather than dropping it; replay peers' and unowned tasks you did not mean to remove. Existing keys may omit unchanged fields (they are preserved per field), so send only what changes — a rejected payload is echoed back verbatim by the host, and a small replay keeps that echo cheap. New keys require subject and status. Capacity: at most ${MAX_TOWER_DO_OPEN_TASKS} non-completed tasks — completed rows are receipts, they replay free and never block a new plan; one write may introduce at most ${MAX_TOWER_DO_OPEN_TASKS} NEW completed rows (replaying an existing receipt is free, split larger batches across successive writes).`,
+      `Tasks to create or update (upsert). Each entry is created when its key is new, otherwise merged as a patch: omitted optional fields keep their stored value. A key you do NOT list is left untouched — deletion is explicit via \`remove\`, so a partial list can never drop a peer's row. New keys require subject and status. Capacity: at most ${MAX_TOWER_DO_OPEN_TASKS} non-completed tasks on the board after the write; one write may introduce at most ${MAX_TOWER_DO_OPEN_TASKS} NEW completed rows (updating a row the board already holds is free). Optional per-task fields: dependsOn, scope, blockedBy.`,
   }),
+  remove: Type.Optional(
+    Type.Array(
+      Type.String({
+        minLength: 1,
+        maxLength: MAX_TASK_KEY_CHARS,
+        pattern: TASK_KEY_PATTERN.source,
+      }),
+      {
+        description:
+          'Explicit deletions: task keys to remove. A key not listed here is never deleted. The owner guard applies (owner or "tower"; a non-completed claim idle past the takeover window may be removed by anyone).',
+      },
+    ),
+  ),
   baseRevision: Type.Optional(
     Type.Integer({
       description:
@@ -761,7 +774,7 @@ const StatusParamsSchema = Type.Object({
   view: Type.Optional(
     StringEnum(["layers", "mine", "needs", "all"] as const, {
       description:
-        "How much of the unfinished board renders as full rows. `layers` (default) renders your own work and the peer work you are coupled to, folding everything else into a one-line shape summary plus a compact `key status @owner` ledger — the keys stay enumerable for a full-replacement write. `all` expands every unfinished row, `mine` renders only your own rows in full, and `needs` is an alias for `layers`.",
+        "How much of the unfinished board renders as full rows. `layers` (default) renders your own work and the peer work you are coupled to, folding everything else into a one-line shape summary plus a compact `key status @owner` ledger — the keys stay enumerable so you can target a single row. `all` expands every unfinished row, `mine` renders only your own rows in full, and `needs` is an alias for `layers`.",
     }),
   ),
   limit: Type.Optional(
@@ -832,9 +845,9 @@ function formatChange(
   caller: string,
   change: { added: string[]; updated: string[]; removed: string[] },
 ): string {
-  // No-op first — an identical full-list replay (even of an empty board) is
-  // NOT a clear: nothing was removed, so reporting "board cleared" would
-  // mislead a caller that replayed an already-empty board.
+  // No-op first — an identical replay of the rows the caller already sent (even
+  // of an empty board) is NOT a clear: nothing was removed, so reporting "board
+  // cleared" would mislead a caller that replayed an already-empty board.
   if (
     change.added.length === 0 &&
     change.updated.length === 0 &&
@@ -1960,18 +1973,18 @@ export default function towerDoExtension(pi: ExtensionAPI): void {
     name: TOWER_DO_TOOL_NAME,
     label: "TowerDo",
     description: `Maintain the shared multi-agent task board with one atomic update.
-- Full replacement at the task level: include every key to keep; any current key omitted from the list is removed (an omitted task owned by another agent is rejected instead of dropped — replay peers' and unowned tasks you did not mean to lose). Fields are per-field: omitted optional fields on an existing key are preserved, and new keys require subject and status.
+- Upsert semantics: list only the tasks you create or change. Omitted optional fields on an existing key are preserved, and new keys require subject and status. A key you do not list is left untouched (there is no implicit removal) — delete with the explicit 'remove' field.
 - Owner guard: a task with an owner can only be changed (any field) or removed by its owner or the "tower" identity. Exception: a non-completed task whose OWN activity is older than ${formatTakeoverWindow()} (TASK_CLAIM_STALE_MS; unrelated board chatter does not protect a row, and an owner's activity on another task never protects this one) may be displaced row by row — adopt it by setting owner to yourself and changing nothing else in that write (any content edit in the same write is rejected; re-plan in a second write), or remove it; completed tasks stay guarded.
 - Dependencies gate status: in_progress/completed require every dependsOn entry to be completed, dependsOn keys must exist on the board or in this call, and cycles are rejected (blocked is exempt).
 - Set changedFiles only in the same write that completes a task; reopening a task without changedFiles voids the inherited receipt.
 - Content limits (subject ${MAX_TASK_SUBJECT_CHARS} / description ${MAX_TASK_DESCRIPTION_CHARS} characters) are enforced per task and a violation names the task key, so fix that one row instead of resending everything. An omitted field on an existing task is preserved (send only what changes); long-form evidence belongs in a tower_do_talk message or a finding, not in description.
 - Always pass baseRevision from tower_do_status; omitting it disables the stale-write check.
-- Capacity: up to ${MAX_TOWER_DO_OPEN_TASKS} non-completed tasks. Completed rows are receipts — they replay free, do not count, and can only be dropped by their owner or "tower", so a board of finished work never blocks a new plan. One write may introduce at most ${MAX_TOWER_DO_OPEN_TASKS} NEW completed rows (replaying an existing receipt is free; split a larger batch of deliveries across successive writes). When the open budget is full, omit your own or an unowned task; a board holding only completed rows is compacted by an as: "tower" write replaying just the rows to keep. Optional per-task fields: dependsOn (see above), scope (file globs the task may touch), blockedBy (free-form ids — non-empty renders a non-completed task as blocked).`,
+- Capacity: up to ${MAX_TOWER_DO_OPEN_TASKS} non-completed tasks. Completed rows are receipts — they replay free, do not count, and can only be dropped by their owner or "tower", so a board of finished work never blocks a new plan. One write may introduce at most ${MAX_TOWER_DO_OPEN_TASKS} NEW completed rows (replaying an existing receipt is free; split a larger batch of deliveries across successive writes). When the open budget is full, remove or complete an existing open task first. Optional per-task fields: dependsOn (see above), scope (file globs the task may touch), blockedBy (free-form ids — non-empty renders a non-completed task as blocked).`,
     promptSnippet:
       "Maintain the shared multi-agent task board with one atomic update",
     promptGuidelines: [
       "Use tower_do for the task plan instead of direct file edits when multiple agents or sessions share the work; it is the shared board, not a private todo list.",
-      "tower_do replaces the entire task list: read tower_do_status first and replay every key you want to keep, changing only the tasks you mean to change.",
+      "tower_do upserts only the tasks you list: read tower_do_status first, then send just the rows you create or change (delete with `remove`).",
       "When a task needs a plan of 3+ steps, define it yourself and call tower_do with subject + status before beginning substantive work.",
       "Include baseRevision (from tower_do_status) in every tower_do call; a stale revision is rejected so you never silently overwrite a peer's update.",
       "Mark a task completed only after implementation and verification succeed, attaching changedFiles (files you actually changed, repo-relative) in the same call. Use status blocked with a blockedBy note instead of leaving it hanging.",
@@ -1987,7 +2000,7 @@ export default function towerDoExtension(pi: ExtensionAPI): void {
       return withFileMutationQueue(board.file, async () => {
         const { details, activity } = await board.withWrite(async (appendLocked) => {
         // Re-fold inside both queues: the revision guard must observe peer
-        // appends before it decides whether the full replacement is stale.
+        // appends before it decides whether the write is stale.
         throwIfAborted(signal, "TowerDo update");
         const freshView = await foldRetained(ctx.cwd);
         throwIfAborted(signal, "TowerDo update");
@@ -2028,7 +2041,11 @@ export default function towerDoExtension(pi: ExtensionAPI): void {
         );
         const details = writeBoardSnapshot(
           freshView,
-          { tasks: params.tasks, baseRevision: params.baseRevision },
+          {
+            tasks: params.tasks,
+            ...(params.remove === undefined ? {} : { remove: params.remove }),
+            baseRevision: params.baseRevision,
+          },
           caller,
           staleClaims,
         );
@@ -2813,7 +2830,7 @@ export default function towerDoExtension(pi: ExtensionAPI): void {
   pi.registerTool({
     name: TOWER_DO_STATUS_TOOL_NAME,
     label: "TowerDo Status",
-    description: `Read the shared tower-do board: everyone's tasks (owner, status, deps, scope, blocks), messages addressed to you, open findings, and the recent activity tail. Unfinished work is caller-centred: your own rows and the peer rows you are coupled to (your unfinished work awaits it, it awaits yours, unread mail threads under it, or its declared scope intersects yours) render in full, recency-first, while every other unfinished row folds into one shape summary plus a \`key status @owner\` ledger — keys stay enumerable for a full-replacement write, and completed rows stay a compact key ledger (their detail is one taskKey lookup away). Still bounded by the dashboard budget and the byte/line caps, which disclose what they cut. Also prints the board file path and the current revision (pass it back as baseRevision) so subagents can read state directly (file-as-state). Reading here does NOT ack messages (tower_do_talk action=inbox does). Pass taskKey for the FULL detail of one task, findingId for the full text of one finding, view=all to expand the folded layer, or view=mine to narrow to your own rows. Output is bounded to ${Math.round(DEFAULT_MAX_BYTES / 1024)}KB / ${String(DEFAULT_MAX_LINES)} lines from the TAIL (the head — header, revision, board file path and open-task rows — is dropped first) and says so in a footer when that happens.`,
+    description: `Read the shared tower-do board: everyone's tasks (owner, status, deps, scope, blocks), messages addressed to you, open findings, and the recent activity tail. Unfinished work is caller-centred: your own rows and the peer rows you are coupled to (your unfinished work awaits it, it awaits yours, unread mail threads under it, or its declared scope intersects yours) render in full, recency-first, while every other unfinished row folds into one shape summary plus a \`key status @owner\` ledger — keys stay enumerable so you can target a single row, and completed rows stay a compact key ledger (their detail is one taskKey lookup away). Still bounded by the dashboard budget and the byte/line caps, which disclose what they cut. Also prints the board file path and the current revision (pass it back as baseRevision) so subagents can read state directly (file-as-state). Reading here does NOT ack messages (tower_do_talk action=inbox does). Pass taskKey for the FULL detail of one task, findingId for the full text of one finding, view=all to expand the folded layer, or view=mine to narrow to your own rows. Output is bounded to ${Math.round(DEFAULT_MAX_BYTES / 1024)}KB / ${String(DEFAULT_MAX_LINES)} lines from the TAIL (the head — header, revision, board file path and open-task rows — is dropped first) and says so in a footer when that happens.`,
     promptSnippet:
       "Show the shared multi-agent task board: tasks, messages, findings, activity",
     promptGuidelines: [

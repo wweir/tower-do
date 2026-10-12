@@ -815,6 +815,7 @@ async function layer4(): Promise<void> {
         { key: "x", subject: "X", status: "in_progress", owner: "dave" },
         { key: "y", subject: "Y", status: "in_progress", owner: "eve" },
       ],
+      remove: ["a", "b"],
     },
     "tower",
   );
@@ -1044,6 +1045,7 @@ async function layer4(): Promise<void> {
         { key: "c", subject: "C", status: "in_progress", owner: "carol" },
         { key: "d", subject: "D", status: "in_progress", owner: "dave" },
       ],
+      remove: ["a", "b"],
     },
     "tower",
   );

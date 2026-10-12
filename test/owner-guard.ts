@@ -767,6 +767,7 @@ async function main(): Promise<void> {
           owner: "B",
         },
       ],
+      remove: ["stale-task"],
       baseRevision: idleView.revision,
     },
     "C",
@@ -799,12 +800,13 @@ async function main(): Promise<void> {
               owner: "B",
             },
           ],
+          remove: ["stale-done"],
           baseRevision: idleView.revision,
         },
         "C",
         STALE,
       ),
-    /a completed task stays with its owner — only that owner or an as: "tower" write that replays the rows to keep may drop it[\s\S]*enumerate every receipt it does not mean to drop/,
+    /a completed task stays with its owner — only that owner or an as: "tower" write may drop it/,
   );
   expectThrows(
     "idle owner's completed task cannot have its owner swapped by a peer",
@@ -838,7 +840,7 @@ async function main(): Promise<void> {
         "C",
         STALE,
       ),
-    /owned by "A"[\s\S]*replay the key unchanged to keep it/,
+    /owned by "A"[\s\S]*only that owner or an as: "tower" write may change it/,
   );
 
   // A fresh owner is not adoptable: takeover attempt is rejected, no hint.
@@ -1001,6 +1003,7 @@ async function main(): Promise<void> {
       tasks: [
         { key: "a-live", subject: "l", status: "in_progress", owner: "A" },
       ],
+      remove: ["a-stalled"],
       baseRevision: mixedBoard.revision,
     },
     "C",
@@ -1025,6 +1028,7 @@ async function main(): Promise<void> {
               owner: "A",
             },
           ],
+          remove: ["a-live"],
           baseRevision: mixedBoard.revision,
         },
         "C",
