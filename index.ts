@@ -765,9 +765,6 @@ export default function towerDoExtension(pi: ExtensionAPI): void {
   // Set when a watcher event asked for a board re-fold during the debounce
   // window (OR-merged across sources); cleared when the refresh runs.
   let liveRefreshNeedsFold = false;
-  // Owner labels this session has written as (`as`). Session-scoped, like
-  // the single sidecar file the session owns (selfLivePath is fixed once
-  // live wiring starts).
   // This session's liveness file path — computed ONCE in restore(). The
   // empty-session-id fallback is a fresh random UUID and identity can change
   // mid-session, so recomputing per call would churn the filename every
