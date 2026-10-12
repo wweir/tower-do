@@ -157,69 +157,6 @@ async function layer1(): Promise<void> {
     isMessageFullyRead(broadcastReadByBob, view),
   );
 
-  // A broadcast whose sender carries its LEGACY label while its own task row
-  // carries the CURRENT label must not list the sender as a pending reader: a
-  // self-broadcast never reaches its own inbox, so it could never ack and the
-  // row would never retire. Delivery/display exclude by AGENT, not by string.
-  const legacyBroadcast = msg({
-    id: "m-legacy",
-    to: "all",
-    from: "session-01a0b475",
-    at,
-  });
-  const legacySenderView: TowerBoardView = {
-    ...view,
-    tasks: [
-      {
-        key: "lg",
-        subject: "legacy owner",
-        status: "in_progress",
-        owner: "session-01a0b475-abcdef12",
-        dependsOn: [],
-        blockedBy: [],
-        updatedAt: at,
-      },
-    ],
-    messages: [legacyBroadcast],
-  };
-  check(
-    "a legacy label of the sender is excluded from the broadcast audience",
-    isMessageFullyRead(legacyBroadcast, legacySenderView),
-  );
-
-  // Same guarantee for the SEND-TIME SNAPSHOT branch: a session that migrated
-  // from a legacy label persists an audience that can name its OWN older label.
-  // The snapshot must be filtered by AGENT too, or that label becomes a
-  // pending reader that never acks and the broadcast escapes retention.
-  const legacySnapshotted: TowerDoMessage = {
-    ...msg({
-      id: "m-legacy-snap",
-      to: "all",
-      from: "session-01a0b475-abcdef12",
-      at,
-    }),
-    audience: ["session-01a0b475"],
-  };
-  const legacySnapshotView: TowerBoardView = {
-    ...view,
-    tasks: [
-      {
-        key: "lg2",
-        subject: "legacy snapshot owner",
-        status: "in_progress",
-        owner: "session-01a0b475-abcdef12",
-        dependsOn: [],
-        blockedBy: [],
-        updatedAt: at,
-      },
-    ],
-    messages: [legacySnapshotted],
-  };
-  check(
-    "a snapshotted legacy label of the sender is excluded from the audience",
-    isMessageFullyRead(legacySnapshotted, legacySnapshotView),
-  );
-
   // A later-joining owner (carol) was never part of the broadcast audience
   // and must not keep it alive: with an audience snapshot the broadcast is
   // fully read once the snapshot readers ack, even though carol now owns a

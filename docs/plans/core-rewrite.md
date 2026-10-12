@@ -46,7 +46,7 @@
 | P3c 删 scope/changedFiles | `rw-trim` | done |
 | P3d 删 layers/presence + 收敛 status | `rw-view` | done |
 | P4a 消息投递（D2） | `rw-msg` | done |
-| P4b 身份（D4） | `rw-identity` | open |
+| P4b 身份（D4） | `rw-identity` | done |
 | P5 UI（D3） | `rw-ux` | open |
 | P6 文档 | `rw-docs` | open |
 | P7 清理 | `rw-cleanup` | open |
@@ -78,7 +78,7 @@
   `derivePresence`/`PresenceLine`/`formatLayerSummary`；`tower_do_status` 收敛为 `## Open` 全量行 +
   `## Completed` 键账目 + messages + activity（删 `view=layers|mine|needs`）；widget 改按 recency 列
   open 行；`formatBoardReminder` 重写为 header + open 行 + 溢出键行。删 test/view-layers.ts。tsc + 13 套件全绿。
-- [ ] **P4b 身份（D4）** — identity = `as` > config `identity` > session id；删 `sessionLabel`
+- [x] **P4b 身份（D4）** — identity = `as` > config `identity` > session name > session id；删 `sessionLabel`
   label entropy / alias / `sameAgent` 多时钟体系；stale takeover 只用 `task.updatedAt` 单时钟。
 - [ ] **P5 UI** — 极简 widget + reminder。
 - [ ] **P6 文档** — 重写 PRODUCT/ARCHITECTURE/CONTRACTS/OPERATIONS/DECISIONS/README。

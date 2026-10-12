@@ -21,7 +21,6 @@ import {
   LIVE_WINDOW_MS,
   liveOwnerIdentities,
   liveSessionCount,
-  MAX_TOWER_DO_ALIASES,
   parseLiveRecord,
   type LiveRecord,
 } from "../state.ts";
@@ -147,51 +146,6 @@ eq(
   undefined,
 );
 eq("NaN at rejected", parseLiveRecord('{"identity":"a","at":NaN}'), undefined);
-eqJson(
-  "aliases parse",
-  parseLiveRecord('{"identity":"alice","at":1,"aliases":["coder-1"]}'),
-  { identity: "alice", at: 1, aliases: ["coder-1"] },
-);
-eqJson(
-  "non-array aliases ignored, record still live",
-  parseLiveRecord('{"identity":"alice","at":1,"aliases":"coder-1"}'),
-  { identity: "alice", at: 1 },
-);
-eqJson(
-  "empty/all/blank aliases dropped",
-  parseLiveRecord(
-    '{"identity":"alice","at":1,"aliases":["","  ","all","coder-1","coder-1"]}',
-  ),
-  { identity: "alice", at: 1, aliases: ["coder-1"] },
-);
-eq(
-  "liveOwnerIdentities unions identity and aliases",
-  liveOwnerIdentities({
-    identity: "alice",
-    at: 1,
-    aliases: ["coder-1", "alice"],
-  }).join(","),
-  "alice,coder-1",
-);
-eq(
-  "liveOwnerIdentities without aliases is identity only",
-  liveOwnerIdentities({ identity: "alice", at: 1 }).join(","),
-  "alice",
-);
-{
-  const extras = Array.from(
-    { length: MAX_TOWER_DO_ALIASES + 1 },
-    (_, i) => `as-${String(i)}`,
-  );
-  const parsed = parseLiveRecord(
-    JSON.stringify({ identity: "alice", at: 1, aliases: extras }),
-  );
-  eq(
-    "parse keeps at most MAX_TOWER_DO_ALIASES aliases",
-    parsed?.aliases?.length,
-    MAX_TOWER_DO_ALIASES,
-  );
-}
 
 // 4. formatLiveSegment.
 eq("zero renders empty", formatLiveSegment(0), "");

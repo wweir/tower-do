@@ -21,7 +21,7 @@
  */
 import { mkdtempSync } from "node:fs";
 
-import { MAX_IDENTITY_CHARS, sessionLabel } from "../state.ts";
+import { MAX_IDENTITY_CHARS } from "../state.ts";
 import { tmpdir } from "node:os";
 import { join } from "node:path";
 
@@ -98,14 +98,14 @@ async function main(): Promise<void> {
   process.env.HOME = mkdtempSync(join(tmpdir(), "tower-do-scope-home-"));
   const dir = mkdtempSync(join(tmpdir(), "tower-do-scope-"));
   // The real incident ids: same 65.5 s bucket (identical first 8 hex digits,
-  // 26 ms apart) — through 0.4.0 both resolved to `session-01a0b47e`, which is
-  // exactly the collision `sessionLabel` now prevents.
+  // 26 ms apart). Identity is now the raw session id, so the two are distinct
+  // by construction.
   const parentId = "01a0b47e-b9bf-70bd-9a77-2412ac0f8017";
   const childId = "01a0b47e-b9d9-70bd-9a77-2416a6b6d6be";
   const parent = makeInstance(dir, parentId);
   const child = makeInstance(dir, childId);
-  const parentIdentity = sessionLabel(parentId);
-  const childIdentity = sessionLabel(childId);
+  const parentIdentity = parentId;
+  const childIdentity = childId;
 
   const towerDoExtension = (await import("../index.ts")).default;
   // Both sessions load the extension in ONE process — the real layout.
@@ -146,7 +146,7 @@ async function main(): Promise<void> {
   check(
     "bucket siblings in one process get different identities",
     parentIdentity !== childIdentity &&
-      parentIdentity.slice(0, 15) === childIdentity.slice(0, 15),
+      parentIdentity.slice(0, 8) === childIdentity.slice(0, 8),
     `${parentIdentity} vs ${childIdentity}`,
   );
   check(
@@ -200,7 +200,7 @@ async function main(): Promise<void> {
   const namedText = namedStatus.content.map((item) => item.text).join("\n");
   check(
     "a session name the identity rule rejects falls back to the session label",
-    namedText.includes(`identity ${sessionLabel(badNameId)}`) &&
+    namedText.includes(`identity ${badNameId}`) &&
       !namedText.includes(badName),
     namedText.split("\n")[0]?.slice(0, 120),
   );

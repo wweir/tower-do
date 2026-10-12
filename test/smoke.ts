@@ -23,7 +23,6 @@ import {
   findAllUnresolvedDeps,
   formatBoardReminder,
   MAX_MESSAGE_BYTES,
-  MAX_TOWER_DO_ALIASES,
   taskIsBlocked,
   TOWER_DO_REMINDER_TYPE,
   writeBoardSnapshot,
@@ -1474,28 +1473,6 @@ async function layer2(): Promise<void> {
     );
   }
 
-  // LAST in the shared instance on purpose: reaching the cap consumes this
-  // session's whole alias budget, so every assertion that needs another `as`
-  // must already have run. The cap must fail LOUD rather than silently dropping
-  // the label (CONTRACTS.md). `inbox` records the alias in `prepare()` without
-  // writing, so the probe cannot trip the task owner guard en route.
-  let aliasError = "";
-  for (let i = 0; i <= MAX_TOWER_DO_ALIASES; i += 1) {
-    try {
-      await run("tower_do_talk", {
-        action: "inbox",
-        as: `alias-${String(i)}`,
-      } as never);
-    } catch (error) {
-      aliasError = error instanceof Error ? error.message : String(error);
-      break;
-    }
-  }
-  check(
-    "the alias cap fails loud instead of dropping the label",
-    /at most \d+ aliases/.test(aliasError),
-    aliasError.slice(0, 90),
-  );
 
 }
 

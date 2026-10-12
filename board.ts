@@ -30,7 +30,6 @@ import {
   normalizeIdentity,
   readPersistedMessage,
   readPersistedTask,
-  sameAgent,
   TOWER_DO_SCHEMA_VERSION,
   TOWER_IDENTITY,
   TowerDoValidationError,
@@ -257,7 +256,7 @@ export class TowerBoard {
             // Exclude the sender by AGENT, so a legacy label of the same
             // session is not left in the audience (a self-broadcast can never
             // be acked).
-            currentOwners.filter((owner) => !sameAgent(owner, message.from));
+            currentOwners.filter((owner) => owner !== message.from);
           messages.set(message.id, { ...message, audience });
         } else {
           messages.set(message.id, message);

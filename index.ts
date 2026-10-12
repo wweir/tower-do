@@ -102,8 +102,6 @@ import {
   latestActivity,
   LIVE_HEARTBEAT_MS,
   LIVE_PRUNE_MS,
-  LIVE_WINDOW_MS,
-  liveOwnerIdentities,
   liveSessionCount,
   parseLiveRecord,
   MAX_IDENTITY_CHARS,
@@ -114,7 +112,6 @@ import {
   MAX_TASK_DESCRIPTION_CHARS,
   MAX_TASK_KEY_CHARS,
   MAX_TASK_SUBJECT_CHARS,
-  MAX_TOWER_DO_ALIASES,
   MAX_TOWER_DO_OPEN_TASKS,
   messagesToMe,
   normalizeIdentity,
@@ -123,11 +120,7 @@ import {
   retainMessages,
   staleTaskClaims,
   taskIsBlocked,
-  identityListHas,
-  identitySetHas,
   readByWith,
-  sameAgent,
-  sessionLabel,
   TASK_KEY_PATTERN,
   textLength,
   transportLimit,
@@ -376,26 +369,17 @@ function sessionIdentity(
       ? pi.getSessionName()?.trim()
       : undefined;
   if (sessionName) {
-    // Same rule as the config identity and an explicit `as`: the host strips
-    // `\r\n` from a session name but neither U+2028/U+2029 nor an over-long
-    // value, and this string becomes an owner / message `from` / reminder
-    // header identity that every write then validates. A name the identity
-    // rule rejects falls back to the session label instead of bricking the
-    // session over its title.
     try {
       return normalizeIdentity(sessionName, "session name");
     } catch {
-      // Fall through to the session label.
+      // Fall through to the session id.
     }
   }
   const sessionId =
     typeof ctx?.sessionManager.getSessionId === "function"
       ? (ctx.sessionManager.getSessionId() ?? "")
       : "";
-  // `sessionLabel` is the one place that maps a session id to a board identity
-  // (see its doc: the ≤ 0.4.0 form was pure timestamp and collided for every
-  // session started inside one 65.5 s bucket).
-  if (sessionId) return sessionLabel(sessionId);
+  if (sessionId) return sessionId;
   return DEFAULT_IDENTITY;
 }
 
@@ -711,7 +695,7 @@ function ensureKnown(
       .filter((owner): owner is string => owner !== undefined),
     ...activity,
   ]);
-  if (!identitySetHas(known, recipient)) {
+  if (!known.has(recipient)) {
     const knownNames = [...known].join(", ");
     throw new TowerDoValidationError(
       `unknown recipient "${recipient}" — address "all", ${TOWER_IDENTITY}, a current task owner, or someone with recent board activity (known: ${knownNames || "(none)"})`,
@@ -784,7 +768,6 @@ export default function towerDoExtension(pi: ExtensionAPI): void {
   // Owner labels this session has written as (`as`). Session-scoped, like
   // the single sidecar file the session owns (selfLivePath is fixed once
   // live wiring starts).
-  const liveAliases = new Set<string>();
   // This session's liveness file path — computed ONCE in restore(). The
   // empty-session-id fallback is a fresh random UUID and identity can change
   // mid-session, so recomputing per call would churn the filename every
@@ -1160,49 +1143,6 @@ export default function towerDoExtension(pi: ExtensionAPI): void {
   const liveDirFor = (cwd: string): string =>
     join(dirname(boards.entryFor(cwd).board.file), "live");
 
-  /** Identities with a fresh liveness record (Layer 1 routing), plus whether
-   * the scan was COMPLETE. A read failure (missing dir, mid-scan error) must
-   * not be read as "that owner is dead": callers treat an incomplete scan as
-   * "every known owner is live", mirroring the task guard's strict fallback.
-   * Liveness can only ever give a claim MORE standing, never resolve it. */
-  const readLiveOwners = async (
-    cwd: string,
-  ): Promise<{ owners: Set<string>; complete: boolean }> => {
-    const owners = new Set<string>();
-    try {
-      const dir = liveDirFor(cwd);
-      const nowMs = Date.now();
-      for (const name of await readdir(dir)) {
-        if (!name.endsWith(".json")) continue;
-        const record = parseLiveRecord(
-          await readFile(join(dir, name), "utf8"),
-        );
-        if (record === undefined) continue;
-        if (record.at < nowMs - LIVE_WINDOW_MS) continue;
-        for (const id of liveOwnerIdentities(record)) owners.add(id);
-      }
-      return { owners, complete: true };
-    } catch {
-      // No live dir yet, or an unreadable one: incomplete, so callers keep
-      // every claim protected rather than treating silence as death.
-      return { owners, complete: false };
-    }
-  };
-
-  /** Effective live set for derivation: on an incomplete scan every owner that
-   * appears on the board counts as live (strict guard, never loosened). */
-  const effectiveLiveOwners = (
-    view: TowerBoardView,
-    live: { owners: Set<string>; complete: boolean },
-  ): Set<string> => {
-    if (live.complete) return live.owners;
-    const all = new Set(live.owners);
-    for (const task of view.tasks) {
-      if (task.owner !== undefined) all.add(task.owner);
-    }
-    return all;
-  };
-
   /** Filename-safe component (identities/session ids are human-chosen). */
   const sanitizeLiveName = (s: string): string =>
     s.replace(/[^A-Za-z0-9._-]/g, "_").slice(0, MAX_IDENTITY_CHARS) || "x";
@@ -1236,7 +1176,6 @@ export default function towerDoExtension(pi: ExtensionAPI): void {
         JSON.stringify({
           identity: sessionIdentity(cwd, pi, selfCtx),
           at: Date.now(),
-          ...(liveAliases.size > 0 ? { aliases: [...liveAliases] } : {}),
         }),
       );
       await rename(tmp, selfLivePath);
@@ -1252,19 +1191,6 @@ export default function towerDoExtension(pi: ExtensionAPI): void {
     liveWriteChain = liveWriteChain
       .then(() => writeSelfLiveOnce(cwd))
       .catch(() => {});
-  };
-
-  const rememberLiveAlias = (cwd: string, caller: string): void => {
-    const self = sessionIdentity(cwd, pi, selfCtx);
-    if (caller === self || caller === "" || caller === "all") return;
-    if (liveAliases.has(caller)) return;
-    if (liveAliases.size >= MAX_TOWER_DO_ALIASES) {
-      throw new TowerDoValidationError(
-        `as identities this session can remember at most ${String(MAX_TOWER_DO_ALIASES)} aliases for liveness (got "${caller}")`,
-      );
-    }
-    liveAliases.add(caller);
-    writeSelfLive(cwd);
   };
 
   /** Live-session count from the liveness sidecar: distinct identities with
@@ -1630,7 +1556,6 @@ export default function towerDoExtension(pi: ExtensionAPI): void {
     currentView = view;
     uiContext = ctx;
     const caller = resolveCaller(as, ctx.cwd, pi, ctx);
-    rememberLiveAlias(ctx.cwd, caller);
     return { board: entry.board, caller, view };
   };
 
@@ -1699,23 +1624,12 @@ export default function towerDoExtension(pi: ExtensionAPI): void {
           // Unreadable log → empty activity, which `staleTaskClaims` maps to
           // "no stale claims" (strict guard); the write must still land.
         }
-        // Liveness tiebreaker: an owner whose process still heartbeats is
-        // never stale, however quiet on the board. `effectiveLiveOwners` is the
-        // same derivation the other guard sites use, so this gate cannot drift
-        // from them; on a read failure every known owner counts as live (strict
-        // guard), mirroring the activity read above.
-        const liveOwners = effectiveLiveOwners(
-          freshView,
-          await readLiveOwners(ctx.cwd),
-        );
         // An empty activity list (unreadable / empty log) already means "no
         // stale claims" inside the derivation — strict guard, never loosened.
         const staleClaims = staleTaskClaims(
           activity,
           freshView.tasks,
           Date.now(),
-          undefined,
-          liveOwners,
         );
         const details = writeBoardSnapshot(
           freshView,
@@ -1856,7 +1770,7 @@ export default function towerDoExtension(pi: ExtensionAPI): void {
         }
         // Same agent, not just the same string: a session that migrated from a
         // legacy label must not be able to address itself.
-        if (sameAgent(to, caller))
+        if (to === caller)
           throw new TowerDoValidationError(
             "cannot send an inbox message to yourself",
           );
@@ -2006,7 +1920,7 @@ export default function towerDoExtension(pi: ExtensionAPI): void {
             };
           }
           const withAcks = (message: TowerDoMessage): TowerDoMessage =>
-            ackedIds.has(message.id) && !identityListHas(message.readBy, caller)
+            ackedIds.has(message.id) && !(message.readBy ?? []).includes(caller)
               ? { ...message, readBy: readByWith(message.readBy, caller) }
               : message;
           const updatedMessages = mine.map(withAcks);
@@ -2026,7 +1940,7 @@ export default function towerDoExtension(pi: ExtensionAPI): void {
           updateWidget(ctx);
           const lines = updatedMessages.map(
             (message) =>
-              `- [${message.id}] [${identityListHas(message.readBy, caller) ? "read" : "UNREAD"}] ${message.from} → ${message.to}${message.taskKey === undefined ? "" : ` (task ${message.taskKey})`}: ${message.subject}\n  ${message.body.split("\n")[0]}`,
+              `- [${message.id}] [${(message.readBy ?? []).includes(caller) ? "read" : "UNREAD"}] ${message.from} → ${message.to}${message.taskKey === undefined ? "" : ` (task ${message.taskKey})`}: ${message.subject}\n  ${message.body.split("\n")[0]}`,
           );
           return {
             content: [
@@ -2046,7 +1960,7 @@ export default function towerDoExtension(pi: ExtensionAPI): void {
         throwIfAborted(signal, "TowerDo talk");
         const peekMine = myInbox(peek);
         if (
-          !peekMine.some((message) => !identityListHas(message.readBy, caller))
+          !peekMine.some((message) => !(message.readBy ?? []).includes(caller))
         ) {
           return inboxResult(peek, peekMine, new Set());
         }
@@ -2058,7 +1972,7 @@ export default function towerDoExtension(pi: ExtensionAPI): void {
           const fresh = await readFold();
           throwIfAborted(signal, "TowerDo talk");
           const unacked = myInbox(fresh).filter(
-            (message) => !identityListHas(message.readBy, caller),
+            (message) => !(message.readBy ?? []).includes(caller),
           );
           if (unacked.length > 0) {
             throwIfAborted(signal, "TowerDo talk");
@@ -2435,7 +2349,7 @@ export default function towerDoExtension(pi: ExtensionAPI): void {
         }; ${myUnread} unread)`,
       );
       for (const message of myMessages) {
-        const readMark = identityListHas(message.readBy, caller)
+        const readMark = (message.readBy ?? []).includes(caller)
           ? "read"
           : "UNREAD";
         lines.push(
@@ -2682,6 +2596,5 @@ export default function towerDoExtension(pi: ExtensionAPI): void {
     // mid-session). Within a session the cache is deliberately stable — moving
     // the board file mid-session would orphan earlier events (split-brain).
     projectRootCache.clear();
-    liveAliases.clear();
   });
 }

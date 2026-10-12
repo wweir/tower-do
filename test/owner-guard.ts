@@ -489,42 +489,6 @@ async function main(): Promise<void> {
     ).size === 0,
   );
 
-  // Liveness tiebreaker: an owner whose process still heartbeats is never
-  // stale, however quiet it has been on the board.
-  const withLive = staleTaskClaims(
-    [
-      activityEntry("A", NOW - 7 * 60 * MIN, "idle"),
-      activityEntry("B", NOW - 1 * MIN, "fresh"),
-    ],
-    tasksForDerivation,
-    NOW,
-    undefined,
-    new Set(["A", "C"]),
-  );
-  check(
-    "fresh liveness heartbeat keeps a board-quiet owner from takeover",
-    withLive.size === 0,
-    [...withLive].join(","),
-  );
-  check(
-    "liveOwners alias protects an as-label owner with stale board activity",
-    staleTaskClaims(
-      [activityEntry("coder-1", NOW - 7 * 60 * MIN, "child")],
-      [
-        handTask({
-          key: "child",
-          subject: "c",
-          status: "in_progress",
-          owner: "coder-1",
-          updatedAt: NOW - 7 * 60 * MIN,
-        }),
-      ],
-      NOW,
-      undefined,
-      new Set(["alice", "coder-1"]),
-    ).size === 0,
-  );
-
   // No activity data at all (unreadable/garbage log) disables the exception:
   // the updatedAt fallback is only sound when the log exists.
   check(

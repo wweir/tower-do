@@ -32,10 +32,6 @@ export const TOWER_DO_STATUS_TOOL_NAME = "tower_do_status";
  * for every session that is not an owner or `tower` (the guard pins completed
  * rows to their owner forever). See DECISIONS.md "open-task budget". */
 export const MAX_TOWER_DO_OPEN_TASKS = 50;
-/** Live-alias memory cap: distinct `as` labels one session records in its own
- * liveness sidecar. Unrelated to the task budget (identities, not work); they
- * were one constant before and silently changed together. */
-export const MAX_TOWER_DO_ALIASES = 50;
 export const DEFAULT_IDENTITY = "main";
 /** Reserved orchestrator identity that may act on any owned task (Tower). */
 export const TOWER_IDENTITY = "tower";
@@ -343,85 +339,6 @@ export function normalizeIdentity(
 // Identity labels — one agent, one key
 // ---------------------------------------------------------------------------
 
-/** pi session ids are UUIDv7 (hex, `8-4-4-4-12`): the first 12 hex digits are a
- * millisecond timestamp, the last 12 are random. Two generated-label shapes
- * exist: `session-<time8>` (≤ 0.4.0) and `session-<time8>-<rand8>` (≥ 0.4.1). */
-const LEGACY_SESSION_LABEL = /^session-([0-9a-f]{8})$/;
-const CURRENT_SESSION_LABEL = /^session-([0-9a-f]{8})-([0-9a-f]{8})$/;
-
-/** Board identity for a session id: `session-<time8>-<rand8>`.
- *
- * Through 0.4.0 the label was `session-<time8>`. The first 8 hex digits of a
- * UUIDv7 are the top 32 bits of a 48-bit millisecond timestamp — pure time
- * with no entropy — so every session started inside one 65536 ms (65.5 s)
- * bucket resolved to the SAME identity: parallel subagents, launched within
- * milliseconds of each other, shared one owner key (observed live: two
- * siblings 26 ms apart, both `session-01a0b47e`). The suffix carries 8 hex
- * digits of the id's random tail, which separates the bucket's members.
- *
- * The time prefix is kept verbatim, so a ≤ 0.4.0 label is a prefix of the
- * label the same session resolves to now — that partition is what `sameAgent`
- * uses to migrate rows written before the change. */
-export function sessionLabel(sessionId: string): string {
-  return `session-${sessionId.slice(0, 8)}-${sessionId
-    .replace(/-/g, "")
-    .slice(-8)}`;
-}
-
-/**
- * Do two labels reach the same agent? DELIVERY AND DISPLAY ONLY — never
- * permission (see the owner guard: it compares labels exactly).
- *
- * Exact equality always does. Beyond that a legacy `session-<time8>` label
- * reaches the `session-<time8>-<rand8>` label it prefixes, so mail addressed to
- * a pre-0.4.1 label is still delivered and a migrated row still renders as the
- * same agent. A legacy label is ambiguous for its whole 65.5 s bucket by
- * construction — it cannot name one member — so this relation is deliberately
- * permissive: it may over-deliver (the pre-0.4.1 reach, never worse) but must
- * never lose mail.
- *
- * Two CURRENT labels are never equated, not even when they share the 8-digit
- * time prefix: that prefix is a bucket, not an identity, and treating bucket
- * siblings as one agent is exactly the collision this fixes. Labels that are
- * not generated session labels (a pinned `config.identity`, an `as` label)
- * compare verbatim. The relation is NOT transitive (legacy ↔ each sibling), so
- * grouping must stay keyed — `derivePresence` merges a legacy row only into a
- * bucket that holds exactly one current label.
- */
-export function sameAgent(left: string, right: string): boolean {
-  if (left === right) return true;
-  const legacyLeft = LEGACY_SESSION_LABEL.exec(left);
-  const legacyRight = LEGACY_SESSION_LABEL.exec(right);
-  if (legacyLeft === null && legacyRight === null) return false;
-  const currentLeft = CURRENT_SESSION_LABEL.exec(left);
-  const currentRight = CURRENT_SESSION_LABEL.exec(right);
-  if (legacyLeft !== null && currentRight !== null)
-    return legacyLeft[1] === currentRight[1];
-  if (legacyRight !== null && currentLeft !== null)
-    return legacyRight[1] === currentLeft[1];
-  return false;
-}
-
-/** Set membership that honours `sameAgent` — for reachability and display
- * (audiences, recipient validation, presence). NEVER for permission: the owner
- * guard compares labels exactly. Identity sets are small. */
-export function identitySetHas(
-  set: ReadonlySet<string>,
-  label: string,
-): boolean {
-  if (set.has(label)) return true;
-  for (const candidate of set) if (sameAgent(candidate, label)) return true;
-  return false;
-}
-
-/** List membership that honours `sameAgent` (read receipts, audiences). */
-export function identityListHas(
-  list: readonly string[] | undefined,
-  label: string,
-): boolean {
-  return (list ?? []).some((candidate) => sameAgent(candidate, label));
-}
-
 /** `readBy` after `label` acks: append unless the same agent is already
  * recorded. Purely additive — an existing legacy entry is left alone, because
  * rewriting another label's receipt is not this ack's business. */
@@ -430,7 +347,7 @@ export function readByWith(
   label: string,
 ): string[] {
   const next = [...(readBy ?? [])];
-  if (!identityListHas(next, label)) next.push(label);
+  if (!next.includes(label)) next.push(label);
   return next;
 }
 
@@ -1068,7 +985,7 @@ function broadcastAudience(
   // reaches its own inbox), which would pin the broadcast outside the
   // retention budget forever.
   const owners = [...(message.audience ?? currentOwners(view))].filter(
-    (owner) => !sameAgent(owner, message.from),
+    (owner) => owner !== message.from,
   );
   return new Set(owners);
 }
@@ -1092,10 +1009,10 @@ export function messagesToMe(
   identity: string,
 ): TowerDoMessage[] {
   return view.messages.filter((message) => {
-    if (sameAgent(message.from, identity)) return false;
-    if (sameAgent(message.to, identity)) return true;
+    if (message.from === identity) return false;
+    if (message.to === identity) return true;
     if (message.to !== "all") return false;
-    return identitySetHas(broadcastAudience(message, view), identity);
+    return broadcastAudience(message, view).has(identity);
   });
 }
 
@@ -1105,7 +1022,7 @@ export function unreadMessagesToMe(
   identity: string,
 ): TowerDoMessage[] {
   return messagesToMe(view, identity).filter(
-    (message) => !identityListHas(message.readBy, identity),
+    (message) => !(message.readBy ?? []).includes(identity),
   );
 }
 
@@ -1128,12 +1045,12 @@ export function isMessageFullyRead(
     // owners). Nobody can ever read it now — treat as fully read so a
     // finished broadcast round cannot pin the retention budget forever.
     const pendingReaders = [...owners].filter(
-      (owner) => !identityListHas(readBy, owner),
+      (owner) => !readBy.includes(owner),
     );
     if (pendingReaders.length === 0) return true;
     const pendingStillHere = pendingReaders.some((owner) =>
       view.tasks.some(
-        (task) => task.owner !== undefined && sameAgent(task.owner, owner),
+        (task) => task.owner !== undefined && task.owner === owner,
       ),
     );
     if (!pendingStillHere) return true;
@@ -1144,7 +1061,7 @@ export function isMessageFullyRead(
   // ownership proxy below would classify every message to it as undeliverable
   // and let the retention budget drop one that is still unread. Its read state
   // is the ack list alone.
-  if (message.to === TOWER_IDENTITY) return identityListHas(readBy, message.to);
+  if (message.to === TOWER_IDENTITY) return readBy.includes(message.to);
   // Anyone else: if the recipient is no longer an owner on the board (they
   // left / the board was rebuilt), nobody can ever read it — treat it as fully
   // read so orphan messages do not accumulate in the folded view forever.
@@ -1153,10 +1070,10 @@ export function isMessageFullyRead(
   // for recent board activity may therefore retire earlier than the age valve,
   // which stays the bound.
   const recipientStillHere = view.tasks.some(
-    (task) => task.owner !== undefined && sameAgent(task.owner, message.to),
+    (task) => task.owner !== undefined && task.owner === message.to,
   );
   if (!recipientStillHere) return true;
-  return identityListHas(readBy, message.to);
+  return readBy.includes(message.to);
 }
 
 /**
@@ -1284,7 +1201,7 @@ export function parseActivityLine(line: string): ActivityEntry | undefined {
       // message: it is traffic the *reader* generated. Render it as a read
       // notice, keyed to the reader, so activity doesn't look like the
       // reader re-sent the message.
-      if (by !== message.from && identityListHas(readBy, by)) {
+      if (by !== message.from && readBy.includes(by)) {
         return {
           kind: "message",
           by,
@@ -1438,13 +1355,6 @@ export function staleTaskClaims(
   tasks: readonly TowerDoTask[],
   now: number,
   idleMs: number = OWNER_TAKEOVER_MS,
-  /** Identities with a fresh liveness-sidecar record (`live/`,
-   * LIVE_WINDOW_MS): a running process is never stale, however quiet it has
-   * been on the board — the heartbeat exists precisely to separate "alive
-   * but heads-down" from "exited / crashed". Callers who cannot read the
-   * sidecar should pass EVERY owner here: no liveness data must disable
-   * the exception, not loosen it. */
-  liveOwners: ReadonlySet<string> = new Set(),
 ): Set<string> {
   const stale = new Set<string>();
   // No activity data at all (unreadable / garbage log) must disable the
@@ -1466,12 +1376,7 @@ export function staleTaskClaims(
     // decide whether THIS owner is stale. A legacy row therefore goes stale by
     // its own label's silence and becomes adoptable through the normal window —
     // that is the documented remedy, predictable rather than guessed.
-    if (
-      task.owner === undefined ||
-      task.status === "completed" ||
-      liveOwners.has(task.owner)
-    )
-      continue;
+    if (task.owner === undefined || task.status === "completed") continue;
     const quietSince =
       taskActivity.get(claimKey(task.owner, task.key)) ?? task.updatedAt;
     if (now - quietSince > idleMs) stale.add(claimKey(task.owner, task.key));
@@ -1547,9 +1452,6 @@ export const LIVE_PRUNE_MS = 10 * 60_000;
 export interface LiveRecord {
   identity: string;
   at: number;
-  /** Extra owner labels this session has written as (`as`). Used by the
-   *  takeover gate; not counted by `liveSessionCount`. */
-  aliases?: string[];
 }
 
 /** Parse the raw JSON content of a liveness sidecar file. Corrupt or
@@ -1566,41 +1468,13 @@ export function parseLiveRecord(raw: string): LiveRecord | undefined {
   const { identity, at } = record;
   if (typeof identity !== "string" || identity.trim() === "") return undefined;
   if (typeof at !== "number" || !Number.isFinite(at)) return undefined;
-  const aliases = readLiveAliases(record.aliases);
-  return aliases === undefined ? { identity, at } : { identity, at, aliases };
+  return { identity, at };
 }
 
-function readLiveAliases(value: unknown): string[] | undefined {
-  if (!Array.isArray(value)) return undefined;
-  const out: string[] = [];
-  const seen = new Set<string>();
-  for (const item of value) {
-    if (out.length >= MAX_TOWER_DO_ALIASES) break;
-    if (typeof item !== "string") continue;
-    const id = item.trim();
-    if (id === "" || id === "all" || textLength(id) > MAX_IDENTITY_CHARS)
-      continue;
-    if (identitySetHas(seen, id)) continue;
-    seen.add(id);
-    out.push(id);
-  }
-  return out.length === 0 ? undefined : out;
-}
-
-/** Identities a fresh sidecar record should protect from takeover:
- *  the session identity plus any `as` aliases. `live N` still counts
- *  `identity` only. */
+/** Identities a fresh sidecar record protects from takeover (its session
+ * identity). Kept as a list so callers can treat it uniformly. */
 export function liveOwnerIdentities(record: LiveRecord): string[] {
-  if (record.aliases === undefined || record.aliases.length === 0)
-    return [record.identity];
-  const ids = [record.identity];
-  const seen = new Set([record.identity]);
-  for (const alias of record.aliases) {
-    if (seen.has(alias)) continue;
-    seen.add(alias);
-    ids.push(alias);
-  }
-  return ids;
+  return [record.identity];
 }
 
 /**
