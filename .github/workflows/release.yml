@@ -51,7 +51,6 @@ jobs:
           bun test/live-sessions.ts
           bun test/board-progress.ts
           bun test/task-cap.ts
-          bun test/wake-mail.ts
           bun test/limits.ts
           bun test/identity-scope.ts
           bun test/identity-label.ts

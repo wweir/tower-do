@@ -45,7 +45,7 @@
 | P3b findings 退役 | `rw-findings` | done |
 | P3c 删 scope/changedFiles | `rw-trim` | done |
 | P3d 删 layers/presence + 收敛 status | `rw-view` | done |
-| P4a 消息投递（D2） | `rw-msg` | open |
+| P4a 消息投递（D2） | `rw-msg` | done |
 | P4b 身份（D4） | `rw-identity` | open |
 | P5 UI（D3） | `rw-ux` | open |
 | P6 文档 | `rw-docs` | open |
