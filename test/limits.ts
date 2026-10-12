@@ -108,8 +108,6 @@ const ELEMENT_TEXT: Array<[string, number]> = [
 /** Element-level list limits, and the limit the extension enforces for each. */
 const ELEMENT_COUNT: Array<[string, number]> = [
   ["dependsOn", MAX_TASK_DEPENDENCIES],
-  ["scope", MAX_SCOPE_GLOBS],
-  ["changedFiles", MAX_CHANGED_FILES],
   ["blockedBy", MAX_TASK_BLOCKERS],
 ];
 /** Top-level named fields: the schema keeps the business value. */
@@ -520,41 +518,6 @@ async function main(): Promise<void> {
     /tasks\[0\]\.owner \(astral\) is 65 characters \(max 64\)/,
   );
   await expectThrows(
-    "an over-long scope entry is refused with the key and the entry index",
-    () =>
-      write({
-        baseRevision: current.revision,
-        tasks: [
-          {
-            key: "astral",
-            scope: ["src/**", "x".repeat(MAX_PATH_ENTRY_CHARS + 1)],
-          },
-        ],
-      }),
-    /tasks\[0\]\.scope\[1\] \(astral\) is 257 characters \(max 256\)/,
-  );
-  // The index must be the ORIGINAL payload position, not the deduped one: a
-  // duplicate before the offender shifts the deduped index, so the caller
-  // would shorten the wrong entry and fail identically on retry.
-  await expectThrows(
-    "an over-long scope entry names the raw index after a duplicate",
-    () =>
-      write({
-        baseRevision: current.revision,
-        tasks: [
-          {
-            key: "astral",
-            scope: [
-              "dup/**",
-              "dup/**",
-              "x".repeat(MAX_PATH_ENTRY_CHARS + 1),
-            ],
-          },
-        ],
-      }),
-    /tasks\[0\]\.scope\[2\] \(astral\) is 257 characters \(max 256\)/,
-  );
-  await expectThrows(
     "an over-long blockedBy entry is refused with the key and the entry index",
     () =>
       write({
@@ -569,22 +532,6 @@ async function main(): Promise<void> {
     /tasks\[0\]\.blockedBy\[1\] \(astral\) is 121 characters \(max 120\)/,
   );
   await expectThrows(
-    "an over-long changedFiles entry is refused with the key and the entry index",
-    () =>
-      write({
-        baseRevision: current.revision,
-        tasks: [
-          {
-            key: "receipt",
-            subject: "delivered",
-            status: "completed",
-            changedFiles: ["src/a.ts", "x".repeat(MAX_PATH_ENTRY_CHARS + 1)],
-          },
-        ],
-      }),
-    /tasks\[0\]\.changedFiles\[1\] \(receipt\) is 257 characters \(max 256\)/,
-  );
-  await expectThrows(
     "a malformed dependency key is refused with the depending task key",
     () =>
       write({
@@ -594,10 +541,8 @@ async function main(): Promise<void> {
     /tasks\[0\]\.dependsOn\[0\] \(astral\) must be 1-40/,
   );
 
-  // Duplicates are dropped before the cap: 101 changedFiles entries with one
-  // duplicate is 100 stored paths, and 21 references to one dependency is one
-  // dependency. Counting the raw array rejected a legal value (the cap's error
-  // even said "supports at most 100 paths" while the stored list was 100).
+  // Duplicates are dropped before the cap: 21 references to one dependency is
+  // one dependency. Counting the raw array rejected a legal value.
   await write({
     baseRevision: current.revision,
     tasks: [
@@ -607,22 +552,9 @@ async function main(): Promise<void> {
         status: "completed",
       },
       { key: "astral", description: emoji },
-      {
-        key: "cg-release",
-        changedFiles: [
-          ...Array.from({ length: MAX_CHANGED_FILES }, (_, i) => `src/f${i}.ts`),
-          "src/f0.ts",
-        ],
-      },
     ],
   });
   const deduped = await fold();
-  const receipt = deduped.tasks.find((task) => task.key === "cg-release");
-  check(
-    "changedFiles: a duplicate does not consume the cap (100 stored, not 101 rejected)",
-    receipt?.changedFiles?.length === MAX_CHANGED_FILES,
-    `stored=${String(receipt?.changedFiles?.length)}`,
-  );
   await write({
     baseRevision: deduped.revision,
     tasks: [

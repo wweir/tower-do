@@ -59,7 +59,6 @@ function snapshotOf(view: ReturnType<typeof createEmptyBoard>): Array<{
   owner?: string;
   description?: string;
   dependsOn: string[];
-  scope?: string[];
   blockedBy: string[];
 }> {
   return view.tasks.map((t) => ({
@@ -69,7 +68,6 @@ function snapshotOf(view: ReturnType<typeof createEmptyBoard>): Array<{
     ...(t.owner === undefined ? {} : { owner: t.owner }),
     ...(t.description === undefined ? {} : { description: t.description }),
     dependsOn: t.dependsOn,
-    ...(t.scope === undefined ? {} : { scope: t.scope }),
     blockedBy: t.blockedBy,
   }));
 }
@@ -87,7 +85,6 @@ async function main(): Promise<void> {
           subject: "S1",
           status: "in_progress",
           owner: "A",
-          scope: ["extensions/tower-do/**"],
         },
         {
           key: "b-task",
@@ -115,7 +112,6 @@ async function main(): Promise<void> {
               subject: "HACKED-BY-B", // status/owner/scope unchanged
               status: "in_progress",
               owner: "A",
-              scope: ["extensions/tower-do/**"],
             },
             {
               key: "b-task",
@@ -143,7 +139,6 @@ async function main(): Promise<void> {
               subject: "S1",
               status: "in_progress",
               owner: "A",
-              scope: ["extensions/tower-do/**"],
               blockedBy: ["blocker-x"], // content field, owner/status unchanged
             },
             {
@@ -172,7 +167,6 @@ async function main(): Promise<void> {
               subject: "S1",
               status: "in_progress",
               owner: "A",
-              scope: ["extensions/tower-do/**"],
               dependsOn: ["b-task"], // a real, existing dep — not a dangling ref
             },
             {
@@ -201,7 +195,6 @@ async function main(): Promise<void> {
               subject: "S1",
               status: "in_progress",
               owner: "A",
-              scope: ["extensions/tower-do/**"],
               description: "sneaky description",
             },
             {
@@ -230,7 +223,6 @@ async function main(): Promise<void> {
               subject: "S1",
               status: "completed", // only status changes
               owner: "A",
-              scope: ["extensions/tower-do/**"],
             },
             {
               key: "b-task",
@@ -258,7 +250,6 @@ async function main(): Promise<void> {
               subject: "S1",
               status: "in_progress",
               owner: "B", // steal
-              scope: ["extensions/tower-do/**"],
             },
             {
               key: "b-task",
@@ -302,7 +293,6 @@ async function main(): Promise<void> {
               subject: "S1", // stale — A just set S2
               status: "in_progress",
               owner: "A",
-              scope: ["extensions/tower-do/**"],
             },
             {
               key: "b-task",
@@ -661,7 +651,6 @@ async function main(): Promise<void> {
           subject: "delivered",
           status: "completed",
           owner: "A",
-          changedFiles: ["x.ts"],
         },
         {
           key: "fresh-task",
@@ -692,7 +681,6 @@ async function main(): Promise<void> {
           subject: "delivered",
           status: "completed",
           owner: "A",
-          changedFiles: ["x.ts"],
         },
         {
           key: "fresh-task",
@@ -731,7 +719,6 @@ async function main(): Promise<void> {
               subject: "delivered",
               status: "completed",
               owner: "A",
-              changedFiles: ["x.ts"],
             },
             {
               key: "fresh-task",
@@ -758,7 +745,6 @@ async function main(): Promise<void> {
           subject: "delivered",
           status: "completed",
           owner: "A",
-          changedFiles: ["x.ts"],
         },
         {
           key: "fresh-task",
@@ -826,7 +812,6 @@ async function main(): Promise<void> {
               subject: "delivered",
               status: "completed",
               owner: "C",
-              changedFiles: ["x.ts"],
             },
             {
               key: "fresh-task",
@@ -860,7 +845,6 @@ async function main(): Promise<void> {
             subject: "delivered",
             status: "completed",
             owner: "A",
-            changedFiles: ["x.ts"],
           },
           {
             key: "fresh-task",
@@ -903,7 +887,6 @@ async function main(): Promise<void> {
               subject: "delivered",
               status: "completed",
               owner: "A",
-              changedFiles: ["x.ts"],
             },
             {
               key: "fresh-task",
@@ -939,7 +922,6 @@ async function main(): Promise<void> {
               subject: "delivered",
               status: "completed",
               owner: "A",
-              changedFiles: ["x.ts"],
             },
             {
               key: "fresh-task",
@@ -1037,30 +1019,7 @@ async function main(): Promise<void> {
     /owned by "A"/,
   );
 
-  // Two distinct values must never compare equal. `taskEquals` used to join
-  // list fields with NUL before comparing, so ["a","b"] and ["a\0b"] were
-  // "equal": a real content edit (or a scope change) was silently dropped as a
-  // no-op, and the same collision made the adoption guard read a content edit
-  // as a pure owner swap.
-  const nulBoard = writeBoardSnapshot(
-    createEmptyBoard(),
-    { tasks: [{ key: "n", subject: "s", status: "pending", scope: ["a", "b"] }] },
-    "A",
-  ).view;
-  const nulEdit = writeBoardSnapshot(
-    nulBoard,
-    {
-      tasks: [{ key: "n", subject: "s", status: "pending", scope: ["a\u0000b"] }],
-      baseRevision: nulBoard.revision,
-    },
-    "A",
-  );
-  check(
-    "a NUL-bearing scope entry is a real edit, not a NUL-join no-op",
-    nulEdit.change.updated.join(",") === "n" &&
-      nulEdit.view.tasks[0]?.scope?.[0] === "a\u0000b",
-    JSON.stringify(nulEdit.change),
-  );
+
   // An identity must not carry the separator claimKey joins on, or two distinct
   // (owner, task) pairs could collapse into one key in the takeover set.
   expectThrows(

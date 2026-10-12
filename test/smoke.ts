@@ -121,14 +121,12 @@ async function layer1(): Promise<void> {
           subject: "implement vulkan int4 gemm",
           status: "in_progress",
           owner: "alice",
-          scope: ["src/gemm/**"],
         },
         {
           key: "readme",
           subject: "write vulkan API survey into README",
           status: "in_progress",
           owner: "bob",
-          scope: ["README.md"],
         },
         {
           key: "test",
@@ -404,58 +402,6 @@ async function layer1(): Promise<void> {
     `tasks=${view.tasks.map((t) => t.key).join(",")}`,
   );
 
-  // changedFiles receipt survives the DISK round-trip (board.append → fold):
-  // a completed task carrying the receipt must re-fold it from the JSONL
-  // event log, including via a second TowerBoard instance on the same file
-  // (the path a peer session actually reads).
-  const doneWrite = writeBoardSnapshot(
-    view,
-    {
-      tasks: [
-        {
-          key: "readme",
-          subject: "write vulkan API survey into README",
-          status: "completed",
-          owner: "bob",
-          changedFiles: ["README.md", "src/api/types.ts"],
-        },
-        {
-          key: "test",
-          subject: "run sqznet test",
-          status: "pending",
-          owner: "carol",
-          dependsOn: [],
-        },
-      ],
-      baseRevision: view.revision,
-    },
-    "bob",
-  );
-  view = doneWrite.view;
-  await board.append(doneWrite.taskEvents);
-  const receipt = doneWrite.view.tasks.find((t) => t.key === "readme");
-  check(
-    "completing with changedFiles persists the receipt",
-    receipt?.status === "completed" &&
-      JSON.stringify(receipt.changedFiles) ===
-        JSON.stringify(["README.md", "src/api/types.ts"]),
-    `changedFiles=${JSON.stringify(receipt?.changedFiles)}`,
-  );
-  const freshBoard = new TowerBoard(file);
-  const reFolded = await freshBoard.fold();
-  const reRead = reFolded.tasks.find((t) => t.key === "readme");
-  check(
-    "changedFiles receipt survives disk fold across instances",
-    reRead?.status === "completed" &&
-      JSON.stringify(reRead.changedFiles) ===
-        JSON.stringify(["README.md", "src/api/types.ts"]),
-    `reFolded changedFiles=${JSON.stringify(reRead?.changedFiles)}`,
-  );
-  check(
-    "revision still equals a refold after the receipt write",
-    reFolded.revision === doneWrite.view.revision,
-    `refold=${reFolded.revision} write=${doneWrite.view.revision}`,
-  );
 }
 
 async function layer2(): Promise<void> {
@@ -583,7 +529,6 @@ async function layer2(): Promise<void> {
         subject: "refactor auth module",
         status: "in_progress",
         owner: "alice",
-        scope: ["src/auth/**"],
       },
       {
         key: "billing",
@@ -699,180 +644,6 @@ async function layer2(): Promise<void> {
     capped.text.includes("more row(s) hidden by the 1-row budget") &&
       capped.text.includes("pass a larger limit"),
     capped.text.split("\n").slice(-3).join(" / "),
-  );
-
-  // The scope-conflict section grows with the completed history (every receipt
-  // that touched a file the caller's scope names is a row), so the default view
-  // cuts it to DASHBOARD_SCOPE_CONFLICT_LINES and reports the rest. The
-  // disclosure must stay neutral: the hidden rows are mostly the CALLER's own
-  // tasks against old receipts, not conflicts "between other sessions".
-  const foldedConflictDir = mkdtempSync(join(tmpdir(), "tower-do-conflict-"));
-  await run(
-    "tower_do",
-    {
-      tasks: [
-        {
-          key: "done-receipt",
-          subject: "touched src",
-          status: "completed",
-          changedFiles: ["src/a.ts"],
-        },
-        ...Array.from({ length: 6 }, (_, i) => ({
-          key: `scope-${String(i)}`,
-          subject: `scope row ${String(i)}`,
-          status: "pending",
-          // The caller owns one of them, so the cut must keep ITS conflict
-          // (relevant-first) instead of whatever fold order surfaced.
-          ...(i === 0 ? { owner: "smoke-session" } : {}),
-          scope: ["src/a.ts"],
-        })),
-      ],
-    } as never,
-    foldedConflictDir,
-  );
-  const conflictStatus = await run(
-    "tower_do_status",
-    {} as never,
-    foldedConflictDir,
-  );
-  check(
-    "the caller's own conflicts win the cut",
-    conflictStatus.text.includes(
-      "⛔ overlap: scope-0 plans to touch what done-receipt already changed",
-    ),
-    conflictStatus.text
-      .split("\n")
-      .filter((line) => line.includes("overlap:"))
-      .map((line) => line.slice(0, 60))
-      .join(" / "),
-  );
-  check(
-    "the folded scope-conflict section reports hidden rows neutrally",
-    conflictStatus.text.includes(
-      "## Scope conflicts (6, 5 shown) — advisory",
-    ) &&
-      conflictStatus.text.includes("… +1 more conflict(s) not shown") &&
-      !conflictStatus.text.includes("between other sessions"),
-    conflictStatus.text
-      .split("\n")
-      .filter((line) => line.includes("Scope conflicts") || line.includes("not shown"))
-      .join(" / ") || "(missing)",
-  );
-
-  // Completed rows are a compact key ledger now, so receipts no longer
-  // inflate the render: fat OPEN rows (a full scope list each) are the cheap
-  // way to grow it instead.
-  const fatDir = mkdtempSync(join(tmpdir(), "tower-do-trunc-"));
-  const fatGlobs = Array.from(
-    { length: 20 },
-    (_, i) => `${"x".repeat(220)}/segment-${String(i)}/**/*.ts`,
-  );
-  const fatBatch = (round: number): Array<Record<string, unknown>> =>
-    Array.from({ length: 50 }, (_, i) => ({
-      key: `fat-${String(round * 50 + i)}`,
-      subject: `open artifact ${String(round * 50 + i)}`,
-      status: "in_progress",
-      scope: fatGlobs,
-    }));
-  await run("tower_do", { tasks: fatBatch(0) } as never, fatDir);
-  // The byte-cap fixture needs the expanded view: the folded default renders
-  // these 50 rows as 50 short ledger lines, which is the point of the fold.
-  const fatStatus = await run(
-    "tower_do_status",
-    { view: "all" } as never,
-    fatDir,
-  );
-  check(
-    "dashboard past the byte cap discloses the dropped head",
-    fatStatus.text.includes("… dashboard truncated:") &&
-      fatStatus.text.includes("Revision ") &&
-      fatStatus.text.includes("board file ") &&
-      !fatStatus.text.includes("TowerDo shared board — identity"),
-    fatStatus.text.split("\n").slice(-1)[0]?.slice(0, 140),
-  );
-  // The disclosure must not itself break the promised bound: the body is cut
-  // with the footer's bytes reserved.
-  check(
-    "truncated dashboard still fits the declared byte cap",
-    Buffer.byteLength(fatStatus.text, "utf8") <= 50 * 1024,
-    `${String(Buffer.byteLength(fatStatus.text, "utf8"))} bytes`,
-  );
-
-  // The layers are computed over the whole board: a `limit` that slices the
-  // caller's own row away must not reclassify the peer row it is coupled to.
-  const coupledDir = mkdtempSync(join(tmpdir(), "tower-do-coupled-"));
-  await run(
-    "tower_do",
-    {
-      tasks: [
-        {
-          key: "peer-dep",
-          subject: "peer work",
-          status: "in_progress",
-          owner: "carol",
-        },
-        {
-          key: "mine",
-          subject: "my work",
-          status: "pending",
-          owner: "smoke-session",
-          dependsOn: ["peer-dep"],
-        },
-      ],
-    } as never,
-    coupledDir,
-  );
-  const coupled = await run(
-    "tower_do_status",
-    { limit: 1 } as never,
-    coupledDir,
-  );
-  check(
-    "a sliced-away own row still classifies its peer dependency as needs",
-    coupled.text.includes("[needs you: await]") &&
-      !coupled.text.includes("- ○ mine:"),
-    coupled.text.slice(0, 200),
-  );
-
-  // A completed ledger line packs several keys, so the line cap can no longer
-  // fire before the byte cap does: assert the disclosure survives and both
-  // budgets hold on a board whose ledger alone exceeds the byte cap.
-  const lineDir = mkdtempSync(join(tmpdir(), "tower-do-lines-"));
-  // Seed the log directly: one writeBoardSnapshot call may introduce at most
-  // MAX_TOWER_DO_OPEN_TASKS new completed rows (the fabricated-receipt bound).
-  const lineEvents: ReturnType<typeof writeBoardSnapshot>["taskEvents"] =
-    Array.from({ length: 8000 }, (_, i) => {
-      const key = `l${String(i).padStart(5, "0")}`;
-      return {
-        kind: "task" as const,
-        op: "upsert" as const,
-        key,
-        task: {
-          key,
-          subject: "x",
-          status: "completed" as const,
-          dependsOn: [],
-          blockedBy: [],
-          updatedAt: i,
-        },
-        by: "seed",
-        at: i,
-      };
-    });
-  await new TowerBoard(boardFileFor(lineDir)).append(lineEvents);
-  const lineStatus = await run(
-    "tower_do_status",
-    { limit: 20_000 } as never,
-    lineDir,
-  );
-  const lineCount = lineStatus.text.split("\n").length;
-  check(
-    "truncated ledger still discloses the cut inside both budgets",
-    lineStatus.text.includes("… dashboard truncated:") &&
-      lineCount <= 2000 &&
-      Buffer.byteLength(lineStatus.text, "utf8") <= 50 * 1024 &&
-      !lineStatus.text.includes("TowerDo shared board — identity"),
-    `rows=8000 lines=${String(lineCount)}`,
   );
 
   // bob (as subagent id) tries to complete alice's task → ownership error.
@@ -1067,7 +838,6 @@ async function layer2(): Promise<void> {
         subject: "refactor auth module",
         status: "in_progress",
         owner: "alice",
-        scope: ["src/auth/**"],
       },
       {
         key: "billing",

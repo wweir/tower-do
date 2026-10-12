@@ -38,7 +38,6 @@ import {
   formatOtherKeysLine,
   orderTasksByLayer,
   sliceTaskDashboard,
-  sliceScopeConflicts,
   truncateChars,
   type TowerBoardView,
   type TowerDoMessage,
@@ -456,28 +455,6 @@ check(
   foldedNotes.includes("… +40 more row(s) hidden by the 200-row budget"),
   foldedNotes.join(" / "),
 );
-// The scope-conflict cut is a section-internal disclosure (`  … +N more`), so
-// the fold must match past its indent as well — it is a cut notice, not content
-// the budget may drop.
-const foldedIndented = foldDashboardSections(
-  [
-    "head",
-    "## Scope conflicts (73, 5 shown) — advisory",
-    "- ⛔ overlap: a plans to touch what b already changed — src/a.ts",
-    "  … +68 more conflict(s) not shown — view=all lists every one",
-    "  (advisory: scope is self-declared, changedFiles is self-reported — resolve by messaging the owner or re-scoping, not by gate)",
-    "## Recent activity (newest first)",
-    "(no recent activity)",
-  ],
-  4,
-);
-check(
-  "an indented in-section cut notice survives the fold",
-  foldedIndented.includes(
-    "  … +68 more conflict(s) not shown — view=all lists every one",
-  ),
-  foldedIndented.join(" / "),
-);
 // A budget smaller than the head must still bound the output: the contract is
 // "at most `budget` lines", not "at most `budget` lines once a section exists".
 eq(
@@ -583,34 +560,6 @@ check(
   String(foldedDetail.length),
 );
 
-// --- scope coupling --------------------------------------------------------
-
-const scopeView = board([
-  task("mine", "me", 10, { scope: ["src/a.ts"] }),
-  task("peer-same", "bob", 5, { scope: ["src/a.ts"] }),
-  task("peer-other", "carol", 4, { scope: ["src/b.ts"] }),
-]);
-const scopeLayers = classifyTaskLayers(scopeView.tasks, scopeView, "me");
-eq(
-  "an intersecting peer scope lands in needs with reason scope",
-  scopeLayers.needs.map((entry) => `${entry.task.key}:${entry.reason}`).join(","),
-  "peer-same:scope",
-);
-eq(
-  "a disjoint peer scope stays other",
-  keys(scopeLayers.other).join(","),
-  "peer-other",
-);
-const noScopeView = board([
-  task("mine", "me", 10, { scope: ["src/a.ts"] }),
-  task("no-scope", "bob", 5),
-]);
-eq(
-  "scope coupling needs a declared scope on both sides",
-  keys(classifyTaskLayers(noScopeView.tasks, noScopeView, "me").other).join(","),
-  "no-scope",
-);
-
 // --- folded layer helpers --------------------------------------------------
 
 eq(
@@ -638,26 +587,6 @@ eq(
   "the folded-layer summary says unowned when nobody owns the layer",
   formatLayerSummary([task("a", undefined, 1)], board([])),
   "unowned · 1 pending",
-);
-
-// --- scope-conflict folding ------------------------------------------------
-
-const conflicts = [
-  { taskKey: "other-a", kind: "overlap" as const, peerKey: "mine", detail: "x" },
-  { taskKey: "peer-1", kind: "collision" as const, peerKey: "peer-2", detail: "y" },
-  { taskKey: "mine", kind: "collision" as const, peerKey: "peer-3", detail: "z" },
-];
-const foldedConflicts = sliceScopeConflicts(conflicts, new Set(["mine"]), 2);
-eq(
-  "scope-conflict folding keeps the caller's rows first and cuts the rest",
-  foldedConflicts.shown.map((conflict) => conflict.taskKey).join(","),
-  "other-a,mine",
-);
-eq("scope-conflict folding reports the cut", foldedConflicts.hidden, 1);
-eq(
-  "a cap past the row count hides nothing",
-  sliceScopeConflicts(conflicts, new Set(), 10).hidden,
-  0,
 );
 
 // --- 5. reminder -----------------------------------------------------------
@@ -712,21 +641,6 @@ check(
     coupled.includes("+1 other task(s): backlog") &&
     !coupled.includes("- [pending] backlog:"),
   coupled.split("\n").slice(1, 4).join(" / "),
-);
-
-const scopeCoupledReminder = formatBoardReminder(
-  board([
-    task("mine-scope", "me", 2, { scope: ["src/auth/**"] }),
-    task("peer-scope", "bob", 1, { scope: ["src/auth/login.ts"] }),
-  ]),
-  "me",
-);
-check(
-  "reminder labels a scope-coupled peer row with its reason",
-  scopeCoupledReminder.includes("[needs you: scope]"),
-  scopeCoupledReminder
-    .split("\n")
-    .find((line) => line.includes("peer-scope")),
 );
 
 const receiptReminder = formatBoardReminder(

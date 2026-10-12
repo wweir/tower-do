@@ -61,15 +61,12 @@ function task(
   subject: string;
   status: TowerDoStatus;
   owner?: string;
-  changedFiles?: string[];
 } {
   return {
     key,
     subject: `subject ${key}`,
     status,
     ...(owner === undefined ? {} : { owner }),
-    // A receipt on every completed row: the guard exists to protect these.
-    ...(status === "completed" ? { changedFiles: [`${key}.ts`] } : {}),
   };
 }
 
@@ -278,7 +275,7 @@ async function main(): Promise<void> {
       tasks: [
         ...transitionBoard.tasks.map((t) =>
           t.key === "started"
-            ? { key: t.key, status: "completed" as const, changedFiles: ["z.ts"] }
+            ? { key: t.key, status: "completed" as const }
             : { key: t.key },
         ),
         ...Array.from({ length: cap }, (_, i) =>

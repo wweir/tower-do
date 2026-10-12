@@ -680,22 +680,17 @@ function layer5(): void {
   );
 
   // Task lines where the owner fragment is followed by each renderer suffix:
-  // deps ( ←), scope/files/blocked ( [), a reason ( —), or the line end.
+  // deps ( ←), a blocked marker ( [), a reason ( —), or the line end.
   const ownDep = "- ◐ key: subject @alice (me) ← z, w";
-  const ownScope = "- ◐ key: subject @alice (me) [scope: z.ts]";
-  const ownFiles = "- ✓ key: subject @alice (me) [files: z.ts]";
+  const ownBlocked = "- ✗ key: subject @alice (me) [blocked by: z]";
   const ownReason = "- ✗ key: subject @alice (me) — waiting for deps: z";
   check(
     "owner fragment before deps matches",
     isCallerLine(ownDep, "alice") && !isCallerLine(ownDep, "bob"),
   );
   check(
-    "owner fragment before scope matches",
-    isCallerLine(ownScope, "alice") && !isCallerLine(ownScope, "bob"),
-  );
-  check(
-    "owner fragment before changed-files matches",
-    isCallerLine(ownFiles, "alice") && !isCallerLine(ownFiles, "bob"),
+    "owner fragment before blocked matches",
+    isCallerLine(ownBlocked, "alice") && !isCallerLine(ownBlocked, "bob"),
   );
   check(
     "owner fragment before a reason matches",

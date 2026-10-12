@@ -156,9 +156,6 @@ interface TowerDoTaskInput {
   status?: TowerDoStatus;
   owner?: string;
   dependsOn?: string[];
-  scope?: string[];
-  /** Delivery receipt: files the owner actually changed (completed only). */
-  changedFiles?: string[];
   blockedBy?: string[];
 }
 
@@ -169,8 +166,6 @@ interface ResolvedTowerDoTaskInput {
   description?: string;
   owner?: string;
   dependsOn: string[];
-  scope?: string[];
-  changedFiles?: string[];
   blockedBy: string[];
 }
 
@@ -258,10 +253,6 @@ function cloneTask(task: TowerDoTask): TowerDoTask {
     ...task,
     ...(task.owner === undefined ? {} : { owner: task.owner }),
     dependsOn: [...task.dependsOn],
-    ...(task.scope === undefined ? {} : { scope: [...task.scope] }),
-    ...(task.changedFiles === undefined
-      ? {}
-      : { changedFiles: [...task.changedFiles] }),
     blockedBy: [...task.blockedBy],
   };
 }
@@ -522,15 +513,6 @@ export function writeBoardSnapshot(
       // is skipped because the layers below treat "" as "no owner".
       normalizeIdentity(owner, `tasks[${index}].owner (${key})`);
     }
-    // Receipts describe a completed delivery: do not inherit one onto a
-    // reopen, or normalizeTask rejects a field the caller never sent.
-    const changedFiles =
-      patch.changedFiles === undefined
-        ? status === "completed"
-          ? existing?.changedFiles
-          : undefined
-        : patch.changedFiles;
-
     resolved.push(
       normalizeTask(
         {
@@ -549,10 +531,6 @@ export function writeBoardSnapshot(
                 ? [...existing.dependsOn]
                 : []
               : patch.dependsOn,
-          ...(patch.scope !== undefined || existing?.scope !== undefined
-            ? { scope: patch.scope ?? existing!.scope }
-            : {}),
-          ...(changedFiles === undefined ? {} : { changedFiles }),
           blockedBy:
             patch.blockedBy === undefined
               ? existing
@@ -742,10 +720,6 @@ function cloneNormalizedTask(
       : { description: task.description }),
     ...(task.owner === undefined ? {} : { owner: task.owner }),
     dependsOn: [...task.dependsOn],
-    ...(task.scope === undefined ? {} : { scope: [...task.scope] }),
-    ...(task.changedFiles === undefined
-      ? {}
-      : { changedFiles: [...task.changedFiles] }),
     blockedBy: [...task.blockedBy],
   };
 }
@@ -769,8 +743,6 @@ function taskEquals(left: TowerDoTask, right: TowerDoTask): boolean {
     left.description === right.description &&
     left.owner === right.owner &&
     listEquals(left.dependsOn, right.dependsOn) &&
-    listEquals(left.scope, right.scope) &&
-    listEquals(left.changedFiles, right.changedFiles) &&
     listEquals(left.blockedBy, right.blockedBy)
   );
 }
@@ -833,50 +805,6 @@ function normalizeTask(
     );
   }
 
-  const scopeEntries = normalizeListEntries(
-    input.scope,
-    (entryIndex) => `tasks[${index}].scope[${entryIndex}] (${key})`,
-  );
-  for (const { value, at } of scopeEntries) {
-    const globLength = textLength(value);
-    if (globLength > MAX_PATH_ENTRY_CHARS) {
-      throw new TowerDoValidationError(
-        `tasks[${index}].scope[${at}] (${key}) is ${globLength} characters (max ${MAX_PATH_ENTRY_CHARS}) — shorten it`,
-      );
-    }
-  }
-  const scope = scopeEntries.map((entry) => entry.value);
-  if (scope.length > MAX_SCOPE_GLOBS) {
-    throw new TowerDoValidationError(
-      `tasks[${index}].scope (${key}) supports at most ${MAX_SCOPE_GLOBS} globs`,
-    );
-  }
-
-  const changedFilesEntries = normalizeListEntries(
-    input.changedFiles,
-    (entryIndex) =>
-      `tasks[${index}].changedFiles[${entryIndex}] (${key})`,
-  );
-  for (const { value, at } of changedFilesEntries) {
-    const fileLength = textLength(value);
-    if (fileLength > MAX_PATH_ENTRY_CHARS) {
-      throw new TowerDoValidationError(
-        `tasks[${index}].changedFiles[${at}] (${key}) is ${fileLength} characters (max ${MAX_PATH_ENTRY_CHARS}) — shorten it`,
-      );
-    }
-  }
-  const changedFiles = changedFilesEntries.map((entry) => entry.value);
-  if (changedFiles.length > MAX_CHANGED_FILES) {
-    throw new TowerDoValidationError(
-      `tasks[${index}].changedFiles (${key}) supports at most ${MAX_CHANGED_FILES} paths`,
-    );
-  }
-  if (changedFiles.length > 0 && input.status !== "completed") {
-    throw new TowerDoValidationError(
-      `tasks[${index}].changedFiles (${key}) is a delivery receipt — it requires status "completed" (got "${input.status}")`,
-    );
-  }
-
   const blockedByEntries = normalizeListEntries(
     input.blockedBy,
     (entryIndex) => `tasks[${index}].blockedBy[${entryIndex}] (${key})`,
@@ -910,8 +838,6 @@ function normalizeTask(
     ...(description ? { description } : {}),
     ...(owner === undefined ? {} : { owner }),
     dependsOn,
-    ...(scope.length ? { scope } : {}),
-    ...(changedFiles.length ? { changedFiles } : {}),
     blockedBy,
   };
 }
@@ -1009,238 +935,6 @@ export function findAllUnresolvedDeps(
   return task.dependsOn.filter((key) => statusByKey.get(key) !== "completed");
 }
 
-// ---------------------------------------------------------------------------
-// Scope × changedFiles overlap detection (derived, read-only).
-//
-// Turn the (previously decorative) `scope` declaration into a *useful*
-// boundary signal. Because changedFiles is a delivery receipt (completed
-// only; a worker may set it once, owner/tower may amend) and scope is the
-// owner's declared file boundary, we can derive two advisory warnings without
-// any git access:
-//   1. boundary overlap — a task still in progress/pending has a scope glob
-//      that a COMPLETED task's receipt already touched → "files you plan to
-//      change were just changed by X";
-//   2. scope-vs-scope collision — two in_progress tasks declared overlapping
-//      globs → a planning mistake worth surfacing before both start writing.
-// Both are pure read derivations (like taskIsBlocked): nobody writes them to
-// the board; tower_do_status renders them as row suffixes. Advisory only —
-// never a gate, because scope is a self-declared glob and changedFiles is a
-// self-reported receipt (authoritative conflict resolution needs git diff
-// reads, which is out of TowerDo's scope).
-// ---------------------------------------------------------------------------
-
-export interface ScopeConflict {
-  /** Task key that has the overlapping declaration (in progress / pending). */
-  taskKey: string;
-  kind: "overlap" | "collision";
-  /** The completed task whose receipt collides (overlap), or the peer task. */
-  peerKey: string;
-  /** Human-readable summary of what collides. */
-  detail: string;
-}
-
-/**
- * Minimal file-glob matcher (path segments joined by "/"). Supports:
- *   `*`   — any run of chars within one segment (no "/")
- *   `**`  — any number of segments (may span "/")
- *   `?`   — exactly one char (no "/")
- * No character classes / braces / negation — keep it dependency-free and
- * predictable for the board's advisory use. A glob with no wildcard is
- * treated as an exact path match.
- */
-export function globMatchesPath(glob: string, path: string): boolean {
-  const g = glob.replaceAll("\\", "/");
-  const p = path.replaceAll("\\", "/");
-  // Fast path: no wildcards → exact match (both normalized, no trailing
-  // slash semantics — a directory glob like "src/" is not special here).
-  if (!g.includes("*") && !g.includes("?")) return g === p;
-
-  const gSeg = g.split("/");
-  const pSeg = p.split("/");
-
-  // Memoized on (gi, pi): a `**`-heavy glob (e.g. "**/**/…/x") otherwise
-  // branches exponentially, and peer-written scope globs are matched against
-  // every changed-file path on each status/widget/reminder render. Each
-  // (gi, pi) pair is solved at most once, so the walk is polynomial.
-  const memo = new Map<number, boolean>();
-  const cols = pSeg.length + 1;
-  const matchFrom = (gi: number, pi: number): boolean => {
-    const memoKey = gi * cols + pi;
-    const cached = memo.get(memoKey);
-    if (cached !== undefined) return cached;
-    let result = false;
-    let g = gi;
-    let p = pi;
-    for (;;) {
-      if (g === gSeg.length) {
-        result = p === pSeg.length;
-        break;
-      }
-      const seg = gSeg[g];
-      if (seg === "**") {
-        // `**` eats zero or more path segments: try every split point.
-        for (let skip = p; skip <= pSeg.length; skip += 1) {
-          if (matchFrom(g + 1, skip)) {
-            result = true;
-            break;
-          }
-        }
-        break;
-      }
-      if (p >= pSeg.length) {
-        result = false;
-        break;
-      }
-      if (!segmentMatches(seg, pSeg[p])) {
-        result = false;
-        break;
-      }
-      g += 1;
-      p += 1;
-    }
-    memo.set(memoKey, result);
-    return result;
-  };
-  return matchFrom(0, 0);
-}
-
-/**
- * One glob segment against one path segment: `*` matches any run (including
- * none), `?` exactly one character. This is the classic greedy two-pointer
- * wildcard matcher instead of a repeated `[^/]*` RegExp: a glob such as
- * `"*a*a*…a"` written to a peer-controlled board makes the RegExp engine
- * backtrack exponentially (a ReDoS that would freeze every render), while the
- * loop is O(glob × value) and allocation-free.
- */
-function segmentMatches(glob: string, value: string): boolean {
-  let g = 0;
-  let v = 0;
-  let starG = -1;
-  let starV = 0;
-  while (v < value.length) {
-    const ch = glob[g];
-    // The star branch MUST come first: when `value[v]` is itself a literal
-    // `*`, testing equality first would consume the glob's `*` as a literal
-    // and lose the backtrack point (`globMatchesPath("*", "*.ts")` would be
-    // false instead of true).
-    if (g < glob.length && ch === "*") {
-      // Remember the star and retry its tail from the next value character.
-      starG = g;
-      starV = v;
-      g += 1;
-    } else if (g < glob.length && (ch === "?" || ch === value[v])) {
-      g += 1;
-      v += 1;
-    } else if (starG !== -1) {
-      g = starG + 1;
-      starV += 1;
-      v = starV;
-    } else {
-      return false;
-    }
-  }
-  while (g < glob.length && glob[g] === "*") g += 1;
-  return g === glob.length;
-}
-
-function scopeGlobIntersects(a: string, b: string): boolean {
-  // Two globs intersect if any path in one matches the other. For our
-  // advisory signal an exact conservative test is enough: either glob
-  // literally contains the other's head, or they share a concrete prefix
-  // segment. True glob-intersection is undecidable in general; we only need
-  // to flag the OBVIOUS collisions a planner would make.
-  if (globMatchesPath(a, b)) return true;
-  if (globMatchesPath(b, a)) return true;
-  const aDir = a.endsWith("/**") ? a.slice(0, -3) : a;
-  const bDir = b.endsWith("/**") ? b.slice(0, -3) : b;
-  return (
-    aDir === bDir || aDir.startsWith(`${bDir}/`) || bDir.startsWith(`${aDir}/`)
-  );
-}
-
-/**
- * Derive advisory scope conflicts for a board view. Returns one entry per
- * in-progress/pending task that collides with a completed task's receipt
- * (kind "overlap") or with another in-progress task's scope (kind
- * "collision"). Read-only; never throws; renders nothing itself.
- */
-export function findScopeConflicts(board: TowerBoardView): ScopeConflict[] {
-  const conflicts: ScopeConflict[] = [];
-  const completed = board.tasks.filter((t) => t.status === "completed");
-  const active = board.tasks.filter(
-    (t) => t.status === "in_progress" || t.status === "pending",
-  );
-  for (const task of active) {
-    if (task.scope === undefined || task.scope.length === 0) continue;
-    // 1. overlap: a completed task's receipt file sits inside my scope glob.
-    for (const done of completed) {
-      if (done.key === task.key) continue;
-      const files = done.changedFiles ?? [];
-      if (files.length === 0) continue;
-      const hit = files.find((file) =>
-        task.scope!.some((glob) => globMatchesPath(glob, file)),
-      );
-      if (hit !== undefined) {
-        conflicts.push({
-          taskKey: task.key,
-          kind: "overlap",
-          peerKey: done.key,
-          detail: `${hit} (touched by ${done.key} ${done.owner ? `@${done.owner}` : ""})`,
-        });
-      }
-    }
-  }
-  // 2. collision: two in-progress tasks declared intersecting scope globs.
-  const inProgress = board.tasks.filter((t) => t.status === "in_progress");
-  for (let i = 0; i < inProgress.length; i += 1) {
-    for (let j = i + 1; j < inProgress.length; j += 1) {
-      const a = inProgress[i];
-      const b = inProgress[j];
-      if (a.key === b.key) continue;
-      const aScope = a.scope ?? [];
-      const bScope = b.scope ?? [];
-      if (aScope.length === 0 || bScope.length === 0) continue;
-      const collides = aScope.some((ga) =>
-        bScope.some((gb) => scopeGlobIntersects(ga, gb)),
-      );
-      if (collides) {
-        conflicts.push({
-          taskKey: a.key,
-          kind: "collision",
-          peerKey: b.key,
-          detail: `scope ${aScope.join(", ")} × ${bScope.join(", ")}`,
-        });
-      }
-    }
-  }
-  return conflicts;
-}
-
-/** How many `## Scope conflicts` rows the default dashboard renders. The
- *  section grows with the completed history — every receipt that touched a file
- *  the caller's scope names is a row — so the default view keeps the rows that
- *  involve the caller and reports the rest as a count; `view=all` expands. */
-export const DASHBOARD_SCOPE_CONFLICT_LINES = 5;
-
-/** Order conflicts for the caller and cut them to `cap`: conflicts involving a
- *  key in `relevantKeys` (the caller's own or coupled tasks) come first, the
- *  rest follow; `hidden` is how many rows the cut dropped. Pure. */
-export function sliceScopeConflicts(
-  conflicts: readonly ScopeConflict[],
-  relevantKeys: ReadonlySet<string>,
-  cap: number,
-): { shown: ScopeConflict[]; hidden: number } {
-  const relevant: ScopeConflict[] = [];
-  const rest: ScopeConflict[] = [];
-  for (const conflict of conflicts) {
-    const involvesCaller =
-      relevantKeys.has(conflict.taskKey) || relevantKeys.has(conflict.peerKey);
-    (involvesCaller ? relevant : rest).push(conflict);
-  }
-  const ordered = [...relevant, ...rest];
-  const shown = cap >= ordered.length ? ordered : ordered.slice(0, cap);
-  return { shown, hidden: ordered.length - shown.length };
-}
 
 // ---------------------------------------------------------------------------
 // Persisted-state reading (board file entries) + session checkpoint replay.
@@ -2241,7 +1935,7 @@ export function formatPresenceLine(line: PresenceLine, now: number): string {
 }
 
 /** Why a peer-owned unfinished task is in the caller's attention set. */
-export type NeedsReason = "await" | "blocking" | "scope" | "unread";
+export type NeedsReason = "await" | "blocking" | "unread";
 
 /** One `needs` row: a peer task plus why the caller must still look at it. */
 export interface NeedsTask {
@@ -2311,23 +2005,6 @@ export function classifyTaskLayers(
   for (const message of unreadMessagesToMe(view, identity)) {
     if (message.taskKey !== undefined) unreadKeys.add(message.taskKey);
   }
-  // Declared scopes of the caller's own unfinished work. A peer planning to
-  // touch the same files is the other half of "it affects me": not a gate, but
-  // the caller must see it before editing. Only the unfinished x unfinished
-  // pair lands here — an `overlap` against a completed receipt is what the
-  // standalone `## Scope conflicts` section renders.
-  const mineScopes = mine
-    .map((task) => task.scope ?? [])
-    .filter((scope) => scope.length > 0);
-  const scopeCollides = (task: TowerDoTask): boolean => {
-    const scope = task.scope ?? [];
-    if (scope.length === 0 || mineScopes.length === 0) return false;
-    return mineScopes.some((mineScope) =>
-      scope.some((glob) =>
-        mineScope.some((mineGlob) => scopeGlobIntersects(mineGlob, glob)),
-      ),
-    );
-  };
   const needs: NeedsTask[] = [];
   const other: TowerDoTask[] = [];
   for (const task of tasks) {
@@ -2339,8 +2016,6 @@ export function classifyTaskLayers(
     } else if (task.dependsOn.some((key) => mineKeys.has(key))) {
       // `mineKeys` only holds unfinished work, so this is "it awaits me".
       needs.push({ task, reason: "blocking" });
-    } else if (scopeCollides(task)) {
-      needs.push({ task, reason: "scope" });
     } else {
       other.push(task);
     }

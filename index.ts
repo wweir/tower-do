@@ -92,7 +92,6 @@ import {
   cloneBoard,
   createEmptyBoard,
   DASHBOARD_ROW_BUDGET,
-  DASHBOARD_SCOPE_CONFLICT_LINES,
   DEFAULT_IDENTITY,
   derivePresence,
   deliveredMailIds,
@@ -102,7 +101,6 @@ import {
   formatBoardReminder,
   foldDashboardSections,
   formatDashboardHiddenNote,
-  findScopeConflicts,
   formatKeyListLine,
   formatLayerSummary,
   formatLedgerKeyRows,
@@ -141,7 +139,6 @@ import {
   relativeTime,
   retainMessages,
   selectWakeMessages,
-  sliceScopeConflicts,
   sliceTaskDashboard,
   staleTaskClaims,
   taskIsBlocked,
@@ -693,19 +690,7 @@ function statusColor(
 function taskLine(task: TowerDoTask): string {
   const owner = task.owner !== undefined ? ` @${task.owner}` : "";
   const deps = task.dependsOn.length ? ` ← ${task.dependsOn.join(",")}` : "";
-  const scope = task.scope?.length ? ` [scope: ${task.scope.join(", ")}]` : "";
-  return `${task.key}: ${task.subject}${owner}${deps}${scope}`;
-}
-
-/** Receipt rendering: ` [files: a.ts, b.ts]` — only ever present on completed tasks. */
-function changedFilesSuffix(task: TowerDoTask): string {
-  const files = task.changedFiles;
-  if (files === undefined || files.length === 0) return "";
-  const joined =
-    files.length <= 4
-      ? files.join(", ")
-      : `${files.slice(0, 4).join(", ")}, …+${files.length - 4}`;
-  return ` [files: ${joined}]`;
+  return `${task.key}: ${task.subject}${owner}${deps}`;
 }
 
 /** Flatten a tool result's text content into one string — the shared tail of
@@ -2423,7 +2408,6 @@ export default function towerDoExtension(pi: ExtensionAPI): void {
       // Derived scope × changedFiles advisory. Pure read, rendered as a
       // dedicated section (not per-row suffix) so long scope lists don't
       // explode every task line.
-      const scopeConflicts = findScopeConflicts(view);
 
       if (params.status !== undefined && !isTowerDoStatus(params.status)) {
         throw new TowerDoValidationError(
@@ -2506,12 +2490,6 @@ export default function towerDoExtension(pi: ExtensionAPI): void {
           detail.push(`- blockedBy: ${task.blockedBy.join(", ")}`);
         }
         if (taskIsBlocked(task, view)) detail.push("- blocked: yes");
-        if (task.scope !== undefined && task.scope.length > 0) {
-          detail.push(`- scope: ${task.scope.join(", ")}`);
-        }
-        if (task.changedFiles !== undefined && task.changedFiles.length > 0) {
-          detail.push(`- changedFiles: ${task.changedFiles.join(", ")}`);
-        }
         if (task.description === undefined) {
           detail.push("- description: (none)");
         } else {
@@ -2696,9 +2674,6 @@ export default function towerDoExtension(pi: ExtensionAPI): void {
         const deps = task.dependsOn.length
           ? ` ← ${task.dependsOn.join(",")}`
           : "";
-        const scope = task.scope?.length
-          ? ` [scope: ${task.scope.join(", ")}]`
-          : "";
         // Derived status, like the summary counts: a gated pending row must
         // not render as `○` while the header counts it blocked.
         const shownStatus = displayStatus(task);
@@ -2725,7 +2700,7 @@ export default function towerDoExtension(pi: ExtensionAPI): void {
         // why, or it reads as unrelated backlog the caller may skip.
         const needsSuffix =
           reason === undefined ? "" : ` [needs you: ${reason}]`;
-        return `- ${STATUS_GLYPH[shownStatus]} ${task.key}: ${task.subject}${owner}${deps}${scope}${changedFilesSuffix(task)}${blockedSuffix}${needsSuffix}`;
+        return `- ${STATUS_GLYPH[shownStatus]} ${task.key}: ${task.subject}${owner}${deps}${blockedSuffix}${needsSuffix}`;
       };
       const renderSection = (
         label: string,
@@ -2777,43 +2752,6 @@ export default function towerDoExtension(pi: ExtensionAPI): void {
       if (shown.length === 0) lines.push("(no tasks match the filter)");
       const hiddenNote = formatDashboardHiddenNote(hidden, limit);
       if (hiddenNote !== undefined) lines.push(hiddenNote);
-
-      if (scopeConflicts.length > 0) {
-        const conflictKeys = new Set<string>([
-          ...layers.mine.map((task) => task.key),
-          ...layers.needs.map((entry) => entry.task.key),
-        ]);
-        const { shown: shownConflicts, hidden: hiddenConflicts } =
-          sliceScopeConflicts(
-            scopeConflicts,
-            conflictKeys,
-            layerView === "all"
-              ? scopeConflicts.length
-              : DASHBOARD_SCOPE_CONFLICT_LINES,
-          );
-        lines.push(
-          `## Scope conflicts (${String(scopeConflicts.length)}${
-            hiddenConflicts > 0 ? `, ${String(shownConflicts.length)} shown` : ""
-          }) — advisory`,
-        );
-        for (const conflict of shownConflicts) {
-          const glyph = conflict.kind === "collision" ? "⚠" : "⛔";
-          const label =
-            conflict.kind === "collision"
-              ? `collision: ${conflict.taskKey} × ${conflict.peerKey}`
-              : `overlap: ${conflict.taskKey} plans to touch what ${conflict.peerKey} already changed`;
-          lines.push(`- ${glyph} ${label} — ${conflict.detail}`);
-        }
-        if (hiddenConflicts > 0) {
-          lines.push(
-            `  … +${String(hiddenConflicts)} more conflict(s) not shown — view=all lists every one`,
-          );
-        }
-        lines.push(
-          "  (advisory: scope is self-declared, changedFiles is self-reported — resolve by messaging the owner or re-scoping, not by gate)",
-        );
-        lines.push("");
-      }
 
       lines.push(
         `## Messages for ${caller} (${myMessages.length}${
