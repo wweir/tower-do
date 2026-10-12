@@ -1,30 +1,27 @@
 # Operations — tower-do
 
-> Deployment, configuration, running, and troubleshooting. Product scope in
-> PRODUCT.md; contracts/tests in CONTRACTS.md.
+> Deployment, configuration, running and troubleshooting. Product scope in
+> [PRODUCT.md](./PRODUCT.md); contracts/tests in
+> [CONTRACTS.md](./CONTRACTS.md).
 
 ## Install
 
-Three equivalent routes — see the README for the commands: npm
+Three equivalent routes — see the [README](../README.md) for the commands: npm
 (`pi install npm:tower-do`), git, or a manual copy to
 `~/.pi/agent/extensions/`. Pi auto-discovers the extension at startup;
 `/reload` picks it up in an existing session.
 
 Runtime deps (`typebox`, `@earendil-works/pi-ai`, `@earendil-works/pi-tui`) are
-peer dependencies provided by the Pi host — no manual install.
-`@earendil-works/pi-coding-agent` is the host package itself, so it is a dev
-dependency (types/constants) yet always present at runtime. Dev-only
-`bun install` (bun-types + typescript) is for typecheck/tests.
+peer dependencies provided by the Pi host. `@earendil-works/pi-coding-agent` is
+the host package itself, so it is a dev dependency (types/constants) yet always
+present at runtime. Dev-only `bun install` (bun-types + typescript) is for
+typecheck/tests.
 
 ## Configuration
 
 `~/.pi/agent/tower-do/config.json` is the only configuration surface — no
 environment variables. The file is optional (absent = defaults), global across
-every project, and lives outside any repo — it is never committed. A leftover
-per-project state dir at the retired `<project>/.pi/tower-do/` location is
-auto-migrated into the global records home on first use (a pinned identity
-rides along to the global config path). If the global state dir already
-exists, a leftover project dir is ignored — it does not brick the session.
+every project, and lives outside any repo (never committed).
 
 ```json
 { "identity": "team-orchestrator" }
@@ -34,26 +31,24 @@ exists, a leftover project dir is ignored — it does not brick the session.
 | --- | --- | --- |
 | `identity` | session name/id | pin this session's board identity (global, applies to every project); must not be the reserved orchestrator identity `tower` |
 
-That is the whole surface. Reminder cadence, widget rows, activity tail, and
-message retention are internal tuning constants, not configuration. Unknown
-keys are ignored (forward compatibility). A malformed file or invalid
-`identity` fails loudly at session start — it is never silently defaulted,
-because a silently-reset identity would corrupt owner matching and message
-addressing in multi-agent sessions.
+Unknown keys are ignored (forward compatibility). A malformed file or an
+invalid `identity` fails loudly at session start — it is never silently
+defaulted, because a silently-reset identity would corrupt owner matching and
+message addressing in multi-agent sessions.
 
 ## Release (npm publish on tag)
 
-Tagging `vX.Y.Z` on `main` triggers `.github/workflows/release.yml`, which
-runs the compile + test gate, `npm publish`, and then creates a GitHub
-Release for the tag — all automatically. This is the **only** release path —
-no manual `npm publish` or `gh release create`.
+Tagging `vX.Y.Z` on `main` triggers `.github/workflows/release.yml`, which runs
+the compile + test gate, `npm publish`, and then creates a GitHub Release for
+the tag. This is the **only** release path — no manual `npm publish` or
+`gh release create`.
 
 The tag must sit **on the release commit** — the one that changes
 `package.json`'s version and nothing else. `git tag` defaults to `HEAD`, so
 tagging after any further commit silently points the tag at a tree whose
 `package.json` still carries the OLD version, and the job fails at the version
-gate with the work already pushed. Land the release commit last, tag that
-commit explicitly, and never `git push --tags` from a dirty/ahead HEAD.
+gate. Land the release commit last, tag that commit explicitly, and never
+`git push --tags` from a dirty/ahead HEAD.
 
 ```bash
 # 1. version bump ONLY — one commit, one file:
@@ -71,196 +66,78 @@ git log -1 --format=%s vX.Y.Z                 # chore(release): vX.Y.Z
 git show vX.Y.Z:package.json | grep version   # "version": "X.Y.Z"
 ```
 
-If a tag is already pushed by mistake, delete it before recreating it —
-**but only while npm has no such version** (`curl -s -o /dev/null -w '%{http_code}'
+If a tag is already pushed by mistake, delete it before recreating it — **but
+only while npm has no such version** (`curl -s -o /dev/null -w '%{http_code}'
 https://registry.npmjs.org/tower-do/X.Y.Z` → `404`). A tag whose release
-succeeded must never be force-moved: cut the next version instead. A stale,
-never-published duplicate also has to be removed, or it becomes the previous
-tag the release notes walk back to and the real work is left out of the notes.
+succeeded must never be force-moved: cut the next version instead.
 
 - The repo ships TypeScript sources directly (`main: ./index.ts`, no build
-  step), so the "compile" gate is `bunx tsc --noEmit -p tsconfig.json`.
-- Tag must equal `package.json` version (`v` stripped); a mismatched tag
-  fails the job before publish.
+  step), so the "compile" gate is `bunx tsc --noEmit -p tsconfig.json` and the
+  test gate runs each suite as `bun test/<file>.ts` (**not** `bun run <file>`,
+  which since bun 1.4.0 prints help and exits 0 without running anything).
+- The tag must equal the `package.json` version (`v` stripped), or the job
+  fails before publish.
 - Publish uses **npm trusted publishing (OIDC)** — no repository secret. The
   workflow's `id-token: write` permission lets the npm CLI exchange a
-  short-lived publish token, and provenance is generated automatically.
-  Requires a GitHub-hosted runner (OIDC/trusted publishing is unavailable on
-  self-hosted runners) and npm >= 11.5.1 — the job upgrades npm and fails
-  loud below that version.
-- One-time npmjs.com setup: package `tower-do` → Settings → Trusted Publisher
-  → GitHub Actions, with Organization or user `wweir`, Repository `tower-do`,
-  Workflow filename `release.yml`, and **Allow `npm publish`** enabled
-  (connections created after 2026-09-03 default to stage-only).
-  `package.json` `repository.url` must keep matching the GitHub repo, or npm
-  refuses the exchange. The old `NPM_TOKEN` secret is no longer used.
-- **Until that npm-side connection exists, a tag push fails at `Publish to
-  npm` with `ENEEDAUTH`.** Other causes of the same error: the workflow
-  filename / repository / owner not matching npmjs.com exactly (those fields
-  are case-sensitive and the filename must include `.yml`), a self-hosted
-  runner, or `package.json` `repository.url` not matching the GitHub
-  repository. npm does not validate a connection when it is saved, so a typo
-  only surfaces on the next publish.
-- The GitHub Release notes are generated from conventional commits since the
-  previous `v*` tag; the job needs `contents: write` for `gh release create`.
+  short-lived publish token, and provenance is generated automatically. It
+  requires a GitHub-hosted runner and npm >= 11.5.1 (the job upgrades npm and
+  fails loud below that).
+- One-time npmjs.com setup: package `tower-do` → Settings → Trusted Publisher →
+  GitHub Actions, with owner `wweir`, repository `tower-do`, workflow filename
+  `release.yml`, and **Allow `npm publish`** enabled. `package.json`
+  `repository.url` must keep matching the GitHub repo.
+- A missing/mismatched npm-side connection fails at `Publish to npm` with
+  `ENEEDAUTH`; the workflow/repo/owner fields are case-sensitive and the
+  filename must include `.yml`.
+- GitHub Release notes are generated from conventional commits since the
+  previous `v*` tag.
 
 ## Runtime layout
 
-- Board: `~/.pi/tower-do/<project>/board.jsonl` (append-only event log — the
-  single source of truth). `<project>` is the slug-hash of the project's git
-  root; state never lives inside a repo, so nothing to gitignore.
-- Checkpoints: on session compact / agent start, the view is embedded as a
-  custom context entry (fallback display when the board file is missing).
+- Board: `~/.pi/tower-do/<project>/board.jsonl` — an append-only event log and
+  the single source of truth. `<project>` is the slug-hash of the project's git
+  root; state never lives inside a repo, so there is nothing to gitignore.
 - Widget: above-editor status line (TUI only).
+- There is no `live/` sidecar, no `archive/`, and no lock file.
 
-## Board capacity and compaction
+## Board behaviour
 
-`tower_do` is a full replacement, so every write names the rows to keep. The
-budget therefore has to leave room for a replay:
-
-- Only **non-completed** rows count against `MAX_TOWER_DO_OPEN_TASKS` (50).
-  `completed` rows are receipts, replay free, and can never block a new plan.
-- Batch length is never a budget: replaying the whole board (completed rows
-  included) is always legal. One write may introduce at most `MAX_TOWER_DO_OPEN_TASKS`
-  (50) NEW completed rows — replaying an existing receipt is free.
-- `tower_do_status` prints `open N/50` on the `Tasks:` line and adds a warning
-  line at the cap.
-- The dashboard renders at most `DASHBOARD_ROW_BUDGET` (200) rows. Open work
-  always wins that default budget, and anything hidden is reported
-  (`… +N more row(s) hidden by the budget`) — widen with `limit`, or narrow with
-  `owner=`/`status=`. A task that "disappeared" from a long board is a
-  filter/limit question, not data loss: the fold is the board.
-- Unrelated unfinished work is folded, not dropped: the default `view` shows
-  your own rows plus the peer work you are coupled to, and folds the rest into
-  one stats line + a `key status @owner` ledger. `view=all` expands it, and
-  every key stays in the output either way — a `tower_do` write must be able to
-  name the rows it is not deleting.
-- A very large dashboard is also cut at the host caps (50KB and 2000 lines,
-  tail kept), and the cut takes the HEAD (header, revision, board file path,
-  open rows). The footer says so and repeats the revision + board file path
-  (its own bytes and line are reserved, so it survives the cut); page that file
-  when you need every row for a full-replacement write. With completed rows
-  folded into a multi-key ledger the byte cap is what normally binds; the
-  2000-line bound stays enforced.
-
-When the open budget is full (`open 50/50`):
-
-1. **Free a slot** — omit your own rows (your completed ones too — a receipt you
-   own is yours to drop) or an unowned task. Never another owner's row, unless
-   that owner is stale and the row is not completed.
-2. **Compact a finished board** — when rows are all completed and owned by
-departed sessions, replay only the rows worth keeping under an explicit
-orchestrator identity: `tower_do` with `as: "tower"`. `tower` owns every task,
-so it may drop them; the dropped receipts survive in the JSONL history until a
-compact (see below), only the folded view shrinks. This is the
-documented, cooperative-trust escape hatch — it is unauthenticated, so treat a
-board compaction like any other shared-state maintenance and record it in a
-message (`tower_do_talk`) when peers are live.
-
-Completed rows are never garbage-collected automatically: the owner guard
-exists to keep delivery receipts trustworthy, and the folded view already has
-display budgets (status slices at `limit`, widget shows remaining work only).
-Because a write must name the rows it keeps, the practical ceiling on history
-is what a reader can see; when the log itself matters, it is compacted
-automatically once it crosses the size threshold (see below), or explicitly
-with `gc` — never silent row deletion. See DECISIONS.md.
-
-### Log compaction (`tower_do action: "gc"`)
-
-The board log is append-only, so `retainMessages` / `retainFindings` (view
-projections) never shrink it. Disk is bounded by one mechanism with two entry
-points — the explicit compact, and an automatic threshold-triggered one:
-
-```
-tower_do  { "action": "gc", "tasks": [], "as": "tower" }
-```
-
-The extension also compacts a board whose log crosses
-`BOARD_COMPACT_HINT_BYTES` (1 MiB) at a session/settle boundary
-(`session_start`, `session_tree`, `agent_settled`), under the same lease, CAS
-and archive. The byte threshold is the automatic trigger (a cheap `stat`);
-`BOARD_COMPACT_HINT_LINES` (10k) is disclosed by `tower_do_status` only. It is
-never periodic (no timer) and never drops unfoldable lines — a board with any
-stays uncompacted and keeps disclosing `skipped > 0`. The explicit `gc` is how
-to compact now, and the only path that drops them (into the archive, reporting
-the count).
-
-- The explicit `gc` requires the `tower` identity and empty `tasks`. Never
-  periodic.
-- `append` and `compact` share a per-board `<board>.lock` lease (a directory
-  holding the holder's token file), so a peer
-  append cannot land inside the compaction window (a stale lease from a dead
-  holder is stolen after 30s; release unlinks only the holder's own token file
-  and `rmdir` refuses a non-empty directory, so a stolen holder's cleanup
-  cannot delete the new lease). `compact` fails
-  closed if the lock cannot be created; an `append` degrades to unlocked when
-  the lock path is unwritable (its own write is still atomic).
-- Rewrites `board.jsonl` as one `{kind:"compact"}` header + one last-wins
-  snapshot event per surviving entity (completed tasks and closed findings
-  INCLUDED — it folds superseded upserts/acks, it does not delete rows). The
-  snapshot preserves each owner's real last activity on a task, so a gc does
-  not flip the takeover clock.
-- The previous log is archived to `archive/board-rev<N>-<utc>-<rand>.jsonl` — written
-  after the first content check but before the hard link and the final CAS,
-  deliberately outside the `[final CAS, rename]` window, so an aborted compact
-  never leaves an archive behind. After a successful swap the archive
-  set is pruned to the newest `MAX_BOARD_ARCHIVES` (3) logs, so the cleanup
-  does not itself accumulate whole-log copies.
-- Content CAS: the live sha is re-checked immediately before the rename (read through a hard link taken just before the swap, so the checked bytes are exactly the ones the rename replaces), and the pre-rename guard also verifies the path still names that preserved inode — a peer that replaced the board (compaction) in the window makes the compact abort instead of silently swapping the peer's board away. A mismatch aborts with the live file untouched, and every crash point leaves the old file intact. The lease is
-  re-proven right after the rename: a holder paused past the staleness limit
-  inside that window fails loud, and when the shape is provable the compact
-  reconciles the window under a fresh lease (`content + P + W`, CAS re-checked
-  at the swap) so the peer's writes reappear in the live fold; when it is not
-  provable the pre-compact log is kept as a `board.jsonl.prev-*` evidence file
-  named in the error. Nothing is ever rolled back blindly.
-- `revision` is preserved (the header carries it), so `baseRevision` stays
-  valid. Unfoldable legacy lines: the raw API refuses unless `dropSkipped` is
-  passed, but the `gc` action passes it by default (it always archives the
-  verbatim pre-compact log, and the tool result reports how many lines moved).
-  An automatic run never does — such a board stays uncompacted and keeps
-  disclosing `skipped > 0`.
-- `tower_do_status` prints `State: <slug> · log N line(s) / XKB [· compact
-  rev M]` and discloses the size (plus the explicit `gc` command) at
-  `BOARD_COMPACT_HINT_LINES` (10k) / `BOARD_COMPACT_HINT_BYTES` (1 MiB) or when
-  `skipped > 0`.
-- Known limit: the snapshot keeps each entity's ORIGINATING activity — the
-  task owner's real clock, and for findings the last event's actor — so a gc
-  does not flip the takeover clock or credit a peer's finding status change to
-  the original filer. Message ACKS by other identities are not replayed (only
-  the sender's time is kept), so the presence/idle hint can show an acker as
-  quieter than the pre-gc log implied. The takeover clock (the load-bearing
-  one) is preserved.
+- **Writes are upserts.** A write lists only the rows it creates or changes; a
+  key it does not mention is left alone, so a partial write can never drop a
+  peer's row. Deleting is explicit (`remove: ["key"]`).
+- **Capacity** is charged to open work: at most 50 non-completed rows after a
+  write. Completed rows never consume the budget, and one write may introduce
+  at most 50 NEW completed rows.
+- **The log grows by the events actually written** and is never compacted
+  automatically. `tower_do_status` prints `State: … log N line(s) / XKB` and
+  discloses `skipped > 0` (lines it could not fold). A long log is expected;
+  folding it is cheap.
+- **The dashboard** renders every open task (recency-first) and completed rows
+  as a key ledger. `limit` caps the rows; `owner=`/`status=` narrow the filter;
+  `taskKey` returns one task's full detail. A large dashboard is cut at the host
+  caps (50KB / 2000 lines, tail kept); the footer repeats the revision and
+  board file path.
 
 ## Troubleshooting
 
 - **"stale tower-do revision"** — a peer wrote since your read. Call
   `tower_do_status`, merge your changes onto the fresh view, retry with the new
   `baseRevision`.
-- **"owned by ..."** — you touched another owner's task. Only its owner or
-  `tower` may, unless that owner's activity ON THAT TASK is older than the
-  takeover window (`TASK_CLAIM_STALE_MS`, 6 h) with no fresh `live/` heartbeat
-  (including `as` aliases): then adopt by setting `owner` to yourself, or remove
-  the non-completed task. Unrelated board activity does not protect the row.
-  Completed tasks stay guarded. Otherwise message the owner via `tower_do_talk`,
-  or have `tower` do it.
-- **"open tasks support at most 50 items"** — the board's open budget is full.
-  Omit your own or an unowned task, or compact a finished board with
-  `as: "tower"` (see *Board capacity and compaction*). Completed rows do not
-  consume the budget, so a board of finished work is never the cause.
-- **Board file missing / empty view after cleanup** — `tower_do_status` warns
-  and shows an empty fold; if the transcript holds a bounded checkpoint digest
-  it is shown instead (open tasks + finding titles only, marked incomplete).
-  Disk stays authoritative: a write treats the missing file as an empty board
-  (revision 0), so no stale `baseRevision` survives the loss.
-- **Conflicting scope advisories** — advisory only: message the peer owner or
-  re-scope. They never block writes.
-- **Peer edits invisible** — every read path re-folds from disk. Widget and
-  context reminders also re-fold on `agent_settled` / each LLM `context` event,
-  so a peer's cancel shows up without waiting for a tool call. Stale compact
-  snapshots are stripped on every `context` event; a replacement reminder is
-  injected every 3 LLM calls (`REMINDER_INTERVAL`), not on every call just
-  because a leftover snapshot was present. A forced checkpoint
-  (`session_compact` retry / `before_agent_start`) arms the next event so its
-  own snapshot is immediately replaced instead of being stripped and lost.
-  Cross-process writers are last-writer-wins past the revision gate
-  (single-tower assumption).
+- **"owned by …"** — you touched another owner's task. Only its owner or
+  `tower` may, unless that owner's activity **on that task** is older than the
+  takeover window (`TASK_CLAIM_STALE_MS`, 6 h): then adopt by setting `owner` to
+  yourself (and changing nothing else), or remove the non-completed task.
+  Unrelated board activity does not protect the row. Completed tasks stay
+  guarded. Otherwise message the owner via `tower_do_talk`, or have `tower` do
+  it.
+- **"open tasks support at most 50 items"** — the open budget is full. Complete
+  or `remove` an existing open task first. Completed rows do not consume the
+  budget, so a board of finished work is never the cause.
+- **Board file missing** — `tower_do_status` warns and shows an empty fold;
+  disk stays authoritative (a write treats the missing file as an empty board
+  at revision 0).
+- **Peer edits invisible** — every read path re-folds from disk, and the widget
+  / reminder re-fold on `agent_settled` and on each LLM `context` event, so a
+  peer's change shows up without waiting for a tool call.
+- **A `finding` line in an old board** — ignored by the fold (valid history),
+  not counted as unfoldable.

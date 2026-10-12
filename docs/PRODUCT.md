@@ -1,77 +1,66 @@
 # Product — tower-do
 
-> Product scope and high-level experience. Architecture in ARCHITECTURE.md,
-> contracts in CONTRACTS.md, decisions in DECISIONS.md.
+> Product scope and high-level experience. Architecture in
+> [ARCHITECTURE.md](./ARCHITECTURE.md), contracts in
+> [CONTRACTS.md](./CONTRACTS.md), decisions in [DECISIONS.md](./DECISIONS.md).
 
 ## What it is
 
-A **shared multi-agent task board** for the Pi coding agent — a todo-flavored
-Pi extension inspired by Kimi Tower's multi-worker orchestration. Multiple
-agents (Pi sessions, or one session + subagents) share a live view of *what's
-in progress* plus task-bound communication state, without any central server.
+A Pi extension that gives every session and subagent in a **project** two
+things:
+
+1. **A shared todo board** — plan, claim, update, complete, and block tasks
+   with owners and dependencies. Every session reads and writes the same board;
+   there is no daemon, no database, and no server, just one file per project.
+2. **Cross-session mail** — addressed messages between the sessions working on
+   that project, stored on the same board.
+
+Plus a one-line above-editor widget showing the current workload
+(`TowerDo 3 open · 1 msg`).
 
 ## Scope
 
-- **Shared task board**: plan / claim / update / complete / block tasks; model
-  ownership and dependencies.
-- **Cross-agent messaging**: addressed mail between owners + structured
-  out-of-scope findings for a coordinator to route. Findings have an explicit,
-  auditable exit: a claim/close/snooze lifecycle with reasons, a bounded
-  non-closed budget (so the backlog is actionable instead of silently
-  accumulating), and a pressure-ordered list that never hides the oldest debt.
-- **Push delivery**: a *direct* message wakes an idle, attended session and is
-  injected into its conversation for one bounded turn, so a waiting agent
-  picks up a peer's reply without a human prompt. Broadcasts, batch modes, and
-  sessions waiting for their first turn are never woken; the `inbox` pull path
-  is unchanged.
-- **Global status dashboard**: who owns what, blocks, unread messages, open
-  findings, activity, presence. The default view is caller-centred — your own
-  unfinished work first, then the peer work you are coupled to (a dependency,
-  unread mail, or an intersecting declared scope); everything else folds into a
-  one-line shape summary plus a compact key ledger. `view=all` expands the
-  folded layer and `view=mine` narrows to your own rows; completed rows are
-  always a compact key ledger.
-- **Conflict awareness**: `changedFiles` delivery receipts on completed tasks
-  and derived `scope` conflict advisories (overlap / collision) so parallel
-  workers see boundary collisions before they write.
+- **Shared task board.** Tasks carry `key`, `subject`, optional `description`,
+  `status` (`pending` / `in_progress` / `completed` / `blocked`), `owner`,
+  `dependsOn`, and free-form `blockedBy`. Writes are upserts; deletion is
+  explicit. `dependsOn` gates `in_progress`/`completed` and is rendered as a
+  block reason.
+- **Ownership.** A task with an `owner` can only be changed or removed by that
+  owner or the reserved orchestrator identity `tower`. A claim whose owner has
+  been quiet **on that task** past the takeover window may be displaced by a
+  peer (adopt it, or remove it while it is not completed). Completed rows stay
+  with their owner — a delivery record cannot be forged or dropped by a peer.
+- **Cross-session mail.** `tower_do_talk send` addresses a message to `all`,
+  the orchestrator `tower`, a current task owner, or an identity with recent
+  board activity; self-send is rejected. `inbox` lists and acknowledges your
+  mail. Unread mail is surfaced by the widget, the reminder, and
+  `tower_do_status`.
+- **Stale-write gate.** Every write may carry the `baseRevision` it read; the
+  board rejects a stale write instead of silently overwriting a peer's work.
+- **Status dashboard.** `tower_do_status` renders open tasks (recency-first),
+  completed rows as a key ledger, your messages, and the activity tail; prints
+  the board file path and revision so another agent (or a subagent) can read
+  state directly; and returns one task's full detail with `taskKey`.
 
-**Out of scope** (deliberate): worktree isolation, merge orchestration, CI,
-tool-read git-diff merge gates. Those belong to a Tower-style orchestrator;
-TowerDo is its state/communication substrate.
+**Out of scope** (deliberate): findings/issues, file-scope declarations and
+conflict advisories, session liveness counts, git-dirty attribution, push
+wake, log compaction, checkpoint digests. Those were removed in the
+two-feature reduction; see [DECISIONS.md](./DECISIONS.md).
 
 ## Experience
 
-- **One session + subagents (typical).** The parent plans on the board and
-  claims owners; hands subagents the board path from `tower_do_status`
+- **One session + subagents (typical).** The parent plans tasks on the board
+  and claims owners; hands subagents the board path from `tower_do_status`
   (file-as-state); they report back; the parent closes tasks (or records on
-  their behalf with `as`). Dependencies via `dependsOn` surface as block
-  reasons.
+  their behalf with `as`). Dependencies surface as block reasons.
 - **Multiple sessions, one project.** Both sides read/write the same
-  `~/.pi/tower-do/<project>/board.jsonl`; send a message, the other reads it via
-  `inbox` — and a directly addressed, idle session is woken to read it at once.
-- **Advisory conflict signals.** Completing a task with `changedFiles` and
-  declaring `scope` turns the board into an early-warning surface: a planner
-  whose scope overlaps a just-finished task's files, or two in-progress tasks
-  with intersecting scopes, are flagged in `tower_do_status` — resolve by
-  messaging, not by gate.
-- **Above-editor widget.** Board progress plus two segments: `live N` (sessions
-  running against this board right now — each session heartbeats a tiny
-  liveness sidecar file and deletes it on exit; `fs.watch` makes peers
-  appear/disappear within a second or two; crashed sessions expire after a
-  2-minute silence window; counted by identity, so one configured identity
-  running three sessions reads `live 1`; hidden in directories without a
-  board) and the git segment (`files M · dirty N`):
-  worktree dirty file count vs files whose content this session actually
-  changed (pre-dirty files count only if edited again; edits committed between
-  refreshes are counted too, while a mid-session pull re-anchors attribution
-  instead of counting pulled files; later commits can leave `files N · dirty 0`).
-  Same unit, two labeled viewpoints; the git segment hides when both counts
-  are 0 or the directory is not git; on an empty board the live segment alone
-  still shows. Unfinished-task rows (capped) are layered mine → needs you →
-  others, recency-first; open/blocked/unread counts stay board-wide, and the
-  overflow note names the attention rows that did not fit.
+  `~/.pi/tower-do/<project>/board.jsonl`; send a message and the peer reads it
+  via `inbox` (or sees it as an unread count).
+- **Above-editor widget.** `TowerDo N open · M msg` plus the most recently
+  updated open tasks (capped, with an overflow line that still names their
+  keys); hidden when there is nothing open and no unread mail.
 
 ## Identity
 
-`as` param > config `identity` > session name > session id. Recording
-work for a subagent: pass its id (`as: "coder-1"`).
+`as` param > config `identity` > session name > session id. Recording work for
+a subagent: pass its id (`as: "coder-1"`).

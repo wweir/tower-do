@@ -1,220 +1,111 @@
 # Architecture — tower-do
 
-> Long-lived system-boundary + key-data-flow facts. Field-level contracts live
-> in [CONTRACTS.md](./CONTRACTS.md); decisions (incl. why) in
-> [DECISIONS.md](./DECISIONS.md). README links here for orientation.
+> System boundary and key data flows. Field-level contracts live in
+> [CONTRACTS.md](./CONTRACTS.md); decisions (incl. why) in
+> [DECISIONS.md](./DECISIONS.md).
 
 ## System boundary
 
-tower-do is a **Pi extension** (registered tools + above-editor widget + context
-reminders) whose only durable state is a **plain append-only JSONL file** per
-project:
+tower-do is a **Pi extension** (three registered tools + an above-editor widget
++ a context reminder) whose only durable state is a **plain append-only JSONL
+file** per project:
 
 ```
 ~/.pi/tower-do/<project>/board.jsonl   # <project> = slug-hash of the git root
 ```
 
 - **No daemon, no DB, no lock server.** Any Pi session or subagent that can read
-  the file sees the same tasks. This is *file-as-state* (Kimi Tower blackboard
-  lineage): state = storage, communication = storage. The only concurrency
-  control is a per-board **write lease on disk** (`<board>.lock`, a directory
-  holding the holder's token file) — taken by `append`/`compact`, never by
-  readers.
+  the file sees the same tasks. This is *file-as-state*: state = storage,
+  communication = storage.
 - The **disk file is the single source of truth.** In-memory state (widget /
-  reminders / `currentView`) is a display cache only. If the workspace is
-  cleaned, the last session checkpoint (a custom context entry) is the fallback
-  display source — pinned to `revision 0` so it never advertises a stale
-  `baseRevision` the disk gate would reject.
+  reminder / `currentView`) is a display cache only; every read path re-folds
+  the file.
 - Runtime deps (`typebox`, `@earendil-works/pi-ai`, `@earendil-works/pi-tui`)
-  are peer dependencies supplied by the Pi host; `@earendil-works/pi-coding-agent`
-  is the host package itself (a dev dependency used for types/constants and
-  always present at runtime). The package adds no install-time deps of its own.
+  are peer dependencies supplied by the Pi host;
+  `@earendil-works/pi-coding-agent` is the host package itself (a dev
+  dependency used for types/constants and always present at runtime). The
+  package adds no install-time dependencies.
 
 ## Event log & folding
 
-Three event kinds are appended (one JSON line each), each with distinct fold
-semantics:
+Two event kinds are appended (one JSON line each):
 
 | kind | fold | write path |
 | --- | --- | --- |
-| `task` | LWW by `key` (key total order; full-replacement snapshot) | `tower_do` |
-| `message` | append, LWW by `id` for re-emissions (acks) | `tower_do_talk send` / `inbox` |
-| `finding` | LWW by `id` + status machine | `tower_do_talk finding` |
+| `task` | LWW by `key`; `op: "upsert"` replaces the row, `op: "remove"` deletes it | `tower_do` |
+| `message` | LWW by `id` (a later event carries an ack update) | `tower_do_talk send` / `inbox` |
 
-- **`revision` counts only task events** — message/finding traffic never makes a
-  peer's legal `baseRevision` stale (communication is "free").
-- Task full-replacement re-folds **inside** both `withFileMutationQueue` and
-  `withWriteLock`: its revision guard and diff see the freshest events across
-  processes. Finding budget decisions re-fold inside `withWriteLock`; message
-  sends/acks use the process mutation queue for local ordering. Appends
-  are per-process serialized on a promise chain with single-write `O_APPEND`
-  syscalls; across processes `append` and `compact` share the on-disk write
-  lease, and a read-modify-append decision holds that lease through its
-  append. `fold()` treats a missing file
-  as an empty board; any other read error throws (an unreadable file must not
-  look like a cleared board).
-  `rawLines()` / `rawTail()` always throw on I/O error — display callers
-  degrade; the stale-claim gate reads `rawLines()` (full log) so a bounded
-  tail can never misreport an active owner as idle.
-- The revision a write returns **exactly equals a re-fold** of the file
-  (one bump per task event), so a caller can verify the write landed.
-- A line the fold cannot turn into an event (corrupt JSON, a foreign shape, or a
-  task event with no usable `at`/`updatedAt`) is counted in `view.skipped` and
-  disclosed — NEVER salvaged with `Date.now()`. For a task event the timestamp
-  IS the ownership clock (the fold falls back to it, and `staleTaskClaims`
-  reads the result), so fabricating one would make the fold non-deterministic
-  between reads and report a corrupt line as permanently fresh, defeating the
-  takeover window. The activity parser rejects the same line, so presence and
-  the fold read one clock, not two.
+- **`revision` counts only task events** — message traffic never makes a peer's
+  legal `baseRevision` stale (communication is "free").
+- A write appends only the events of the entities it actually changes: one
+  `task` upsert per created/updated row and one `task` remove per explicit
+  deletion. A write that changes nothing appends nothing and does not bump the
+  revision.
+- `append` is one `open(O_APPEND)` + single `write(2)` call per batch, so
+  concurrent processes cannot interleave inside a batch. **There is no
+  cross-process lease and no log compaction**: the log grows only by the events
+  actually written, and folding a few hundred kilobytes is cheap. A future `gc`
+  is an optimisation, never a correctness requirement.
+- `fold()` treats a missing file as an empty board; any other read error throws
+  (an unreadable file must not look like a cleared board).
+- **Legacy tolerance.** A pre-compaction `{kind:"compact"}` header from an older
+  version is still read (its snapshot lines rebuild the maps without bumping
+  the revision). A legacy `finding` line is ignored — valid history, not a
+  corrupt row — and is not counted as unfoldable.
+- A line the fold cannot turn into an event is counted in `view.skipped` and
+  disclosed by `tower_do_status`; it is never salvaged with `Date.now()` (a
+  task event's `at` IS the ownership clock).
 
-### Log compaction (explicit `gc` or threshold-triggered)
+## Write path
 
-`board.jsonl` may open with a `{kind:"compact"}` header. It is written by
-`tower_do action:"gc"` (`tower` only) or by the extension's automatic
-threshold-triggered run at a session/settle boundary (never periodic). It
-carries the logical `revision` and
-`snapshotLines`; the following snapshot lines rebuild the maps WITHOUT bumping
-the revision, so a refold after a compact reports the same revision (a
-caller's `baseRevision` is never invalidated) and appends after it stay
-monotonic. The rewrite runs a first content check, then archives the previous
-log under `archive/`, then takes a hard link and re-checks the content through
-it (the final CAS, covering exactly the bytes the swap will replace) before the
-rename; the archive therefore sits outside the `[final CAS, rename]` window.
-Every crash point leaves the live file intact. A holder paused past the lease staleness limit inside that rename
-window cannot be excluded by a userspace lease, so the compact re-proves the
-lease right after the rename and, on a steal, reconciles the window's writes
-under a freshly taken lease when the shape is provable (`content + P + W`),
-failing loud with a `<board>.prev-*` evidence file when it is not — it never
-rolls back blindly, because a rollback could clobber writes the new holder
-made after the rename.
-`append` and `compact` also share a per-board `<board>.lock` lease
-(a directory created atomically with the holder's token file inside it; the
-holder refreshes the token file's mtime and only a token whose heartbeat has
-stopped is reaped), so a peer append cannot land inside the
-compaction window. Ownership of that lease is proved by exclusivity — the
-directory must hold exactly the holder's token — both at acquisition and
-again immediately before each mutation, because a reaper can recycle a
-still-empty lease directory between a creator's `mkdir` and its token write.
-The compact keeps every surviving entity, including
-completed receipts and closed findings, and preserves each task owner's real
-last-activity timestamp — it folds superseded upserts/acks, it never deletes
-rows. It prunes the archive set to the newest `MAX_BOARD_ARCHIVES` logs. The
-automatic run never drops unfoldable legacy lines (only the explicit `gc`
-does, and it archives them and reports the count). See CONTRACTS.md "Log
-compaction".
+`writeBoardSnapshot(current, input, caller, staleClaims)` in `state.ts` is pure:
 
-### Checkpoint digest (bounded transcript payload)
+1. Reject a stale `baseRevision`.
+2. Resolve `tasks` as **upserts** (merge each patch onto the stored row; new
+   keys require `subject` + `status`) and validate `remove` keys.
+3. Guard ownership: an owned row may only be changed/removed by its owner or
+   `tower`, except a stale non-completed claim.
+4. Compute the capacity, dependency-consistency and cycle checks over the
+   **produced board** (existing rows − removals + upserts), not the input list.
+5. Return the produced view, a change summary, and the events to append.
 
-`session_compact` / `before_agent_start` persist a `pi-tower-do-board-digest`
-instead of the full view: `counts` (fixed record) + `openTasks` (≤ 50) +
-`findings` (≤ 50, non-closed titles). The legacy full-snapshot type stays
-readable. A digest-only restore (board file missing) is marked `incomplete`
-and disclosed by the reminder and `tower_do_status`; the write path never uses
-it (it folds the real file, missing = empty). See CONTRACTS.md "Checkpoint
-digest".
+## Identity & takeover
 
-## Project anchoring
-
-The board is shared per **project** = nearest ancestor git work-tree root (a
-`.git` directory, or a worktree/submodule whose `.git` is a file starting with
-`gitdir:`); when no git boundary exists, the directory itself is the project.
-`config.json` is global (`$HOME/.pi/agent/tower-do/`, beside pi's own config),
-so `identity` applies across projects. The board/live state stays under
-`$HOME/.pi/tower-do/<project>/`.
-
-## Liveness sidecar (not board events)
-
-The widget's `live N` does not read the board log: each running session owns
-exactly one file `~/.pi/tower-do/<project>/live/<identity>.<sessionId>.json`
-(`{"identity", "at", "aliases"?}`), rewritten on a 30s heartbeat and deleted
-on clean exit. The count is a pure read derivation (`liveSessionCount` in
-`state.ts`): distinct identities with a record fresh within 2 minutes, plus
-self. Optional `aliases` are extra owner labels the session has written as
-(`as: "coder-1"`): they populate the stale-claim gate's liveness set (a
-parent still heartbeating protects its subagent's claim) but never inflate
-`live N`. Own-file snapshots are serialized per session, so an older write
-cannot land after a newer one and drop an alias. `fs.watch`
-on the sidecar dir and `board.jsonl` (debounced ~250ms, session-scoped) makes
-peer enter/exit — and peer board writes, which also re-fold the view — visible
-within one tick. The board log keeps exactly task/message/finding events:
-liveness never churns `revision` or the activity feed, and directories without
-a board file get neither a live segment nor sidecar writes.
-
-## Push wake (delivery, not a board event)
-
-An **idle** session that a peer addresses directly is woken by
-`pi.sendMessage(msg, { triggerTurn: true })` — Pi starts one turn on an idle
-session, so a waiting session does not need a human prompt to receive mail (a
-running turn is left to the pull path). Delivery is derived, never written to
-the board: the same `board.jsonl` watcher that repaints the widget runs
-`selectWakeMessages` (pure: direct + unread + not already pushed on this
-branch), and the pushed ids are read back on restore from the session's own
-`pi-tower-do-mail` entries plus the `pi-tower-do-mail-pending` session markers
-written before each send (`deliveredMailIds`), so a reload does not re-deliver
-and a rewind above a push re-enables it. The rendered payload is bounded per
-message (`WAKE_BODY_CHARS`). Policy — direct only, idle only, attended
-(`ctx.hasUI`) only, ≤ 5 messages per wake, ≤ 10 wakes / 10 min, a wake only
-after the session has conversation — is internal (DECISIONS.md). A wake adds no
-board event and does not churn `revision`; the pull path (reminder / `inbox`)
-is unchanged.
+- Identity is a plain string: `as` > config `identity` > session name >
+  session id. Comparisons are exact (`===` / `Set.has` / `Array.includes`).
+- **Takeover clock.** `staleTaskClaims` derives the displaceable
+  `(owner, task)` pairs from board activity: the owner's last activity on that
+  task, falling back to the task's `updatedAt`, older than
+  `TASK_CLAIM_STALE_MS` (6 h). The clock is per owner+task — an owner's work on
+  another task never protects this one, and unrelated board chatter does not
+  either. A completed task is never displaceable.
 
 ## Read derivations (never written)
 
-Several board views are **pure read derivations** over the folded view / raw
-activity tail — they never mutate the file, and callers cannot "write" them:
+- **Block reasons** (`taskIsBlocked`): explicit `status: "blocked"`, the
+  persisted `blockedBy` field, or unresolved `dependsOn`. A completed task is
+  never blocked.
+- **View layers** — removed (the dashboard renders open tasks plainly).
+- **Message retirement** (`retainMessages`): fully-read history past the
+  internal retention budget leaves the default view; unread mail never exits on
+  the budget, though unread mail nobody acks retires after the age valve.
 
-- **View layers** (`classifyTaskLayers`): unfinished tasks split for one
-  caller into `mine` / `needs` (the caller's own work awaits it, unread mail
-  threads under it, it awaits the caller's unfinished work, or its declared
-  scope intersects the caller's own unfinished scope) / `other`, plus
-  `completed` receipts; order inside every layer is `updatedAt` DESC, `key`
-  ASC. Feeds the widget rows, the reminder and the `tower_do_status`
-  dashboard. Pure — the folded view is untouched.
-- **Presence** (`Who is around`): per-identity last-seen from parsed activity
-  lines; three states — active / `⚠ idle` (>10 min quiet) / (not started).
-  Real idle owners of unfinished tasks are footnoted on `tower_do` receipts.
-- **Stale claims** (`staleTaskClaims`): the `owner+task` pairs whose activity
-  **on that task** (or, for a never-active owner, the task's `updatedAt`) is
-  older than `TASK_CLAIM_STALE_MS` and whose owner has no fresh sidecar
-  heartbeat/alias. The old board-global `lastSeen` let one unrelated message
-  immunize every stale row; the clock is now per owner+task key. The set is
-  keyed by that same pair, and `isStaleClaim` asks about one row, so an owner
-  stalled on one task stays protected on the task it is still touching. Feeds
-  the owner-guard's takeover exception (contract in CONTRACTS.md) — a
-  permission gate, not a display: `tower_do` reads the full activity log and
-  the sidecar dir, and any read failure yields no stale claims (strict guard).
-- **Finding state** (`deriveFindingState`): `actionable` / `claimed` /
-  `snoozed` / `closed`, derived from status + `snoozeUntil` + liveness. The
-  view retires closed rows past the grace (`retainFindings`) and pages by
-  pressure; the budget gate charges every non-closed row. Never written.
-- **Block reasons**: `taskIsBlocked` is a read derivation over explicit
-  `status: "blocked"`, the persisted `blockedBy` field, and unresolved
-  `dependsOn`. `findAllUnresolvedDeps` only lists the dependency reason.
-  `status: "completed"` is never blocked (stale `blockedBy` does not count).
-- **Scope conflicts** (P1): `findScopeConflicts` derives two advisory signals
-  from `scope` declarations + `changedFiles` receipts:
-  1. **overlap** — a completed task's receipt file lies inside an in-progress /
-     pending task's `scope` glob (planner may be about to touch what a peer
-     already changed);
-  2. **collision** — two in-progress tasks declared intersecting `scope` globs
-     (a planning mistake worth surfacing before both start writing).
-  Advisory only — never a gate (scope is self-declared, changedFiles is
-  self-reported; authoritative conflict resolution needs git-diff reads, out of
-  scope for TowerDo).
-- **Message retention**: `retainMessages` retires *fully-read* history past the
-  internal message-retention budget; unread / partially-read messages never exit
-  on the budget, though an unread message nobody acks still leaves the DEFAULT
-  view after the age valve (`MESSAGE_PENDING_RETIRE_MS`; disk and `inbox all`
-  keep it), and orphaned broadcasts (audience all gone) retire so finished
-  rounds don't pin the budget forever.
+## Widget & reminder
+
+- **Widget** (TUI only): `TowerDo N open · M msg` plus the most recently updated
+  open tasks, capped at `WIDGET_TASK_LIMIT`, with an overflow line that names
+  the remaining keys. Hidden when nothing is open and no mail is unread.
+- **Reminder**: every `REMINDER_INTERVAL` (3) LLM calls a one-screen board
+  summary is injected (header + open rows + the overflow line), so an agent
+  that never calls `tower_do_status` still sees the shared state. A reminder
+  already in the transcript is stripped and replaced.
 
 ## Layout
 
 ```
-index.ts     # extension entry: 3 tools + widget + reminder + push wake + lifecycle
-state.ts     # pure schema / validation / fold / read derivations (no I/O)
+index.ts     # extension entry: 3 tools + widget + reminder + lifecycle
+state.ts     # pure schema / validation / fold semantics / read derivations (no I/O)
 board.ts     # disk layer (append-only JSONL) + config normalization
-git-count.ts # widget dirty/session file-count derivations (no I/O)
-test/        # pure-logic + smoke suites (see CONTRACTS.md gates)
+test/        # test suites (see CONTRACTS.md test gate)
 docs/        # this documentation set
 ```

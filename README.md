@@ -1,6 +1,7 @@
-# tower-do — Shared Multi-Agent Task Board (Pi extension)
+# tower-do — Shared Project Board + Cross-Session Mail (Pi extension)
 
-> A todo-flavored Pi extension inspired by **Kimi Tower's multi-worker orchestration** design. Multiple agents (sessions / subagents) share a live view of "what's in progress" plus task-bound communication state.
+> A todo-flavored Pi extension: every session in a project shares one task
+> board, and can send messages to the other sessions working on it.
 
 [![npm version](https://img.shields.io/npm/v/tower-do.svg)](https://www.npmjs.com/package/tower-do)
 [![Pi gallery](https://img.shields.io/badge/Pi-gallery-7c3aed)](https://pi.dev/packages/tower-do)
@@ -9,48 +10,29 @@
 
 [中文版说明 / Chinese README](./README.zh-CN.md)
 
-![tower-do above-editor widget: board progress (`TowerDo 6 open · 1 blocked`), live session count, `files/dirty` file segments, and annotated unfinished-task rows](https://raw.githubusercontent.com/wweir/tower-do/main/docs/pi-tower-do.png)
+## Two features
 
-## What it does
+Parallel coding agents fail at coordination, not at coding. tower-do gives
+every session and subagent in a project two things:
 
-Parallel coding agents fail at coordination, not at coding: they clobber each
-other's files, redo finished work, and never know who is doing what. tower-do
-gives every agent in the project one shared board to plan, claim, and finish
-work — and the manners to talk about it.
+1. **A shared todo board.** Plan, claim, update, complete, and block tasks
+   with owners and dependencies. Every session reads and writes the same
+   board — no daemon, no database, no server, just one file per project.
+2. **Cross-session mail.** Send an addressed message to another session (or
+   broadcast to `all`) and read your inbox. Mail is stored on the same board,
+   so a peer sees it whenever it next looks — and `tower_do_status` surfaces
+   your unread count.
 
-- **One board, many agents.** Plan, claim, complete, and block tasks with
-  owners and dependencies. Every session and subagent reads and writes the
-  same board — no daemon, no database, no setup beyond installing the
-  extension.
-- **Finish with receipts.** Completing a task records the files you actually
-  changed (`changedFiles`), so whoever picks up the next task knows what just
-  moved under them.
-- **Talk where the work lives.** Addressed messages to a task's owner (or
-  broadcast to all), plus structured findings (bug / improve / vuln / idea)
-  for out-of-scope discoveries — routed to the right agent, not lost in chat.
-  A *direct* message also wakes an idle session: it is injected into the
-  conversation and runs one bounded turn, so a waiting peer picks it up
-  without a human prompt.
-- **Conflict awareness.** The dashboard flags when your task's declared scope
-  overlaps files a peer just changed, or when two in-progress tasks declare
-  intersecting scopes — advisory warnings you resolve by messaging, never
-  gates that block you.
-- **Who is around.** Presence shows which sessions are active, idle, or gone
-  quiet while still owning unfinished work — so a coordinator knows whom to
-  ping instead of reassigning blind.
-- **A widget that explains the room.** The above-editor line shows remaining
-  work (`TowerDo 2 open · 1 blocked`), how many sessions are live, which dirty
-  files are yours vs. the worktree's, and the unfinished tasks with owners
-  (layered mine → needs you → others, recency-first; the open count is still
-  the whole board).
+Plus a one-line above-editor widget (`TowerDo 3 open · 1 msg`) showing the
+current workload.
 
 Three tools:
 
 | Tool | Purpose |
 | --- | --- |
-| `tower_do` | One-shot atomic board update: plan / claim (`owner` + `in_progress`) / complete (`changedFiles` receipt) / block (`blocked` + `blockedBy`). `baseRevision` protects against clobbering |
-| `tower_do_talk` | Cross-agent messaging: `send` (owner / recent-activity identity / `all`; self-send rejected), `inbox`, `finding` (structured out-of-scope report / status update) |
-| `tower_do_status` | Shared dashboard: your own unfinished work first, then the peer work you are coupled to (deps / unread mail / intersecting declared scope); everything else folds into a stats line + a `key status @owner` ledger, completed rows into a key ledger. `view=all` expands, `view=mine` narrows; `taskKey` / `findingId` return one record's full detail |
+| `tower_do` | One atomic board update. `tasks` is an **upsert** list (create or patch); `remove` deletes explicitly. Claim with `owner` + `in_progress`, complete with `status: "completed"`, block with `status: "blocked"` + `blockedBy`. `baseRevision` rejects a stale write instead of clobbering a peer. |
+| `tower_do_talk` | `send` an addressed message (recipient must be `all`, `tower`, a current task owner, or an identity with recent board activity; self-send rejected); `inbox` lists and acknowledges your mail. |
+| `tower_do_status` | Shared dashboard: every open task (recency-first), completed rows as a key ledger, your messages, and the activity tail. `taskKey` returns one task's full detail. Pass its revision back as `baseRevision`. |
 
 ## Install
 
@@ -76,15 +58,20 @@ Pi auto-discovers the extension at startup; existing sessions pick it up with `/
 
 ## Quick tour
 
-**One session + subagents (typical).** Parent plans tasks on the board and
+**One session + subagents (typical).** The parent plans tasks on the board and
 claims owners; hands subagents the board path from `tower_do_status`
-(file-as-state); they report back; parent closes out. **Multiple sessions, one
-project.** Both read/write the same `~/.pi/tower-do/<project>/board.jsonl` — send
-a message, the peer reads it via `inbox` (a directly addressed idle session is
-woken to read it immediately).
+(file-as-state); they report back; the parent closes out.
 
-Identity resolution: `as` param > config `identity` > session name >
-session id. Recording work for a subagent: pass its id (e.g. `as: "coder-1"`).
+**Multiple sessions, one project.** Both read/write the same
+`~/.pi/tower-do/<project>/board.jsonl`. Send a message with `tower_do_talk`;
+the peer sees it in `inbox` (and as an unread count in its widget / status).
+
+**Upsert, not replay.** A write lists only the rows it creates or changes — a
+key you do not mention is left alone, so a partial write can never drop a
+peer's task. Deleting is explicit (`remove: ["key"]`).
+
+Identity resolution: `as` param > config `identity` > session name > session
+id. Recording work for a subagent: pass its id (e.g. `as: "coder-1"`).
 
 ## Configuration
 
@@ -113,16 +100,15 @@ event semantics, and read derivations:
 | Doc | Content |
 | --- | --- |
 | [docs/PRODUCT.md](docs/PRODUCT.md) | Product scope & high-level experience |
-| [docs/ARCHITECTURE.md](docs/ARCHITECTURE.md) | System boundary, event log & folding, source layout, read derivations (presence / block / scope conflicts / retention) |
-| [docs/CONTRACTS.md](docs/CONTRACTS.md) | Task-model invariants (incl. `changedFiles` receipt + scope-conflict contracts), ownership guard, revision gate, test gate |
-| [docs/DECISIONS.md](docs/DECISIONS.md) | Why: share boundary facts not diffs (P0/P1), widget segments, file-as-state, every-field owner guard, advisory scope |
+| [docs/ARCHITECTURE.md](docs/ARCHITECTURE.md) | System boundary, event log & folding, source layout |
+| [docs/CONTRACTS.md](docs/CONTRACTS.md) | Task-model invariants, ownership guard, message contracts, revision gate, test gate |
+| [docs/DECISIONS.md](docs/DECISIONS.md) | Why: file-as-state, upsert writes, the ownership guard, single-clock takeover |
 | [docs/OPERATIONS.md](docs/OPERATIONS.md) | Install, config, release flow (tag → CI → npm), troubleshooting |
 | [README.zh-CN.md](./README.zh-CN.md) | 中文版说明 |
 
-Quality gate: `bunx tsc --noEmit` plus the test suites listed in
-[docs/CONTRACTS.md](docs/CONTRACTS.md), enforced in CI on every release tag —
-that list is the authoritative set and each entry says what the suite proves.
+Quality gate: `bunx tsc --noEmit` plus the suites listed in
+[docs/CONTRACTS.md](docs/CONTRACTS.md), enforced in CI on every release tag.
 
-References: Kimi Tower's multi-worker orchestration design (official Tower
-blog/docs) and the reference extension implementation
-<https://github.com/99percentpeople/pi-extensions/blob/master/extensions/todo/index.ts>.
+## License
+
+MPL-2.0.
