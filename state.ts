@@ -1299,10 +1299,8 @@ export function knownIdentities(
   const known = new Set([
     ...currentOwners(view),
     ...entries.map((entry) => entry.by),
-    // Readers survive compaction: an ack is its own log line whose byline the
-    // compact snapshot does not keep (one line per message), but `readBy`
-    // rides inside the message entity forever. Without this a peer whose only
-    // footprint was an ack would become an unknown recipient after a gc.
+    // An ack is its own log line, and `readBy` rides inside the message entity
+    // forever, so a peer whose only footprint is an ack stays a known recipient.
     ...view.messages.flatMap((message) => message.readBy ?? []),
   ]);
   known.delete(TOWER_IDENTITY);
@@ -1405,8 +1403,8 @@ export function isStaleClaim(
 /** Remediation hint attached to a full open-task budget (see writeBoardSnapshot):
  * what the caller can free, and how a board holding nothing but completed rows
  * is compacted. */
-const OPEN_TASK_BUDGET_HINT =
-  ' — free a slot by omitting your own or an unowned task, or compact a finished board with an as: "tower" write that replays only the rows to keep';
+export const OPEN_TASK_BUDGET_HINT =
+  ' — free a slot by completing or removing an existing open task (remove: ["key"]) first';
 
 /** What a caller can still do about a row it is not allowed to touch.
  *

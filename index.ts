@@ -88,6 +88,7 @@ import {
   MAX_TASK_SUBJECT_CHARS,
   MAX_TOWER_DO_OPEN_TASKS,
   messagesToMe,
+  OPEN_TASK_BUDGET_HINT,
   normalizeIdentity,
   parseActivityLine,
   relativeTime,
@@ -479,7 +480,7 @@ const TowerDoParamsSchema = Type.Object({
   as: Type.Optional(
     Type.String({
       description:
-        `Identity to act as (default: your session identity); the call is then owner-guarded as that identity. Pass a subagent id to record work on its behalf. Must be a single line, at most ${MAX_IDENTITY_CHARS} characters, and not the reserved broadcast recipient "all". Identities are self-declared labels (cooperative trust, no authentication), so the reserved "${TOWER_IDENTITY}" label gates compaction by convention, not by verification.`,
+        `Identity to act as (default: your session identity); the call is then owner-guarded as that identity. Pass a subagent id to record work on its behalf. Must be a single line, at most ${MAX_IDENTITY_CHARS} characters, and not the reserved broadcast recipient "all". Identities are self-declared labels (cooperative trust, no authentication), so the reserved "${TOWER_IDENTITY}" label carries the owner guard's orchestrator authority by convention, not by verification.`,
       maxLength: MAX_IDENTITY_CHARS,
     }),
   ),
@@ -1104,11 +1105,12 @@ export default function towerDoExtension(pi: ExtensionAPI): void {
           ...(params.taskKey === undefined ? {} : { taskKey: params.taskKey }),
         };
         await withFileMutationQueue(board.file, async () => {
-        // The lease spans the fold, the existence/recipient checks, the
-        // audience snapshot and the append: `append` alone takes the lease
-        // AFTER those checks, so a peer could delete the task in between and
-        // the persisted message would carry a dangling taskKey (the same
-        // reason tower_do uses withWrite).
+        // `withWrite` holds the in-process write chain across the fold, the
+        // existence/recipient checks, the audience snapshot and the append, so
+        // no local write can land in between and the persisted message cannot
+        // carry a taskKey that was removed beside it (cross-process races are
+        // covered by folding the fresh view here plus append atomicity). The
+        // same reason tower_do uses withWrite.
         await board.withWrite(async (appendLocked) => {
           throwIfAborted(signal, "TowerDo talk");
           const fresh = await foldRetained(ctx.cwd);
@@ -1256,10 +1258,8 @@ export default function towerDoExtension(pi: ExtensionAPI): void {
             details: { caller, inbox: updatedMessages },
           };
         };
-        // Fast path: with nothing of mine unacked this is a PURE READ, so it
-        // must not take the cross-process write lease — a read-only state dir
-        // still has to serve an inbox, and a peer mid-compact must not stall a
-        // read for up to LOCK_WAIT_MS.
+        // Fast path: with nothing of mine unacked this is a PURE READ — it
+        // appends nothing, so a read-only state dir still serves an inbox.
         const peek = await readFold();
         throwIfAborted(signal, "TowerDo talk");
         const peekMine = myInbox(peek);
@@ -1593,7 +1593,7 @@ export default function towerDoExtension(pi: ExtensionAPI): void {
       }
       if (openCount >= MAX_TOWER_DO_OPEN_TASKS) {
         lines.push(
-          `Open-task budget full: completed rows do not count — omit your own or an unowned task, or compact a finished board with an as: "tower" write replaying just the rows to keep.`,
+          `Open-task budget full: completed rows do not count${OPEN_TASK_BUDGET_HINT}`,
         );
       }
       lines.push("");
@@ -1753,7 +1753,7 @@ export default function towerDoExtension(pi: ExtensionAPI): void {
   });
 
   // -------------------------------------------------------------------------
-  // Lifecycle: restore, compact checkpoints, reminders, shutdown
+  // Lifecycle: restore, reminders, shutdown
   // -------------------------------------------------------------------------
 
 
