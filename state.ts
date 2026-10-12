@@ -79,20 +79,14 @@ export const MAX_TASK_SUBJECT_CHARS = 160;
 export const MAX_TASK_DESCRIPTION_CHARS = 2_000;
 export const MAX_IDENTITY_CHARS = 64;
 export const MAX_TASK_DEPENDENCIES = 20;
-export const MAX_SCOPE_GLOBS = 20;
-export const MAX_CHANGED_FILES = 100;
 /** `blockedBy` is a free-form blocker list, not a dependency list: same shape,
  * different rule. Kept as its own constant so retuning the dependency cap
  * cannot silently retune the blocker cap (CONTRACTS.md task model). */
 export const MAX_TASK_BLOCKERS = 20;
-/** Longest single `blockedBy` entry. Blockers name a task/message/finding id,
- * so 120 is generous, but the list still needs a bound: it is rendered inline
- * in the reminder, which has no byte budget of its own. */
+/** Longest single `blockedBy` entry. Blockers name a task or message id, so
+ * 120 is generous, but the list still needs a bound: it is rendered inline in
+ * the reminder, which has no byte budget of its own. */
 export const MAX_BLOCKER_CHARS = 120;
-/** Longest single entry in a path-ish list (`scope` glob, `changedFiles`
- * path). Both are single-line repo-relative strings that must stay readable in
- * the dashboard, so one limit covers both. */
-export const MAX_PATH_ENTRY_CHARS = 256;
 
 /** Length of `value` in Unicode code points — the metric every user-facing
  * "at most N characters" limit in this extension uses. */
@@ -192,9 +186,6 @@ export interface TowerBoardView {
    * still holds but cannot show — never silent: the dashboard discloses it.
    * Not part of `revision` (which counts folded task events only). */
   skipped: number;
-  /** True when this view was rebuilt from a bounded checkpoint because the
-   * board file was missing. Display-only, never persisted into a board event. */
-  incomplete?: boolean;
 }
 
 interface TowerDoChangeSummary {
@@ -251,7 +242,6 @@ export function cloneBoard(view: TowerBoardView): TowerBoardView {
     schemaVersion: TOWER_DO_SCHEMA_VERSION,
     revision: view.revision,
     skipped: view.skipped,
-    ...(view.incomplete === undefined ? {} : { incomplete: view.incomplete }),
     tasks: view.tasks.map(cloneTask),
     messages: view.messages.map((message) => ({
       ...message,
@@ -1752,11 +1742,6 @@ export function formatBoardReminder(
   const lines = [
     `TowerDo shared board — you are ${identity} (revision ${view.revision}; ${tasks.length} task(s), ${unfinished.length} open${completed > 0 ? `, ${completed} completed hidden` : ""}, ${blocked.length} blocked, ${unread} unread message(s) for you).`,
   ];
-  if (view.incomplete === true) {
-    lines.push(
-      "⚠ board file is missing — this is the last bounded checkpoint (open tasks only). Full content (messages, completed receipts) is unavailable; writes fold the missing file as an empty board.",
-    );
-  }
   const shown = unfinished.slice(0, REMINDER_TASK_LINE_CAP);
   for (const task of shown) {
     const owner =
