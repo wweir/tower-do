@@ -22,7 +22,6 @@
  */
 import {
   createEmptyBoard,
-  derivePresence,
   messagesToMe,
   readByWith,
   sameAgent,
@@ -377,36 +376,6 @@ check(
 check(
   "acking twice does not duplicate the receipt",
   JSON.stringify(readByWith([labelA], labelA)) === JSON.stringify([labelA]),
-);
-
-// ---------------------------------------------------------------------------
-// 6. Presence: one row per agent, never a transitive bucket merge
-// ---------------------------------------------------------------------------
-const presence = derivePresence(
-  [
-    { kind: "task", by: legacyOf(SIBLING_A), at: Date.now(), glyph: "◐", detail: "work" },
-    { kind: "task", by: labelA, at: Date.now() - 1000, glyph: "◐", detail: "work" },
-  ],
-  [{ ...legacyTask, owner: labelA }],
-  Date.now(),
-);
-check(
-  "a legacy row merges into the current label of its bucket",
-  presence.length === 1 && presence[0].identity === labelA,
-  presence.map((line) => line.identity).join(","),
-);
-const twoSiblings = derivePresence(
-  [
-    { kind: "task", by: labelA, at: Date.now(), glyph: "◐", detail: "a" },
-    { kind: "task", by: labelB, at: Date.now() - 1000, glyph: "◐", detail: "b" },
-  ],
-  [],
-  Date.now(),
-);
-check(
-  "two current labels in one bucket stay two rows (no transitive merge)",
-  twoSiblings.length === 2,
-  twoSiblings.map((line) => line.identity).join(","),
 );
 
 console.log(

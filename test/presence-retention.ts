@@ -24,11 +24,9 @@ import { join } from "node:path";
 import { TowerBoard } from "../board.ts";
 import {
   createEmptyBoard,
-  derivePresence,
   messagesToMe,
   formatActivityEntry,
   formatActivityFeed,
-  formatPresenceLine,
   isCallerLine,
   isMessageFullyRead,
   knownIdentities,
@@ -408,63 +406,6 @@ function layer2(): void {
     by: "carol",
     at: now - 720_000,
   });
-  const e3 = parseActivityLine(idleEvent);
-  const entries = [e1, e2, e3].filter(
-    (e): e is NonNullable<typeof e1> => e !== undefined,
-  );
-  const tasks = [
-    {
-      key: "feat-x",
-      subject: "land feat x",
-      status: "in_progress" as const,
-      owner: "alice",
-      updatedAt: now,
-    },
-    {
-      key: "stale",
-      subject: "stale owned task",
-      status: "in_progress" as const,
-      owner: "carol",
-      updatedAt: now - 720_000,
-    },
-    {
-      key: "fresh",
-      subject: "freshly assigned task",
-      status: "pending" as const,
-      owner: "dave",
-      updatedAt: now - 3600_000,
-    },
-  ];
-  const presence = derivePresence(entries, tasks as never, now);
-  const alice = presence.find((p) => p.identity === "alice");
-  const carol = presence.find((p) => p.identity === "carol");
-  const dave = presence.find((p) => p.identity === "dave");
-  check(
-    "presence derives active owner from activity",
-    alice !== undefined && alice.idle === false && alice.unstarted === false,
-  );
-  check(
-    "presence flags owner quiet past the idle threshold as idle",
-    carol !== undefined &&
-      carol.idle === true &&
-      carol.unstarted === false &&
-      carol.ownerOf.includes("stale"),
-    JSON.stringify(presence.map((p) => formatPresenceLine(p, now))),
-  );
-  check(
-    "presence marks never-active owner as unstarted, not idle",
-    dave !== undefined &&
-      dave.idle === false &&
-      dave.unstarted === true &&
-      formatPresenceLine(dave, now).includes("(not started)"),
-  );
-  check(
-    "presence sorts most-recent first",
-    // alice (60s ago) must outrank carol (720s ago); the old `|| carol` made
-    // this pass with the two active entries swapped.
-    presence[0]?.identity === "alice",
-    presence.map((p) => p.identity).join(","),
-  );
 
   // --- feed rendering: session-break separators + latest-write summary ---
   // All times are newest-first (the status tool reverses the raw tail). A

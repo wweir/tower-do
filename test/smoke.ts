@@ -270,7 +270,7 @@ async function layer1(): Promise<void> {
   const reminderWaiting = formatBoardReminder(stillWaiting.view, "alice");
   check(
     "reminder labels blockedBy task [blocked], header agrees",
-    reminderWaiting.includes("1 task(s), 1 mine, 0 need you, 0 other") &&
+    reminderWaiting.includes("1 task(s), 1 open") &&
       reminderWaiting.includes("1 blocked") &&
       reminderWaiting.includes("- [blocked] wait:"),
     reminderWaiting.split("\n")[1],
@@ -515,12 +515,6 @@ async function layer2(): Promise<void> {
     s0.text.includes("smoke-session") && s0.text.includes("board.jsonl"),
     s0.text.slice(0, 80),
   );
-  check(
-    "an empty presence section collapses to one line",
-    s0.text.includes("## Who is around: nobody active"),
-    s0.text.split("\n").slice(5, 7).join(" / "),
-  );
-
   // alice claims auth; bob's dependent billing starts pending (waits on auth).
   const plan = await run("tower_do", {
     tasks: [
@@ -562,32 +556,21 @@ async function layer2(): Promise<void> {
     s1.text.split("\n")[4],
   );
   check(
-    "the default view folds other sessions' rows into stats plus a key ledger",
-    /## Others \(2 · 2 owner\(s\) · 1 in_progress · 1 pending · 1 blocked, ledger\)/.test(
-      s1.text,
-    ) &&
-      s1.text.includes("- billing pending @bob") &&
-      !s1.text.includes("- ✗ billing:"),
+    "the default view renders every open row with its why",
+    /## Open \(2\)/.test(s1.text) &&
+      s1.text.includes("- ✗ billing:") &&
+      s1.text.includes("[blocked by: auth]"),
     s1.text.split("\n").slice(4, 9).join(" / "),
-  );
-  const sAll = await run("tower_do_status", { view: "all" } as never);
-  check(
-    "view=all renders every unfinished row with its why",
-    /## Others \(2\)[\s\S]*?- ✗ billing:[\s\S]*?\[blocked by: auth\]/.test(
-      sAll.text,
-    ) && !/## Others[\s\S]*?- ○ billing:/.test(sAll.text),
-    "billing renders blocked in Others",
   );
 
   // The status filter follows the same derived contract as the rendering:
   // status:"blocked" finds gated pending tasks, status:"pending" does not.
   const asBlocked = await run("tower_do_status", {
     status: "blocked",
-    view: "all",
   } as never);
   check(
     "status filter blocked finds gated pending task",
-    /## Others \(1\)[\s\S]*?- ✗ billing:[\s\S]*?\[blocked by: auth\]/.test(
+    /## Open \(1\)[\s\S]*?- ✗ billing:[\s\S]*?\[blocked by: auth\]/.test(
       asBlocked.text,
     ) &&
       /Tasks: 2 total \(1 in_progress, 1 blocked, 0 pending, 0 completed\)/.test(
@@ -610,42 +593,6 @@ async function layer2(): Promise<void> {
   // prints the STORED status —
   // `billing` is stored `pending` and only derived-blocked — because that is
   // the value a replay writes back.
-  const narrowMine = await run("tower_do_status", { view: "mine" } as never);
-  check(
-    "view=mine renders the other layers as a ledger",
-    narrowMine.text.includes("ledger)") &&
-      narrowMine.text.includes("- auth in_progress @alice") &&
-      narrowMine.text.includes("- billing pending @bob") &&
-      !narrowMine.text.includes("- ✗ billing:"),
-    narrowMine.text.split("\n").slice(8, 12).join(" / "),
-  );
-  const narrowNeeds = await run("tower_do_status", { view: "needs" } as never);
-  check(
-    "view=needs is an alias for the folded default",
-    narrowNeeds.text.includes("- auth in_progress @alice") &&
-      !narrowNeeds.text.includes("- ✗ billing:"),
-    narrowNeeds.text.split("\n").slice(8, 12).join(" / "),
-  );
-  const othersSection =
-    (s1.text.split("## Others")[1] ?? "").split("\n## ")[0] ?? "";
-  check(
-    "the folded default keeps every open key enumerable",
-    /^- auth in_progress @alice$/m.test(othersSection) &&
-      /^- billing pending @bob$/m.test(othersSection),
-    othersSection.split("\n").slice(0, 3).join(" / ") || "(missing)",
-  );
-
-  // The explicit-limit branch of the hidden-rows note (the default-budget
-  // branch is unit-tested in test/view-layers.ts): the dashboard must SAY what
-  // it dropped.
-  const capped = await run("tower_do_status", { limit: 1 } as never);
-  check(
-    "dashboard reports rows hidden beyond an explicit limit",
-    capped.text.includes("more row(s) hidden by the 1-row budget") &&
-      capped.text.includes("pass a larger limit"),
-    capped.text.split("\n").slice(-3).join(" / "),
-  );
-
   // bob (as subagent id) tries to complete alice's task → ownership error.
   const blockedMsg = await runThrow("tower_do", {
     tasks: [
@@ -1462,48 +1409,6 @@ async function layer2(): Promise<void> {
     } as never,
     layersViewDir,
   );
-  const coupledDefault = await run("tower_do_status", {}, layersViewDir);
-  check(
-    "the default view renders the caller's own row and the coupled peer row in full",
-    /## Mine \(1\)[\s\S]*?- ✗ mine-waits: my turn after the gate @smoke-session \(me\)[\s\S]*?\[blocked by: peer-blocker\]/.test(
-      coupledDefault.text,
-    ) &&
-      /## Needs you \(1\)[\s\S]*?- ○ peer-blocker: peer gate @peer-owner \[needs you: await\]/.test(
-        coupledDefault.text,
-      ) &&
-      /## Others \(1 · 1 owner\(s\) · 1 pending, ledger\)[\s\S]*?- unrelated pending @someone-else/.test(
-        coupledDefault.text,
-      ),
-    coupledDefault.text.split("\n").slice(3, 12).join(" / "),
-  );
-  const coupledMine = await run(
-    "tower_do_status",
-    { view: "mine" } as never,
-    layersViewDir,
-  );
-  check(
-    "view=mine folds the coupled peer row into the ledger and drops its reason",
-    /## Needs you \(1 · 1 owner\(s\) · 1 pending, ledger\)[\s\S]*?- peer-blocker pending @peer-owner/.test(
-      coupledMine.text,
-    ) && !coupledMine.text.includes("[needs you: await]"),
-    coupledMine.text.split("\n").slice(3, 12).join(" / "),
-  );
-  const coupledNeeds = await run(
-    "tower_do_status",
-    { view: "needs" } as never,
-    layersViewDir,
-  );
-  check(
-    "view=needs folds exactly like the default layers view",
-    coupledNeeds.text.includes("## Needs you (1)") &&
-      coupledNeeds.text.includes("[needs you: await]") &&
-      coupledNeeds.text.includes(
-        "## Others (1 · 1 owner(s) · 1 pending, ledger)",
-      ) &&
-      !coupledNeeds.text.includes("- ○ unrelated:"),
-    coupledNeeds.text.split("\n").slice(3, 12).join(" / "),
-  );
-
   // A message old enough to leave the default view (unread, past the age
   // valve) is still readable via inbox all, but the default inbox hides it.
   const retiredAt = Date.now() - 30 * 24 * 60 * 60_000;

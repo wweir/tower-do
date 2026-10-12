@@ -44,7 +44,7 @@
 | P3a digest 退役 | `rw-digest` | done |
 | P3b findings 退役 | `rw-findings` | done |
 | P3c 删 scope/changedFiles | `rw-trim` | done |
-| P3d 删 layers/presence + 收敛 status | `rw-view` | open |
+| P3d 删 layers/presence + 收敛 status | `rw-view` | done |
 | P4a 消息投递（D2） | `rw-msg` | open |
 | P4b 身份（D4） | `rw-identity` | open |
 | P5 UI（D3） | `rw-ux` | open |
@@ -73,9 +73,11 @@
   收据继承、taskEquals、cloneTask/readPersistedTask），删 scope-conflict 派生（glob 匹配/intersect/
   findScopeConflicts/sliceScopeConflicts）与 `needs` 的 scope 原因、`tower_do` schema 与 status 的
   冲突章节。删 test/scope-conflicts.ts、test/changed-files.ts 并同步其他套件。tsc + 14 套件全绿。
-- [ ] **P3d 删 layers/presence + 收敛 status** — 删 classifyTaskLayers/ledger/foldDashboardSections/
-  derivePresence 与 `view=layers|mine|needs`，`tower_do_status` 收敛为 open tasks + completed 键账目
-  + unread + activity；清 `view.incomplete` 与其展示分支。
+- [x] **P3d 删 layers/presence + 收敛 status** — 删 `classifyTaskLayers`/`orderTasksByLayer`/ledger/
+  `foldDashboardSections`/`formatDashboardHiddenNote`/`DASHBOARD_ROW_BUDGET`/`formatPresenceLine`/
+  `derivePresence`/`PresenceLine`/`formatLayerSummary`；`tower_do_status` 收敛为 `## Open` 全量行 +
+  `## Completed` 键账目 + messages + activity（删 `view=layers|mine|needs`）；widget 改按 recency 列
+  open 行；`formatBoardReminder` 重写为 header + open 行 + 溢出键行。删 test/view-layers.ts。tsc + 13 套件全绿。
 - [ ] **P4b 身份（D4）** — identity = `as` > config `identity` > session id；删 `sessionLabel`
   label entropy / alias / `sameAgent` 多时钟体系；stale takeover 只用 `task.updatedAt` 单时钟。
 - [ ] **P5 UI** — 极简 widget + reminder。

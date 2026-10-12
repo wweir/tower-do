@@ -1055,11 +1055,11 @@ export function readPersistedMessage(
   };
 }
 
+const REMINDER_TASK_LINE_CAP = 12;
+
 // ---------------------------------------------------------------------------
 // Bounded checkpoint digest (Layer 4)
 // ---------------------------------------------------------------------------
-
-const REMINDER_TASK_LINE_CAP = 12;
 
 /**
  * Owners currently on the board (task owners), used to scope broadcast
@@ -1480,9 +1480,6 @@ export function formatActivityFeed(
   return lines;
 }
 
-/** How long before an owner with no activity is flagged idle (ms). */
-const PRESENCE_IDLE_MS = 10 * 60_000;
-
 /**
  * Identities addressable via tower_do_talk send: current task owners plus
  * anyone who appears in recent board activity. Owners alone would strand a
@@ -1505,110 +1502,6 @@ export function knownIdentities(
   ]);
   known.delete(TOWER_IDENTITY);
   return known;
-}
-
-export interface PresenceLine {
-  identity: string;
-  lastSeenAt?: number;
-  ownerOf: string[];
-  /** True when the identity has NO activity record at all (freshly assigned). */
-  unstarted: boolean;
-  /** Set when the identity has been active before but has gone quiet. */
-  idle: boolean;
-}
-
-/**
- * Derive who-is-around from parsed activity (never writes to the board).
- * Two distinct signals, kept apart so a coordinator can act correctly:
- *   - unstarted: owns work but has NO activity record (freshly assigned, or
- *     the board was re-planned under a new identity) — NOT a stall, the
- *     owner may simply not have begun;
- *   - idle: HAS activity but nothing for PRESENCE_IDLE_MS — a real stall a
- *     coordinator may message about or re-claim.
- */
-export function derivePresence(
-  entries: readonly ActivityEntry[],
-  tasks: readonly TowerDoTask[],
-  now: number,
-): PresenceLine[] {
-  const lastSeen = new Map<string, number>();
-  for (const entry of entries) {
-    const prior = lastSeen.get(entry.by);
-    if (prior === undefined || entry.at > prior)
-      lastSeen.set(entry.by, entry.at);
-  }
-  const ownerOf = new Map<string, string[]>();
-  for (const task of tasks) {
-    if (task.owner === undefined) continue;
-    const list = ownerOf.get(task.owner) ?? [];
-    list.push(task.key);
-    ownerOf.set(task.owner, list);
-  }
-  const identities = new Set<string>([...lastSeen.keys(), ...ownerOf.keys()]);
-  // A legacy row merges into the current label of its bucket only when exactly
-  // ONE current label carries that bucket: `sameAgent` is not transitive
-  // (legacy ↔ each sibling), so grouping must stay keyed, never transitive —
-  // otherwise two distinct sessions of one bucket would render as one agent,
-  // which is the collision this change removes.
-  const currentLabels = [...identities].filter((label) =>
-    CURRENT_SESSION_LABEL.test(label),
-  );
-  const displayLabel = (label: string): string => {
-    const legacy = LEGACY_SESSION_LABEL.exec(label);
-    if (legacy === null) return label;
-    const matches = currentLabels.filter(
-      (current) => CURRENT_SESSION_LABEL.exec(current)?.[1] === legacy[1],
-    );
-    return matches.length === 1 ? matches[0] : label;
-  };
-  const lines: PresenceLine[] = [];
-  const refreshDerivedFlags = (line: PresenceLine): void => {
-    const hasOwnership = line.ownerOf.length > 0;
-    line.unstarted = hasOwnership && line.lastSeenAt === undefined;
-    line.idle =
-      hasOwnership &&
-      line.lastSeenAt !== undefined &&
-      now - line.lastSeenAt > PRESENCE_IDLE_MS;
-  };
-  for (const raw of identities) {
-    const identity = displayLabel(raw);
-    const existing = lines.find((line) => line.identity === identity);
-    const ownerOfKeys = ownerOf.get(raw) ?? [];
-    const lastSeenAt = lastSeen.get(raw);
-    if (existing !== undefined) {
-      for (const key of ownerOfKeys)
-        if (!existing.ownerOf.includes(key)) existing.ownerOf.push(key);
-      if (
-        lastSeenAt !== undefined &&
-        (existing.lastSeenAt === undefined || lastSeenAt > existing.lastSeenAt)
-      )
-        existing.lastSeenAt = lastSeenAt;
-      // Recompute after merging: the merged row may have gained the activity
-      // or the ownership this raw label did not carry.
-      refreshDerivedFlags(existing);
-      continue;
-    }
-    const line: PresenceLine = {
-      identity,
-      lastSeenAt,
-      ownerOf: ownerOfKeys,
-      unstarted: false,
-      idle: false,
-    };
-    refreshDerivedFlags(line);
-    lines.push(line);
-  }
-  lines.sort((a, b) => {
-    const aAt = a.lastSeenAt ?? 0;
-    const bAt = b.lastSeenAt ?? 0;
-    if (aAt !== bAt) return bAt - aAt;
-    // Code-unit compare, not localeCompare: identity is a user/session label,
-    // and the runtime default locale would make the display order of a
-    // lastSeenAt tie drift across environments. Every other sort in this file
-    // is deterministic for the same reason.
-    return a.identity < b.identity ? -1 : a.identity > b.identity ? 1 : 0;
-  });
-  return lines;
 }
 
 /** Alias of `TASK_CLAIM_STALE_MS` under the name the docs and the takeover
@@ -1923,162 +1816,6 @@ export function isCallerLine(line: string, caller: string): boolean {
   ).test(line);
 }
 
-export function formatPresenceLine(line: PresenceLine, now: number): string {
-  const seen =
-    line.lastSeenAt === undefined
-      ? "no recent activity"
-      : `last seen ${relativeTime(now, line.lastSeenAt)}`;
-  const owned =
-    line.ownerOf.length > 0 ? ` (owns ${line.ownerOf.join(", ")})` : "";
-  const state = line.idle ? " ⚠ idle" : line.unstarted ? " (not started)" : "";
-  return `${line.identity} — ${seen}${owned}${state}`;
-}
-
-/** Why a peer-owned unfinished task is in the caller's attention set. */
-export type NeedsReason = "await" | "blocking" | "unread";
-
-/** One `needs` row: a peer task plus why the caller must still look at it. */
-export interface NeedsTask {
-  task: TowerDoTask;
-  reason: NeedsReason;
-}
-
-/** A board rendered for one caller in three unfinished layers plus receipts.
- *
- *  `mine`  — unfinished tasks the caller owns.
- *  `needs` — peer-owned unfinished tasks the caller is coupled to: its own
- *            unfinished work awaits them (`await`), a message to the caller
- *            threads under them (`unread`), or they await the caller's
- *            unfinished work (`blocking`).
- *  `other` — the remaining unfinished tasks.
- *  `completed` — receipts, rendered as a compact key ledger, never as rows.
- *
- *  Order inside every layer is recency-first (`updatedAt` DESC, `key` ASC as
- *  the tiebreaker — one batch write stamps several rows with one `updatedAt`),
- *  so a cap cannot hide the newest work behind arbitrary order. Identity match
- *  is exact (`alice` ≠ `alice-2`); unowned is not mine. Does not mutate
- *  `tasks`. */
-export interface TaskLayers {
-  mine: TowerDoTask[];
-  needs: NeedsTask[];
-  other: TowerDoTask[];
-  completed: TowerDoTask[];
-}
-
-function byRecency(a: TowerDoTask, b: TowerDoTask): number {
-  if (a.updatedAt !== b.updatedAt) return b.updatedAt - a.updatedAt;
-  return a.key < b.key ? -1 : a.key > b.key ? 1 : 0;
-}
-
-/** Split a board into the caller's layers. Pure; callers own the rendering. */
-export function classifyTaskLayers(
-  tasks: readonly TowerDoTask[],
-  view: TowerBoardView,
-  identity: string,
-): TaskLayers {
-  const mine: TowerDoTask[] = [];
-  const completed: TowerDoTask[] = [];
-  const mineKeys = new Set<string>();
-  for (const task of tasks) {
-    if (task.status === "completed") {
-      completed.push(task);
-      continue;
-    }
-    if (identity !== "" && task.owner === identity) {
-      mine.push(task);
-      mineKeys.add(task.key);
-    }
-  }
-  // Keys the caller's own unfinished work is still waiting on. `blockedBy` is
-  // free-form (a task key, a message id, a finding id); when it names a task on
-  // this board, the caller is parked on that task too.
-  const boardKeys = new Set(tasks.map((task) => task.key));
-  const awaited = new Set<string>();
-  for (const task of mine) {
-    for (const key of findAllUnresolvedDeps(task, view)) awaited.add(key);
-    for (const key of task.blockedBy) {
-      if (boardKeys.has(key)) awaited.add(key);
-    }
-  }
-  // Peer tasks a message to the caller threads under.
-  const unreadKeys = new Set<string>();
-  for (const message of unreadMessagesToMe(view, identity)) {
-    if (message.taskKey !== undefined) unreadKeys.add(message.taskKey);
-  }
-  const needs: NeedsTask[] = [];
-  const other: TowerDoTask[] = [];
-  for (const task of tasks) {
-    if (task.status === "completed" || mineKeys.has(task.key)) continue;
-    if (awaited.has(task.key)) {
-      needs.push({ task, reason: "await" });
-    } else if (unreadKeys.has(task.key)) {
-      needs.push({ task, reason: "unread" });
-    } else if (task.dependsOn.some((key) => mineKeys.has(key))) {
-      // `mineKeys` only holds unfinished work, so this is "it awaits me".
-      needs.push({ task, reason: "blocking" });
-    } else {
-      other.push(task);
-    }
-  }
-  needs.sort((a, b) => byRecency(a.task, b.task));
-  return {
-    mine: mine.sort(byRecency),
-    needs,
-    other: other.sort(byRecency),
-    completed: completed.sort(byRecency),
-  };
-}
-
-/** The layered order flattened: mine, then needs, then other. Exported for
- *  callers that want the whole board as one ranked list; the widget and the
- *  reminder use the layers directly and fold `other` into a single line. */
-export function orderTasksByLayer(
-  tasks: readonly TowerDoTask[],
-  view: TowerBoardView,
-  identity: string,
-): TowerDoTask[] {
-  const layers = classifyTaskLayers(tasks, view, identity);
-  return [
-    ...layers.mine,
-    ...layers.needs.map((entry) => entry.task),
-    ...layers.other,
-  ];
-}
-
-/** Compact folded row: `key status @owner`. A key the caller can still name is
- *  a key a full-replacement write can keep, so a folded section renders as this
- *  instead of disappearing. The status printed is the STORED one, not the
- *  derived `blocked` view: this row is what a replay writes back, and echoing a
- *  derived blocked would turn a parked reason into a stored status. */
-export function formatLedgerRow(task: TowerDoTask): string {
-  const owner = task.owner === undefined ? "" : ` @${task.owner}`;
-  return `- ${task.key} ${task.status}${owner}`;
-}
-
-/** Compact key-only ledger, `maxChars` per line. Receipts share one status, so
- *  repeating it per key buys nothing — this is the form that keeps every key
- *  enumerable for a full-replacement write without spending a line per task. */
-export function formatLedgerKeyRows(
-  tasks: readonly TowerDoTask[],
-  maxChars = 96,
-): string[] {
-  const rows: string[] = [];
-  let current = "";
-  for (const task of tasks) {
-    const candidate = current === "" ? task.key : `${current}, ${task.key}`;
-    // `- ` counts against the width. A single key longer than the budget still
-    // gets its own line: losing a key is worse than a long line.
-    if (current !== "" && candidate.length + 2 > maxChars) {
-      rows.push(`- ${current}`);
-      current = task.key;
-      continue;
-    }
-    current = candidate;
-  }
-  if (current !== "") rows.push(`- ${current}`);
-  return rows;
-}
-
 /** Truncate the CONTENT to `max` code points, appending an ellipsis when cut
  *  (so the result is at most `max + 1` code points — the marker is always
  *  disclosed). Code points, not UTF-16 units — the same metric as every other
@@ -2099,240 +1836,6 @@ export function truncateToAtMost(value: string, max: number): string {
   return `${chars.slice(0, max - 1).join("")}…`;
 }
 
-/** Default `tower_do_status` dashboard budget (rows rendered per call). The
- * open-task quota is 50, so this can only ever bind on a long completed
- * history or an explicit smaller `limit`. */
-export const DASHBOARD_ROW_BUDGET = 200;
-
-/** Slice the dashboard listing, reporting how many rows it had to hide.
- *
- * `limit` explicit = the caller asked for fold order, honoured verbatim.
- * Default budget = open (non-completed) rows win it: a completed history
- * longer than the budget must never hide unfinished work, and boards now
- * outgrow the budget (the row cap became an open budget — see DECISIONS.md
- * "open-task budget"). Stable partition, so the slice keeps fold order; the
- * render order inside a layer is recency-first. Does not mutate `tasks`. */
-export function sliceTaskDashboard(
-  tasks: readonly TowerDoTask[],
-  limit: number | undefined,
-): { shown: TowerDoTask[]; hidden: number } {
-  const ordered =
-    limit === undefined
-      ? [
-          ...tasks.filter((task) => task.status !== "completed"),
-          ...tasks.filter((task) => task.status === "completed"),
-        ]
-      : tasks;
-  const budget = limit ?? DASHBOARD_ROW_BUDGET;
-  const shown = ordered.slice(0, budget);
-  return { shown: [...shown], hidden: ordered.length - shown.length };
-}
-
-/** Footer note naming what the dashboard budget hid and how to see it. The
- * default budget and an explicit `limit` hide rows for different reasons, so
- * they carry different remedies. `undefined` when nothing was hidden. */
-export function formatDashboardHiddenNote(
-  hidden: number,
-  limit: number | undefined,
-): string | undefined {
-  if (hidden <= 0) return undefined;
-  const budget = limit ?? DASHBOARD_ROW_BUDGET;
-  return (
-    `… +${String(hidden)} more row(s) hidden by the ${String(budget)}-row budget` +
-    (limit === undefined
-      ? " (open rows win the default budget — pass limit to widen, or narrow with owner=/status=)"
-      : " (pass a larger limit, or narrow with owner=/status=)")
-  );
-}
-
-/** Section priority for the folded dashboard: the caller's own work first, then
- * the sections that need action, then backlog and history. Titles match by
- * prefix, so a count suffix (`## Mine (3)`) ranks the same as the bare title. */
-const DASHBOARD_SECTION_RANK: readonly string[] = [
-  "## Mine",
-  "## Needs you",
-  // `view=all` renders the findings section as `## Findings`, the folded view
-  // as `## Open findings`; they are one section under two titles, and both must
-  // rank above history or a finite budget spends itself on `## Completed`.
-  "## Open findings",
-  "## Findings",
-  "## Messages for",
-  "## Who is around",
-  "## Scope conflicts",
-  "## Others",
-  "## Completed",
-  "## Recent activity",
-];
-
-/** Sections that keep a heading plus one content line before the rest of the
- * budget is spent (the two findings spellings count as one concept, so this is
- * 5 titles for the 4 action sections). */
-const DASHBOARD_MUST_SEE_SECTIONS = 5;
-
-function dashboardSectionRank(title: string): number {
-  const index = DASHBOARD_SECTION_RANK.findIndex((prefix) =>
-    title.startsWith(prefix),
-  );
-  return index === -1 ? DASHBOARD_SECTION_RANK.length : index;
-}
-
-/** Fold a rendered dashboard to `budget` lines **by section**, keeping the
- * original line order. A head-cut spends the window on whichever section
- * renders first; this spends it where it matters.
- *
- *  - Every must-see section (rank < `DASHBOARD_MUST_SEE_SECTIONS`) keeps its
- *    heading plus one content line before the rest is spent in priority order,
- *    so a long `## Mine` cannot reduce `## Needs you` / findings / messages to
- *    bare headings — while the budget affords it; a head cropped to an
- *    explicit tiny budget may erase sections entirely (pinned by the
- *    `budget < head` case).
- *  - Budget cut notes and `(no tasks match the filter)` are always kept: they
- *    are disclosures, not section content.
- *
- * Pure; the caller reports the cut (`lines.length - result.length`). */
-export function foldDashboardSections(
-  lines: readonly string[],
-  budget = 16,
-): string[] {
-  const head: string[] = [];
-  const notes: string[] = [];
-  const sections: { rank: number; rows: string[] }[] = [];
-  for (const line of lines) {
-    if (line.startsWith("## ")) {
-      sections.push({ rank: dashboardSectionRank(line), rows: [line] });
-    } else if (sections.length === 0) {
-      head.push(line);
-    } else if (
-      line === "(no tasks match the filter)" ||
-      // A section-internal disclosure is indented (`## Scope conflicts` cuts
-      // with `  … +N more …`), so match past the indent: a cut notice is a
-      // disclosure, not section content the budget may drop.
-      line.trimStart().startsWith("… ")
-    ) {
-      notes.push(line);
-    } else {
-      sections[sections.length - 1].rows.push(line);
-    }
-  }
-  if (sections.length === 0) {
-    // No headings at all (the taskKey / findingId detail reads): fall back to
-    // a plain cut so those outputs stay bounded too.
-    return head.slice(0, budget);
-  }
-  // The head is the board header plus its counts; it is bounded by
-  // construction, but an explicit small budget still has to hold, so crop it
-  // before the sections rather than returning more lines than `budget`.
-  const headBudget = Math.max(0, budget - notes.length);
-  const keptHead = head.length <= headBudget ? head : head.slice(0, headBudget);
-  let remaining = Math.max(0, budget - keptHead.length - notes.length);
-  const counts = sections.map(() => 0);
-  const ranked = sections
-    .map((section, index) => ({ index, rank: section.rank }))
-    .sort((a, b) => a.rank - b.rank);
-  // Pass 1: headings for every must-see section. A long header or a disclosure
-  // note must not erase the section that carries the action items.
-  for (const { index, rank } of ranked) {
-    if (remaining <= 0) break;
-    if (rank >= DASHBOARD_MUST_SEE_SECTIONS) continue;
-    counts[index] = 1;
-    remaining -= 1;
-  }
-  // Pass 2: one content line for each of those sections.
-  for (const { index, rank } of ranked) {
-    if (remaining <= 0) break;
-    if (rank >= DASHBOARD_MUST_SEE_SECTIONS) continue;
-    if (sections[index].rows.length <= counts[index]) continue;
-    counts[index] += 1;
-    remaining -= 1;
-  }
-  // Pass 3: spend what is left in priority order.
-  for (const { index } of ranked) {
-    if (remaining <= 0) break;
-    const room = sections[index].rows.length - counts[index];
-    if (room <= 0) continue;
-    const take = Math.min(room, remaining);
-    counts[index] += take;
-    remaining -= take;
-  }
-  const kept = [...keptHead];
-  for (const [index, section] of sections.entries()) {
-    for (let row = 0; row < counts[index]; row += 1) {
-      kept.push(section.rows[row]);
-    }
-  }
-  // Disclosures are kept last, but the budget is absolute: when the caller
-  // passes a budget smaller than the note count, the notes that fit survive and
-  // the remainder is cut (the reservation above cannot hold them all).
-  kept.push(...notes.slice(0, Math.max(0, budget - kept.length)));
-  return kept;
-}
-
-/** One line listing unrelated unfinished keys: `+3 other task(s): a, b, c`.
- *  The keys stay enumerable — a full-replacement write replays keys, not rows —
- *  while the layer itself stops spending the caller's attention window. */
-export function formatOtherKeysLine(
-  keys: readonly string[],
-  maxChars = 160,
-): string {
-  return formatKeyListLine(
-    `+${String(keys.length)} other task(s): `,
-    keys,
-    maxChars,
-  );
-}
-
-/** `lead` followed by as many keys as fit in `maxChars`; a tail names the rest.
- *  The keys stay enumerable — a full-replacement write replays keys, not rows —
- *  while the layer (or an overflowed attention window) stops spending the
- *  caller's rows. */
-export function formatKeyListLine(
-  lead: string,
-  keys: readonly string[],
-  maxChars = 160,
-): string {
-  let line = lead;
-  let taken = 0;
-  for (const key of keys) {
-    const candidate = taken === 0 ? `${line}${key}` : `${line}, ${key}`;
-    if (taken > 0 && candidate.length > maxChars) break;
-    line = candidate;
-    taken += 1;
-  }
-  const rest = keys.length - taken;
-  return rest > 0
-    ? `${line} … (+${String(rest)} more, see tower_do_status)`
-    : line;
-}
-
-/** One-line shape summary of a folded layer, e.g.
- *  `2 owner(s) · 1 in_progress · 1 blocked` — the layer still reports what the
- *  board holds; only its rows are gone. */
-export function formatLayerSummary(
-  tasks: readonly TowerDoTask[],
-  view: TowerBoardView,
-): string {
-  const owners = new Set(
-    tasks
-      .map((task) => task.owner)
-      .filter((owner): owner is string => owner !== undefined),
-  );
-  const counts = new Map<TowerDoStatus, number>();
-  let blocked = 0;
-  for (const task of tasks) {
-    counts.set(task.status, (counts.get(task.status) ?? 0) + 1);
-    if (taskIsBlocked(task, view)) blocked += 1;
-  }
-  const parts = [
-    owners.size > 0 ? `${String(owners.size)} owner(s)` : "unowned",
-  ];
-  for (const status of ["in_progress", "pending"] as const) {
-    const count = counts.get(status) ?? 0;
-    if (count > 0) parts.push(`${String(count)} ${status}`);
-  }
-  if (blocked > 0) parts.push(`${String(blocked)} blocked`);
-  return parts.join(" · ");
-}
-
 /** Compact status-line rendering of the whole board for reminders. Rows are
  *  layered (mine → needs) and recency-first, so the cap shows the work the
  *  caller is in and the peer work it is coupled to; the unrelated layer folds
@@ -2342,37 +1845,21 @@ export function formatBoardReminder(
   identity: string,
 ): string {
   const tasks = getAllTasks(view);
-  const layers = classifyTaskLayers(tasks, view, identity);
-  const completed = layers.completed.length;
-  const unfinished = [
-    ...layers.mine,
-    ...layers.needs.map((entry) => entry.task),
-    ...layers.other,
-  ];
-  // Rows the caller must actually read: its own work plus the peer work it is
-  // coupled to. Unrelated unfinished tasks keep their counts and their keys
-  // (a full-replacement write replays keys, not rows) but not their rows.
-  const attention = [
-    ...layers.mine,
-    ...layers.needs.map((entry) => entry.task),
-  ];
+  const unfinished = tasks
+    .filter((task) => task.status !== "completed")
+    .sort((a, b) => b.updatedAt - a.updatedAt || (a.key < b.key ? -1 : 1));
+  const completed = tasks.length - unfinished.length;
   const blocked = unfinished.filter((task) => taskIsBlocked(task, view));
   const unread = unreadMessagesToMe(view, identity).length;
-  const needsReason = new Map(
-    layers.needs.map((entry) => [entry.task.key, entry.reason]),
-  );
-  // The agent reading this snapshot must know which owner suffix is itself,
-  // or owner matching / (me) markers are guesswork. Counts stay board-wide so
-  // a folded layer is still measurable; only its rows are gone.
   const lines = [
-    `TowerDo shared board — you are ${identity} (revision ${view.revision}; ${tasks.length} task(s), ${layers.mine.length} mine, ${layers.needs.length} need you, ${layers.other.length} other${completed > 0 ? `, ${completed} completed hidden` : ""}, ${blocked.length} blocked, ${unread} unread message(s) for you).`,
+    `TowerDo shared board — you are ${identity} (revision ${view.revision}; ${tasks.length} task(s), ${unfinished.length} open${completed > 0 ? `, ${completed} completed hidden` : ""}, ${blocked.length} blocked, ${unread} unread message(s) for you).`,
   ];
   if (view.incomplete === true) {
     lines.push(
       "⚠ board file is missing — this is the last bounded checkpoint (open tasks only). Full content (messages, completed receipts) is unavailable; writes fold the missing file as an empty board.",
     );
   }
-  const shown = attention.slice(0, REMINDER_TASK_LINE_CAP);
+  const shown = unfinished.slice(0, REMINDER_TASK_LINE_CAP);
   for (const task of shown) {
     const owner =
       task.owner === undefined
@@ -2381,47 +1868,30 @@ export function formatBoardReminder(
           ? ` @${task.owner} (me)`
           : ` @${task.owner}`;
     const deps = task.dependsOn.length ? ` ← ${task.dependsOn.join(",")}` : "";
-    // The status tag already says "blocked" — the suffix must add the WHY
-    // (which keys still gate it) or it is pure duplication.
+    // The status tag already says "blocked" — the suffix adds the WHY.
     const blockers = [
       ...new Set([...task.blockedBy, ...findAllUnresolvedDeps(task, view)]),
     ];
     const blockedBy = blockers.length
       ? ` [blocked by: ${blockers.join(",")}]`
       : "";
-    // One blocked definition everywhere: the header counts taskIsBlocked, so
-    // a pending task gated by unresolved deps is labelled [blocked] here too
-    // (the suffix still carries the WHY). Otherwise the header says
-    // "1 blocked" while the row reads [pending].
     const label = taskIsBlocked(task, view) ? "blocked" : task.status;
-    // A peer row wins the window because the caller is coupled to it; say why,
-    // or it reads as unrelated backlog the caller may skip.
-    const reason = needsReason.get(task.key);
-    const needsTag = reason === undefined ? "" : ` [needs you: ${reason}]`;
     lines.push(
-      `- [${label}] ${task.key}: ${task.subject}${owner}${deps}${blockedBy}${needsTag}`,
+      `- [${label}] ${task.key}: ${task.subject}${owner}${deps}${blockedBy}`,
     );
   }
-  if (attention.length > shown.length) {
-    // The overflow mixes the caller's own rows with the coupled peer rows, so
-    // the count must not claim them all as "yours" — and naming the keys keeps
-    // them enumerable for a full-replacement write.
-    const overflow = attention.slice(shown.length).map((task) => task.key);
+  if (unfinished.length > shown.length) {
     lines.push(
-      formatKeyListLine(
-        `… and ${String(overflow.length)} more task(s) you need to see: `,
-        overflow,
-      ),
+      `… and ${String(unfinished.length - shown.length)} more open task(s): ${unfinished
+        .slice(shown.length)
+        .map((task) => task.key)
+        .join(", ")}`,
     );
-  }
-  if (layers.other.length > 0) {
-    lines.push(formatOtherKeysLine(layers.other.map((task) => task.key)));
   }
   lines.push(
     "Before your final response, reconcile actual progress with this shared board. " +
-      "If your work changed (or should change) any task's status, owner, or deps, write it via tower_do " +
-      `with baseRevision ${view.revision} — attach changedFiles (files you actually changed) when completing. ` +
-      "To coordinate, message the task owner or file a finding via tower_do_talk instead of silently changing tasks you don't own. " +
+      `If your work changed (or should change) any task's status, owner, or deps, write it via tower_do with baseRevision ${view.revision}. ` +
+      "To coordinate, message the task owner via tower_do_talk instead of silently changing tasks you don't own. " +
       `An owner idle for ${formatTakeoverWindow()}+ (per-task activity, not board chatter) may be displaced: adopt the non-completed task by setting owner to yourself, or remove it. ` +
       "Do not call tower_do only to acknowledge this reminder.",
   );
