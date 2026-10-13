@@ -23,6 +23,7 @@
     "test/",
     "docs/",
     "tsconfig.json",
+    "tsconfig.test.json",
     "README.md",
     "README.zh-CN.md",
     "LICENSE"
@@ -33,7 +34,7 @@
     ]
   },
   "devDependencies": {
-    "@earendil-works/pi-coding-agent": "^1.1.0",
+    "@earendil-works/pi-coding-agent": "^1.2.0",
     "bun-types": "^1.4.2",
     "typescript": "^5.9.3"
   },
