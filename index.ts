@@ -186,7 +186,7 @@ function projectRoot(cwd: string): string {
  * session records (board.jsonl, live sidecars) never ride inside a repo. The
  * slug keeps the directory readable; the path hash guarantees uniqueness
  * (`/a/b` vs `/a_b` would slug identically). */
-export function stateDirFor(cwd: string): string {
+function stateDirFor(cwd: string): string {
   const root = projectRoot(cwd);
   const slug =
     root.replace(/[^A-Za-z0-9._-]+/g, "-").replace(/^-+|-+$/g, "") || "project";
@@ -491,7 +491,7 @@ const StatusParamsSchema = Type.Object({
   limit: Type.Optional(
     Type.Integer({
       description:
-        `Max task lines (default ${DASHBOARD_ROW_BUDGET}). The default budget is won by open (non-completed) rows, so a long completed history can never hide unfinished work; an explicit limit is honoured in fold order. Hidden rows are reported in the output.`,
+        `Max task lines (default ${DASHBOARD_ROW_BUDGET}). The default budget is won by open (non-completed) rows, so a long completed history can never hide unfinished work; rows render newest-first within each group. Hidden rows are reported in the output.`,
       minimum: 1,
     }),
   ),
@@ -515,6 +515,12 @@ function taskLine(task: TowerDoTask): string {
   const owner = task.owner !== undefined ? ` @${task.owner}` : "";
   const deps = task.dependsOn.length ? ` ← ${task.dependsOn.join(",")}` : "";
   return `${task.key}: ${task.subject}${owner}${deps}`;
+}
+
+/** Newest first, key-ascending tiebreak — the ordering shared by the widget and
+ *  the status dashboard. */
+function byRecency(a: TowerDoTask, b: TowerDoTask): number {
+  return b.updatedAt - a.updatedAt || (a.key < b.key ? -1 : 1);
 }
 
 /** Flatten a tool result's text content into one string — the shared tail of
@@ -691,9 +697,7 @@ export default function towerDoExtension(pi: ExtensionAPI): void {
               // WIDGET_TASK_LIMIT caps how many unfinished tasks the
               // above-editor line shows; the rest fold into one overflow line
               // that still names their keys.
-              const ordered = [...unfinished].sort(
-                (a, b) => b.updatedAt - a.updatedAt || (a.key < b.key ? -1 : 1),
-              );
+              const ordered = [...unfinished].sort(byRecency);
               const shown = ordered.slice(0, WIDGET_TASK_LIMIT);
               for (const task of shown) {
                 const glyph = TASK_STATUS_GLYPHS[task.status];
@@ -794,7 +798,7 @@ export default function towerDoExtension(pi: ExtensionAPI): void {
     label: "TowerDo",
     description: `Maintain the shared multi-agent task board with one atomic update.
 - Upsert semantics: list only the tasks you create or change. Omitted optional fields on an existing key are preserved, and new keys require subject and status. A key you do not list is left untouched (there is no implicit removal) — delete with the explicit 'remove' field.
-- Owner guard: a task with an owner can only be changed (any field) or removed by its owner or the "tower" identity. Exception: a non-completed task whose OWN activity is older than ${formatTakeoverWindow()} (TASK_CLAIM_STALE_MS; unrelated board chatter does not protect a row, and an owner's activity on another task never protects this one) may be displaced row by row — adopt it by setting owner to yourself and changing nothing else in that write (any content edit in the same write is rejected; re-plan in a second write), or remove it; completed tasks stay guarded.
+- Owner guard: a task with an owner can only be changed (any field) or removed by its owner or the "tower" identity. Exception: a non-completed task whose OWN activity is older than ${formatTakeoverWindow()} — unrelated board chatter does not protect a row, and an owner's activity on another task never protects this one — may be displaced row by row — adopt it by setting owner to yourself and changing nothing else in that write (any content edit in the same write is rejected; re-plan in a second write), or remove it; completed tasks stay guarded.
 - Dependencies gate status: in_progress/completed require every dependsOn entry to be completed, dependsOn keys must exist on the board or in this call, and cycles are rejected (blocked is exempt).
 - Content limits (subject ${MAX_TASK_SUBJECT_CHARS} / description ${MAX_TASK_DESCRIPTION_CHARS} characters) are enforced per task and a violation names the task key, so fix that one row instead of resending everything. An omitted field on an existing task is preserved (send only what changes); long-form evidence belongs in a tower_do_talk message, not in description.
 - Always pass baseRevision from tower_do_status; omitting it disables the stale-write check.
@@ -1057,8 +1061,8 @@ export default function towerDoExtension(pi: ExtensionAPI): void {
           // owner but exactly who hand-off coordination needs to reach.
           let knownRecipients = currentOwners(fresh);
           try {
-            // FULL log, not a bounded tail: a 200-line window can fall behind
-            // a churny fleet and turn a recently active peer into an "unknown
+            // FULL log, not a bounded tail: a short window can fall behind a
+            // churny fleet and turn a recently active peer into an "unknown
             // recipient" — the same reason the takeover gate reads rawLines().
             const raw = await board.rawLines();
             const parsed: ActivityEntry[] = [];
@@ -1325,37 +1329,25 @@ export default function towerDoExtension(pi: ExtensionAPI): void {
       const openCount = tasks.length - completedCount;
       // The activity tail feeds both the rendered feed and the header's
       // "last updated" line, so it is parsed once.
-      const tailCount = STATUS_ACTIVITY_TAIL;
       const now = Date.now();
-      // ONE read of the log serves the activity tail, the total line count and
-      // the legacy compact header below — fold() has already read the same
-      // bytes, so a second and third read is pure waste at any log size.
+      // ONE read of the log serves the activity tail and the total line count —
+      // fold() has already read the same bytes, so a second read is pure waste
+      // at any log size.
       let rawLines: string[] = [];
       let logBytes = 0;
-      let compactRev: number | undefined;
       try {
         // rawLines first: if the log cannot be read there is nothing to size,
         // and the `State:` line below must not claim "log 0 line(s) / 12KB".
         rawLines = await board.rawLines();
         logBytes = statSync(board.file).size;
-        const head: unknown = JSON.parse(rawLines[0] ?? "null");
-        if (
-          head !== null &&
-          typeof head === "object" &&
-          (head as { kind?: unknown }).kind === "compact" &&
-          typeof (head as { revision?: unknown }).revision === "number"
-        ) {
-          compactRev = (head as { revision: number }).revision;
-        }
       } catch {
         // Missing/unreadable log → no activity; the folded view still renders.
       }
       const parsedEntries = rawLines
-        .slice(-tailCount)
+        .slice(-STATUS_ACTIVITY_TAIL)
         .reverse()
         .map((line) => parseActivityLine(line))
         .filter((entry): entry is ActivityEntry => entry !== undefined);
-      const recentEntries = parsedEntries;
       const lastWrite = latestActivity(parsedEntries);
 
       // Totals BEFORE the page slice: the section headers must not report a
@@ -1379,13 +1371,17 @@ export default function towerDoExtension(pi: ExtensionAPI): void {
                   displayStatus(task) === params.status),
             )
           : tasks;
-      const limit = params.limit;
-      // Open rows win the default budget (stable partition, so the slice keeps
-      // fold order); an explicit `limit` is honoured in fold order verbatim.
-      const budget = limit ?? DASHBOARD_ROW_BUDGET;
+      // Open rows win the budget; within each group the newest render first, so
+      // the page (and the hidden-rows note) matches the tool contract and the
+      // widget/reminder ordering.
+      const budget = params.limit ?? DASHBOARD_ROW_BUDGET;
       const ordered = [
-        ...filtered.filter((task) => task.status !== "completed"),
-        ...filtered.filter((task) => task.status === "completed"),
+        ...filtered
+          .filter((task) => task.status !== "completed")
+          .sort(byRecency),
+        ...filtered
+          .filter((task) => task.status === "completed")
+          .sort(byRecency),
       ];
       const shown = ordered.slice(0, budget);
       const hidden = ordered.length - shown.length;
@@ -1485,15 +1481,12 @@ export default function towerDoExtension(pi: ExtensionAPI): void {
       const logLines = rawLines.length;
       if (logLines > 0 || logBytes > 0) {
         lines.push(
-          `State: ${basename(dirname(board.file))} · log ${String(logLines)} line(s) / ${(logBytes / 1024).toFixed(0)}KB` +
-            (compactRev === undefined
-              ? ""
-              : ` · compact rev ${String(compactRev)}`),
+          `State: ${basename(dirname(board.file))} · log ${String(logLines)} line(s) / ${(logBytes / 1024).toFixed(0)}KB`,
         );
       }
-      // D4: board liveness at a glance. revision is monotonic but silent —
-      // a coordinator needs to know how stale the board is and who last
-      // moved it (pure read derivation from the activity tail, zero writes).
+      // Last-write observability: revision is monotonic but silent — a
+      // coordinator needs to know how stale the board is and who last moved it
+      // (a pure read derivation from the activity tail, zero writes).
       const updated =
         lastWrite === undefined
           ? "no board writes yet"
@@ -1580,10 +1573,10 @@ export default function towerDoExtension(pi: ExtensionAPI): void {
 
       lines.push("");
       lines.push("## Recent activity (newest first)");
-      for (const line of formatActivityFeed(recentEntries, now)) {
+      for (const line of formatActivityFeed(parsedEntries, now)) {
         lines.push(line);
       }
-      if (recentEntries.length === 0) lines.push("(no recent activity)");
+      if (parsedEntries.length === 0) lines.push("(no recent activity)");
 
       const full = `${lines.join("\n")}\n`;
       const cut = truncateTail(full, { maxBytes: DEFAULT_MAX_BYTES });

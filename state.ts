@@ -30,7 +30,8 @@ export const TOWER_DO_STATUS_TOOL_NAME = "tower_do_status";
  * rows are receipts/history, not work: they replay free and never consume the
  * budget, otherwise a board whose rows are all completed becomes unwritable
  * for every session that is not an owner or `tower` (the guard pins completed
- * rows to their owner forever). See DECISIONS.md "open-task budget". */
+ * rows to their owner forever). See CONTRACTS.md "Task model — semantic
+ * invariants". */
 export const MAX_TOWER_DO_OPEN_TASKS = 50;
 export const DEFAULT_IDENTITY = "main";
 /** Reserved orchestrator identity that may act on any owned task (Tower). */
@@ -39,13 +40,13 @@ export const MAX_MESSAGE_BYTES = 32 * 1024;
 export const MAX_MESSAGE_SUBJECT_CHARS = 200;
 /** Age after which an unread message leaves the default view even though nobody
  * acked it. The message stays on disk and is readable via `inbox all` — a view
- * retirement, never a delete. Exported because it is the bound CONTRACTS.md
- * names for unread mail the retention budget may not touch. */
+ * retirement, never a delete. Exported for the retention test; the bound is
+ * stated in CONTRACTS.md "Message contracts". */
 export const MESSAGE_PENDING_RETIRE_MS = 14 * 24 * 60 * 60_000;
 /** Ownership-takeover window for non-completed tasks: ownership dies on the
  * task-relevant activity clock, not on unrelated board chatter (see
  * staleTaskClaims). */
-export const TASK_CLAIM_STALE_MS = 6 * 60 * 60_000;
+const TASK_CLAIM_STALE_MS = 6 * 60 * 60_000;
 
 // ---------------------------------------------------------------------------
 // Content limits — defined exactly once, here.
@@ -193,7 +194,6 @@ interface TowerDoChangeSummary {
 
 interface TowerDoWriteDetails {
   view: TowerBoardView;
-  caller: string;
   change: TowerDoChangeSummary;
   taskEvents: BoardTaskEvent[];
 }
@@ -314,7 +314,7 @@ export function normalizeIdentity(
   const identity = value?.trim();
   if (!identity) throw new TowerDoValidationError(`${location} is required`);
   assertSingleLine(identity, location);
-  // NUL is the separator in `claimKey` (and board.ts's task clock), so an
+  // NUL is the separator in `claimKey` (see staleTaskClaims), so an
   // identity carrying one could collide with another (owner, task) pair. Task
   // keys cannot contain NUL (their pattern is lowercase ASCII), so rejecting it
   // on the identity side is enough to keep those keys injective.
@@ -595,7 +595,6 @@ export function writeBoardSnapshot(
 
   return {
     view: nextView,
-    caller,
     change: { added, updated, removed },
     taskEvents,
   };
@@ -1025,7 +1024,7 @@ export function unreadMessagesToMe(
  * `tower` carve-out so that mail to the orchestrator (which owns no task by
  * design) was not classified as unreadable. An unacked message therefore
  * leaves the default view only through the age valve, which bounds it without
- * guessing (CONTRACTS.md "message retention").
+ * guessing (CONTRACTS.md "Message contracts").
  *
  * A broadcast is read once its whole AUDIENCE has acked: the send-time
  * snapshot when present, else the current owners, minus the sender — the
@@ -1116,8 +1115,8 @@ export function parseActivityLine(line: string): ActivityEntry | undefined {
   } catch {
     return undefined;
   }
-  if (!candidate || typeof candidate !== "object") return undefined;
-  const record = candidate as Record<string, unknown>;
+  if (!isRecord(candidate)) return undefined;
+  const record = candidate;
   const kind = record.kind;
   const at = isEpochMs(record.at) ? record.at : undefined;
   const by = typeof record.by === "string" ? record.by : undefined;
@@ -1126,10 +1125,10 @@ export function parseActivityLine(line: string): ActivityEntry | undefined {
     // Same shape test as `readEvent` (board.ts): a task line whose `op` is
     // not upsert/remove is skipped by the fold, so it must not count as
     // ownership activity here either — otherwise the activity parser and the
-    // fold read two different clocks (ARCHITECTURE.md "one clock, not two"), and a
-    // garbage line would extend an owner's takeover protection.
+    // fold read two different clocks (ARCHITECTURE.md "Identity & takeover"),
+    // and a garbage line would extend an owner's takeover protection.
     if (record.op !== "upsert" && record.op !== "remove") return undefined;
-    const task = record.task as Record<string, unknown> | undefined;
+    const task = record.task;
     const key = typeof record.key === "string" ? record.key : undefined;
     if (record.op === "remove") {
       return {
@@ -1145,8 +1144,8 @@ export function parseActivityLine(line: string): ActivityEntry | undefined {
     // fold can actually turn it into a row (an event key plus a payload that
     // still validates under the current limits). `readPersistedTask` is the
     // SAME reader `fold()` uses, so a line the fold reports in `skipped` can
-    // no longer refresh an owner's takeover clock (ARCHITECTURE.md "one clock,
-    // not two").
+    // no longer refresh an owner's takeover clock (ARCHITECTURE.md "Identity &
+    // takeover").
     if (key !== undefined && task !== undefined) {
       const plain = readPersistedTask(task);
       if (plain !== undefined) {
