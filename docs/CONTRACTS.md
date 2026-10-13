@@ -53,12 +53,13 @@
   send time, minus the sender) and persists it **even when empty**, so an owner
   who joins later is neither counted as addressed nor able to pin it.
 - **Retention.** The default view (widget / reminder / `tower_do_status` /
-  `inbox`) keeps at most an internal budget of **fully read** messages, where
-  fully read means every addressee has acked (a broadcast: its whole audience).
-  Unread traffic therefore never exits on the budget; mail nobody acks —
-  including mail whose recipient is unreachable — leaves the default view only
-  through the age valve (14 days). The disk and `inbox all: true` always keep
-  it.
+  `inbox`) keeps at most the internal `MESSAGE_RETENTION`, and only **fully
+  read** messages — every addressee has acked; for a broadcast, its whole
+  audience — are dropped to get there. Unread traffic therefore never exits on
+  the budget; mail nobody acks, including mail whose recipient is unreachable,
+  leaves the default view only through the age valve (14 days), so an unread
+  message occupies one slot until then even when nobody can read it. The disk
+  and `inbox all: true` always keep it.
 - `inbox` returns messages addressed to the caller (or `all`), newest first, and
   marks the ones it shows as read (`readBy`). `all: true` includes
   view-retired messages; the disk never deletes them.

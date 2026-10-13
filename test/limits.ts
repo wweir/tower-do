@@ -130,10 +130,10 @@ async function main(): Promise<void> {
     parameters: unknown;
     execute: (
       id: string,
-      params: never,
+      params: unknown,
       signal: AbortSignal | undefined,
       onUpdate: unknown,
-      ctx: never,
+      ctx: unknown,
     ) => Promise<{ content: Array<{ type: "text"; text: string }> }>;
   };
   const handlers = new Map<string, Handler>();
@@ -177,7 +177,7 @@ async function main(): Promise<void> {
     const def = tools.get("tower_do")!;
     const result = await def.execute(
       "call-1",
-      params as never,
+      params,
       undefined,
       undefined,
       ctx,

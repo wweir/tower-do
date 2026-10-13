@@ -93,9 +93,10 @@ Two event kinds are appended (one JSON line each):
   never blocked.
 - **View layers** — removed (the dashboard renders open tasks plainly).
 - **Message retirement** (`retainMessages`): fully read = every addressee has
-  acked (a broadcast: its whole audience). Acked history past the internal
-  retention budget leaves the default view; unread mail never exits on the
-  budget and retires only through the age valve.
+  acked (a broadcast: its whole audience). The view keeps at most the internal
+  retention budget and drops only fully-read rows to get there, so unread mail
+  never exits on the budget (it occupies a slot until the age valve) and
+  retires only through the age valve.
 
 ## Widget & reminder
 

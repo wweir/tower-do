@@ -260,12 +260,11 @@ const boards = new BoardCache();
  * `ctx` MUST be the calling session's own context. This used to read a
  * module-level `lastContext` that every `towerDoExtension(pi)` call in the
  * process overwrote, so a nested session (a subagent task session, which pi
- * runs in-process) silently re-labelled its PARENT: the parent's heartbeat
- * wrote the child's identity, the board reminder announced the child's
- * identity, `as`-less writes were attributed to the child, and the parent's
- * own tasks lost their liveness protection (a live owner looked idle and
- * became displaceable). Session-scoped state must never live in a module
- * global.
+ * runs in-process) silently re-labelled its PARENT: the board reminder
+ * announced the child's identity, `as`-less writes were attributed to the
+ * child, and the parent's own tasks lost their stale-claim protection (the
+ * takeover clock keyed on the child, so a live owner looked idle and became
+ * displaceable). Session-scoped state must never live in a module global.
  */
 function sessionIdentity(
   cwd: string | undefined,
@@ -865,10 +864,17 @@ export default function towerDoExtension(pi: ExtensionAPI): void {
         // now observes, not the prediction (fold revision + events): a peer
         // process can append between this fold and this batch, and the caller
         // will pass the returned revision back as its next baseRevision.
-        const observed =
-          details.taskEvents.length === 0
-            ? details.view
-            : cloneBoard(await foldRetained(ctx.cwd));
+        let observed = details.view;
+        if (details.taskEvents.length > 0) {
+          // The batch has ALREADY landed, so a read failure here must not be
+          // reported as a failed write (the caller would retry a write the
+          // board accepted). Fall back to the produced view in that case.
+          try {
+            observed = cloneBoard(await foldRetained(ctx.cwd));
+          } catch {
+            observed = details.view;
+          }
+        }
         return { details, observed };
         });
         currentView = cloneBoard(observed);
@@ -1328,8 +1334,10 @@ export default function towerDoExtension(pi: ExtensionAPI): void {
       let logBytes = 0;
       let compactRev: number | undefined;
       try {
-        logBytes = statSync(board.file).size;
+        // rawLines first: if the log cannot be read there is nothing to size,
+        // and the `State:` line below must not claim "log 0 line(s) / 12KB".
         rawLines = await board.rawLines();
+        logBytes = statSync(board.file).size;
         const head: unknown = JSON.parse(rawLines[0] ?? "null");
         if (
           head !== null &&

@@ -41,10 +41,10 @@ type ToolDef = {
   name: string;
   execute: (
     id: string,
-    params: never,
+    params: unknown,
     signal: AbortSignal | undefined,
     onUpdate: unknown,
-    ctx: never,
+    ctx: unknown,
   ) => Promise<{ content: Array<{ type: "text"; text: string }> }>;
 };
 
@@ -113,7 +113,7 @@ async function main(): Promise<void> {
 
   const plan = await parent.tools.get("tower_do")!.execute(
     "call-1",
-    { tasks: [{ key: "work", subject: "unfinished work", status: "pending" }] } as never,
+    { tasks: [{ key: "work", subject: "unfinished work", status: "pending" }] },
     undefined,
     undefined,
     parent.ctx,
@@ -165,7 +165,7 @@ async function main(): Promise<void> {
 
   const status = await parent.tools.get("tower_do_status")!.execute(
     "call-2",
-    {} as never,
+    {},
     undefined,
     undefined,
     parent.ctx,
@@ -188,7 +188,7 @@ async function main(): Promise<void> {
   await named.fire("session_start");
   const namedStatus = await named.tools.get("tower_do_status")!.execute(
     "call-3",
-    {} as never,
+    {},
     undefined,
     undefined,
     named.ctx,

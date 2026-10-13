@@ -1003,9 +1003,6 @@ function layer7(): void {
   );
 }
 
-// --- layer 6: session-checkpoint replay (oldest-first branch) ---------------
-// Pi getBranch() is root-to-leaf. Restore must take the LAST valid custom
-// board snapshot, otherwise a later compact's cancelled todos come back.
 async function main(): Promise<void> {
   await layer1();
   layer2();

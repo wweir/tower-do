@@ -107,7 +107,7 @@ async function main(): Promise<void> {
           tasks: [
             {
               key: "a-task",
-              subject: "HACKED-BY-B", // status/owner/scope unchanged
+              subject: "HACKED-BY-B", // status/owner unchanged
               status: "in_progress",
               owner: "A",
             },
@@ -340,8 +340,9 @@ async function main(): Promise<void> {
     wTower.view.tasks.find((t) => t.key === "a-task")?.subject === "S3",
   );
 
-  // Replaying another owner's task with its CURRENT value while touching
-  // one's own is legal (full-replacement semantics require the replay).
+  // Replaying another owner's task with its CURRENT value while touching one's
+  // own is legal: an identical replay is a no-op, so it is not an edit of
+  // theirs.
   const wLegal = writeBoardSnapshot(
     wTower.view,
     {

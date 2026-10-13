@@ -945,8 +945,9 @@ const REMINDER_TASK_LINE_CAP = 12;
 // ---------------------------------------------------------------------------
 
 /**
- * Owners currently on the board (task owners), used to scope broadcast
- * visibility/retirement to the people who can actually act on the message.
+ * Owners currently on the board (task owners): the fallback audience of a
+ * broadcast that predates the send-time snapshot, and therefore part of what
+ * `messagesToMe` shows. Retirement is a pure ack test and does not consult it.
  */
 export function currentOwners(view: TowerBoardView): Set<string> {
   const owners = new Set<string>();
@@ -958,19 +959,19 @@ export function currentOwners(view: TowerBoardView): Set<string> {
 
 /**
  * The audience a broadcast addresses: its send-time snapshot when present,
- * else the owners currently on the board (sender excluded). A broadcast is
- * visible to — and retired only after being read by — this set.
+ * else the owners currently on the board (sender excluded). Visibility and
+ * fullness (read = the whole audience acked) both read this set.
  */
 function broadcastAudience(
   message: TowerDoMessage,
   view: TowerBoardView,
 ): Set<string> {
-  // Exclude the sender by AGENT — not exact string — for BOTH the send-time
-  // snapshot and the current-owners fallback. A session that migrated from a
-  // legacy label sends as its current label, so the audience it persisted can
-  // name its own older label; that label can never ack (a self-broadcast never
-  // reaches its own inbox), which would pin the broadcast outside the
-  // retention budget forever.
+  // The sender is excluded by exact identity from BOTH the send-time snapshot
+  // and the current-owners fallback: a self-broadcast never reaches its own
+  // inbox, so counting the sender as a pending reader would mean no broadcast
+  // could ever be fully read. Identity has no aliasing (CONTRACTS.md), so an
+  // audience entry the sender cannot ack can only be a legacy label — and that
+  // is bounded by the age valve, not by this filter.
   const owners = [...(message.audience ?? currentOwners(view))].filter(
     (owner) => owner !== message.from,
   );
@@ -1044,13 +1045,15 @@ export function isMessageFullyRead(
 }
 
 /**
- * Retire ACKED history: keep at most `retention` fully-read messages (oldest
- * first) once the folded set exceeds the budget. Unread messages always
- * survive the budget — retiring them would silently swallow traffic a peer has
- * not seen — and leave the DEFAULT view only through the age valve
- * (`MESSAGE_PENDING_RETIRE_MS`; disk and `inbox all` keep them). retention 0 =
- * keep everything (legacy). Returns a NEW messages array; the input view is
- * not mutated.
+ * Retire ACKED history: the folded view keeps at most `retention` messages, and
+ * only FULLY READ ones (oldest first) are dropped to get there. Unread
+ * messages always survive that budget — retiring them would silently swallow
+ * traffic a peer has not seen — and leave the DEFAULT view only through the age
+ * valve (`MESSAGE_PENDING_RETIRE_MS`; disk and `inbox all` keep them). An
+ * unread message therefore occupies a slot until the age valve even when nobody
+ * can read it (reachability is deliberately not guessed), which can push acked
+ * history out one slot early. retention 0 = keep everything (legacy). Returns a
+ * NEW messages array; the input view is not mutated.
  */
 export function retainMessages(
   messages: readonly TowerDoMessage[],
