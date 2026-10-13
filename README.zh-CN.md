@@ -66,9 +66,7 @@ Pi 启动时自动发现该扩展；已有 session 用 `/reload` 生效。
 { "identity": "team-orchestrator" }
 ```
 
-| key | 默认 | 含义 |
-| --- | --- | --- |
-| `identity` | session name/id | 固定本 session 的看板身份（全局，对所有项目生效）；不能是保留的编排者身份 `tower` |
+字段与校验规则见 [docs/OPERATIONS.md](docs/OPERATIONS.md#configuration)。
 
 ## 工作原理
 

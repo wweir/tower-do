@@ -82,9 +82,8 @@ project). No environment variables.
 { "identity": "team-orchestrator" }
 ```
 
-| key | default | meaning |
-| --- | --- | --- |
-| `identity` | session name/id | pin this session's board identity (global, applies to every project); must not be the reserved orchestrator identity `tower` |
+The field and its validation rules are documented in
+[docs/OPERATIONS.md](docs/OPERATIONS.md#configuration).
 
 ## How it works
 
