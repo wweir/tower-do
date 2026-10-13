@@ -36,7 +36,6 @@ import { StringEnum } from "@earendil-works/pi-ai";
 import {
   DEFAULT_MAX_BYTES,
   DEFAULT_MAX_LINES,
-  keyHint,
   truncateTail,
   withFileMutationQueue,
   type ExtensionAPI,
@@ -62,6 +61,7 @@ import {
 import {
   cloneBoard,
   createEmptyBoard,
+  currentOwners,
   DEFAULT_IDENTITY,
   findAllUnresolvedDeps,
   formatActivityFeed,
@@ -92,7 +92,7 @@ import {
   taskIsBlocked,
   readByWith,
   TASK_KEY_PATTERN,
-  textLength,
+  TASK_STATUS_GLYPHS,
   transportLimit,
   TOWER_DO_REMINDER_TYPE,
   TOWER_DO_STATUS_TOOL_NAME,
@@ -301,22 +301,13 @@ function resolveCaller(
   ctx: ExtensionContext | undefined,
 ): string {
   const caller = as?.trim();
+  // A blank `as` behaves as absent (unlike a validated identity FIELD, where
+  // blank is a hard error).
   if (!caller) return sessionIdentity(cwd, pi, ctx);
-  if (/[\r\n\u2028\u2029]/.test(caller)) {
-    throw new TowerDoValidationError("as must be a single line");
-  }
-  const callerLength = textLength(caller);
-  if (callerLength > MAX_IDENTITY_CHARS) {
-    throw new TowerDoValidationError(
-      `as is ${callerLength} characters (max ${MAX_IDENTITY_CHARS}) — shorten it`,
-    );
-  }
-  if (caller === "all") {
-    throw new TowerDoValidationError(
-      'as must not be the reserved broadcast recipient "all"',
-    );
-  }
-  return caller;
+  // One identity rule, in one place: `normalizeIdentity` owns the single-line,
+  // length, reserved-name and NUL checks (a NUL can collide with the
+  // `owner\0taskKey` claim key).
+  return normalizeIdentity(caller, "as");
 }
 
 // ---------------------------------------------------------------------------
@@ -511,13 +502,6 @@ const StatusParamsSchema = Type.Object({
 // Formatting
 // ---------------------------------------------------------------------------
 
-const STATUS_GLYPH: Record<TowerDoStatus, string> = {
-  completed: "✓",
-  in_progress: "◐",
-  pending: "○",
-  blocked: "✗",
-};
-
 /** Theme color for a task status glyph. Shared by the widget and renderCall. */
 function statusColor(
   status: TowerDoStatus,
@@ -585,7 +569,7 @@ function formatChange(
     const task = byKey.get(key);
     if (task) {
       lines.push(
-        `[added] ${STATUS_GLYPH[task.status]} ${taskLine(task)}`,
+        `[added] ${TASK_STATUS_GLYPHS[task.status]} ${taskLine(task)}`,
       );
     }
   }
@@ -593,23 +577,15 @@ function formatChange(
 }
 
 function ensureKnown(
-  view: TowerBoardView,
+  /** Addressable identities (knownIdentities: owners + recent activity). */
+  known: ReadonlySet<string>,
   recipient: string,
-  /** Identities from recent board activity (see knownIdentities). */
-  activity: ReadonlySet<string>,
 ): void {
   // "all" broadcasts; the orchestrator identity is always addressable.
   if (recipient === "all" || recipient === TOWER_IDENTITY) return;
-  const known = new Set([
-    ...view.tasks
-      .map((task) => task.owner)
-      .filter((owner): owner is string => owner !== undefined),
-    ...activity,
-  ]);
   if (!known.has(recipient)) {
-    const knownNames = [...known].join(", ");
     throw new TowerDoValidationError(
-      `unknown recipient "${recipient}" — address "all", ${TOWER_IDENTITY}, a current task owner, or someone with recent board activity (known: ${knownNames || "(none)"})`,
+      `unknown recipient "${recipient}" — address "all", ${TOWER_IDENTITY}, a current task owner, or someone with recent board activity (known: ${[...known].join(", ") || "(none)"})`,
     );
   }
 }
@@ -625,8 +601,9 @@ export default function towerDoExtension(pi: ExtensionAPI): void {
   let uiContext: ExtensionContext | undefined;
   let activeCwd: string | undefined;
   // This instance's own session context (per `towerDoExtension` call), for the
-  // identity fallback and the paths that run without a ctx in hand (heartbeat
-  // timer, context hook). Instance-scoped on purpose — see sessionIdentity.
+  // identity fallback and the paths that run without a ctx in hand (the
+  // context hook, the widget repaint). Instance-scoped on purpose — see
+  // sessionIdentity.
   let selfCtx: ExtensionContext | undefined;
 
   // -------------------------------------------------------------------------
@@ -718,11 +695,9 @@ export default function towerDoExtension(pi: ExtensionAPI): void {
               const ordered = [...unfinished].sort(
                 (a, b) => b.updatedAt - a.updatedAt || (a.key < b.key ? -1 : 1),
               );
-              const cap =
-                activeCwd === undefined ? ordered.length : WIDGET_TASK_LIMIT;
-              const shown = ordered.slice(0, cap);
+              const shown = ordered.slice(0, WIDGET_TASK_LIMIT);
               for (const task of shown) {
-                const glyph = STATUS_GLYPH[task.status];
+                const glyph = TASK_STATUS_GLYPHS[task.status];
                 const color = statusColor(task.status);
                 const owner =
                   task.owner === undefined
@@ -843,7 +818,7 @@ export default function towerDoExtension(pi: ExtensionAPI): void {
       throwIfAborted(signal, "TowerDo update");
       const { board, caller } = await prepare(ctx, params.as);
       return withFileMutationQueue(board.file, async () => {
-        const { details } = await board.withWrite(async (appendLocked) => {
+        const { details, observed } = await board.withWrite(async (appendLocked) => {
         // Re-fold inside both queues: the revision guard must observe peer
         // appends before it decides whether the write is stale.
         throwIfAborted(signal, "TowerDo update");
@@ -885,17 +860,26 @@ export default function towerDoExtension(pi: ExtensionAPI): void {
         );
         throwIfAborted(signal, "TowerDo update");
         await appendLocked(details.taskEvents);
-        return { details, activity };
+        // A no-op write appended nothing, so its own produced view IS the
+        // board. A write that appended must report the revision a fresh fold
+        // now observes, not the prediction (fold revision + events): a peer
+        // process can append between this fold and this batch, and the caller
+        // will pass the returned revision back as its next baseRevision.
+        const observed =
+          details.taskEvents.length === 0
+            ? details.view
+            : cloneBoard(await foldRetained(ctx.cwd));
+        return { details, observed };
         });
-        currentView = cloneBoard(details.view);
+        currentView = cloneBoard(observed);
         llmCallsSinceReminder = 0;
         updateWidget(ctx);
-        const base = formatChange(details.view, caller, details.change);
+        const base = formatChange(observed, caller, details.change);
         return {
           content: [{ type: "text", text: base }],
           details: {
             caller,
-            revision: details.view.revision,
+            revision: observed.revision,
             change: details.change,
           },
         };
@@ -922,7 +906,7 @@ export default function towerDoExtension(pi: ExtensionAPI): void {
         if (typeof task.key !== "string" || typeof task.subject !== "string")
           continue;
         const status = isTowerDoStatus(task.status) ? task.status : "pending";
-        const glyph = STATUS_GLYPH[status];
+        const glyph = TASK_STATUS_GLYPHS[status];
         const color = statusColor(status);
         // `as` overrides the session identity for this call; trimmed to
         // match resolveCaller on the execute side.
@@ -1065,7 +1049,7 @@ export default function towerDoExtension(pi: ExtensionAPI): void {
           // Reachable recipients: current owners PLUS anyone with recent board
           // activity — a peer whose tasks are all completed is no longer an
           // owner but exactly who hand-off coordination needs to reach.
-          let recentActivity = new Set<string>();
+          let knownRecipients = currentOwners(fresh);
           try {
             // FULL log, not a bounded tail: a 200-line window can fall behind
             // a churny fleet and turn a recently active peer into an "unknown
@@ -1076,17 +1060,21 @@ export default function towerDoExtension(pi: ExtensionAPI): void {
               const entry = parseActivityLine(line);
               if (entry !== undefined) parsed.push(entry);
             }
-            recentActivity = knownIdentities(fresh, parsed);
+            knownRecipients = knownIdentities(fresh, parsed);
           } catch {
-            // No/unreadable activity log: owners only.
+            // Unreadable log: the current owners are who is left to address.
           }
-          ensureKnown(fresh, to, recentActivity);
+          ensureKnown(knownRecipients, to);
           // Snapshot the broadcast audience (owners at send time, sender
           // excluded) so full-read / retirement uses the people who were
           // actually addressed — an owner joining later never read it and
           // must not keep the broadcast alive forever. Deduped: an owner
           // holding several tasks would otherwise repeat in the persisted
           // audience.
+          // Persist the snapshot even when it is EMPTY: omitting it would be
+          // indistinguishable from a legacy pre-audience broadcast, which the
+          // fold back-fills with whoever owns a row LATER — turning "addressed
+          // nobody" into "addresses newcomers" (CONTRACTS.md broadcasts).
           const audience =
             to === "all"
               ? [
@@ -1102,9 +1090,7 @@ export default function towerDoExtension(pi: ExtensionAPI): void {
               : undefined;
           const message: TowerDoMessage = {
             ...messageBase,
-            ...(audience === undefined || audience.length === 0
-              ? {}
-              : { audience }),
+            ...(audience === undefined ? {} : { audience }),
           };
           throwIfAborted(signal, "TowerDo talk");
           await appendLocked([
@@ -1204,9 +1190,12 @@ export default function towerDoExtension(pi: ExtensionAPI): void {
         ) {
           return inboxResult(peek, peekMine, new Set());
         }
-        // There IS something to ack: the fold, the ack set and the append must
-        // be one atomic step across processes, or two peers acking the same
-        // message lose one `readBy` entry to last-write-wins.
+        // There IS something to ack: the fold, the ack set and the append run
+        // inside ONE write chain, so no LOCAL writer can slip in between. Two
+        // PROCESSES acking the same message concurrently can still lose one
+        // `readBy` entry (last-write-wins past the atomic append): an ack is
+        // advisory — the message simply stays unread until it is re-read, and
+        // the age valve bounds it.
         return board.withWrite(async (appendLocked) => {
           throwIfAborted(signal, "TowerDo talk");
           const fresh = await readFold();
@@ -1332,16 +1321,33 @@ export default function towerDoExtension(pi: ExtensionAPI): void {
       // "last updated" line, so it is parsed once.
       const tailCount = STATUS_ACTIVITY_TAIL;
       const now = Date.now();
-      let rawTail: string[] = [];
+      // ONE read of the log serves the activity tail, the total line count and
+      // the legacy compact header below — fold() has already read the same
+      // bytes, so a second and third read is pure waste at any log size.
+      let rawLines: string[] = [];
+      let logBytes = 0;
+      let compactRev: number | undefined;
       try {
-        rawTail = (await board.rawTail(tailCount)).reverse();
+        logBytes = statSync(board.file).size;
+        rawLines = await board.rawLines();
+        const head: unknown = JSON.parse(rawLines[0] ?? "null");
+        if (
+          head !== null &&
+          typeof head === "object" &&
+          (head as { kind?: unknown }).kind === "compact" &&
+          typeof (head as { revision?: unknown }).revision === "number"
+        ) {
+          compactRev = (head as { revision: number }).revision;
+        }
       } catch {
-        // Missing/unreadable log → empty activity; the folded view still renders.
+        // Missing/unreadable log → no activity; the folded view still renders.
       }
-      const parsedEntries = rawTail
+      const parsedEntries = rawLines
+        .slice(-tailCount)
+        .reverse()
         .map((line) => parseActivityLine(line))
         .filter((entry): entry is ActivityEntry => entry !== undefined);
-      const recentEntries = parsedEntries.slice(0, tailCount);
+      const recentEntries = parsedEntries;
       const lastWrite = latestActivity(parsedEntries);
 
       // Totals BEFORE the page slice: the section headers must not report a
@@ -1466,45 +1472,15 @@ export default function towerDoExtension(pi: ExtensionAPI): void {
           "⚠ the board file is missing — this is an empty fold. Writes treat the missing file as an empty board.",
         );
       }
-      // Board exit / log observability (Layer C): make "which board is growing"
-      // a fact instead of something the user has to find in ~/.pi/tower-do.
-      let logLines = 0;
-      let logBytes = 0;
-      let compactRev: number | undefined;
-      try {
-        const size = statSync(board.file).size;
-        const allLines = await board.rawLines();
-        logLines = allLines.length;
-        logBytes = size;
-        try {
-          const head: unknown = JSON.parse(allLines[0] ?? "null");
-          if (
-            head !== null &&
-            typeof head === "object" &&
-            (head as { kind?: unknown }).kind === "compact" &&
-            typeof (head as { revision?: unknown }).revision === "number"
-          ) {
-            compactRev = (head as { revision: number }).revision;
-          }
-        } catch {
-          // Legacy log without a compact header.
-        }
-      } catch {
-        // Missing/unreadable board: leave the counters at zero.
-      }
+      // Log observability: make "which board is growing" a fact instead of
+      // something the user has to find in ~/.pi/tower-do.
+      const logLines = rawLines.length;
       if (logLines > 0 || logBytes > 0) {
         lines.push(
           `State: ${basename(dirname(board.file))} · log ${String(logLines)} line(s) / ${(logBytes / 1024).toFixed(0)}KB` +
             (compactRev === undefined
               ? ""
               : ` · compact rev ${String(compactRev)}`),
-        );
-      }
-      // Compaction is gone, so a large log is expected — only unfoldable
-      // lines are worth surfacing (data the board holds and nobody can see).
-      if (view.skipped > 0) {
-        lines.push(
-          `Log holds unfoldable data: ${String(view.skipped)} line(s) cannot be folded (of ${String(logLines)} lines, ${(logBytes / (1024 * 1024)).toFixed(1)}MB)`,
         );
       }
       // D4: board liveness at a glance. revision is monotonic but silent —
@@ -1552,7 +1528,7 @@ export default function towerDoExtension(pi: ExtensionAPI): void {
             : [];
         const blockedSuffix =
           blockers.length > 0 ? ` [blocked by: ${blockers.join(",")}]` : "";
-        return `- ${STATUS_GLYPH[shownStatus]} ${task.key}: ${task.subject}${owner}${deps}${blockedSuffix}`;
+        return `- ${TASK_STATUS_GLYPHS[shownStatus]} ${task.key}: ${task.subject}${owner}${deps}${blockedSuffix}`;
       };
       // Open tasks first, then a compact ledger of completed receipts: their
       // subject is one `taskKey` lookup away, and rendering them per row would
@@ -1605,9 +1581,9 @@ export default function towerDoExtension(pi: ExtensionAPI): void {
       const cut = truncateTail(full, { maxBytes: DEFAULT_MAX_BYTES });
       // truncateTail keeps the TAIL and drops the head — which is exactly where
       // the revision, the board file path and the open-task rows live (open
-      // groups render first). An unmarked cut would silently cost the caller
-      // rows it must name in its next full-replacement write, so the surviving
-      // tail carries the essentials plus an explicit warning. The warning is
+      // groups render first). An unmarked cut would silently hide open rows
+      // from its caller, so the surviving tail carries the essentials plus an
+      // explicit warning. The warning is
       // part of the same budget: the body is re-cut with room reserved for it
       // in BOTH bounds (bytes and one line), so the note can never be the row
       // that pushes the result past what this call promised.
@@ -1665,20 +1641,13 @@ export default function towerDoExtension(pi: ExtensionAPI): void {
         typeof details.identity === "string"
           ? details.identity
           : sessionIdentity(activeCwd, pi, selfCtx);
-      const visible = lines;
-      let rendered = visible
+      const rendered = lines
         .map((line) =>
           !context.isError && isCallerLine(line, caller)
             ? theme.fg("accent", theme.bold(line))
             : theme.fg(context.isError ? "error" : "toolOutput", line),
         )
         .join("\n");
-      if (visible.length < lines.length) {
-        rendered += theme.fg(
-          "dim",
-          `\n… ${lines.length - visible.length} more (${keyHint("app.tools.expand", "expand")})`,
-        );
-      }
       text.setText(rendered);
       return text;
     },

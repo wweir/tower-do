@@ -1,14 +1,12 @@
 /**
  * tower-do ownership-guard regression — proves the guard covers EVERY field
- * of an owned task (subject/description/status/owner/dependsOn/scope/
- * blockedBy), not just status/owner/scope.
+ * of an owned task (subject/description/status/owner/dependsOn/blockedBy),
+ * not just status/owner.
  *
- * Bug context (Bug-1/Bug-2): the old guard compared only status/owner/scope.
- * Because tower_do is a FULL replacement, a worker who wanted to touch its
- * own task had to replay the whole board — and while replaying could
- * silently rewrite ANOTHER owner's content (subject/deps/blockedBy/…) or
- * roll back its concurrent update with a stale snapshot, because content
- * fields were unguarded. This file locks the fix.
+ * Bug context (Bug-1/Bug-2): the old guard compared only status/owner. A
+ * worker writing the board could silently rewrite ANOTHER owner's content
+ * (subject/deps/blockedBy/…) or roll back its concurrent update with a stale
+ * snapshot, because content fields were unguarded. This file locks the fix.
  *
  * It also locks the takeover exception to the ROW: staleness is derived per
  * owner+task, so an owner stalled on one row must stay protected on the row it

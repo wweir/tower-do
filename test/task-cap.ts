@@ -1,8 +1,7 @@
 /**
  * tower-do open-task budget regression.
  *
- * Bug context (f-902d6eb6-4ab): the batch cap (`MAX_TOWER_DO_TASKS`) counted
- * EVERY row, so a board whose 50 rows were all completed became unwritable for
+ * Bug context: the batch cap counted EVERY row, so a board whose 50 rows were all completed became unwritable for
  * any session that was neither the owner of a row nor `tower`: adding a task
  * needed a 51st row, and freeing a row was rejected by the completed-row
  * owner guard. Real boards reached exactly that state, and sessions dropped
@@ -16,8 +15,8 @@
  *      long the history. Only fabricated history is bounded — at most the open
  *      quota of NEW completed keys per write.
  *   4. The completed-row owner guard is unchanged (receipt integrity), and
- *      the cap error names the remediation (drop own/unowned rows, compact
- *      as "tower").
+ *      the cap error names the remediation (complete or remove an open row
+ *      first).
  *
  * Run: bun test/task-cap.ts
  */

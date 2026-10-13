@@ -30,23 +30,19 @@
  *   4. the documented remedy works: omitting a field on an existing task
  *      preserves the stored value, and a rejected write changes nothing.
  *
- * Run with: bun run test/limits.ts
+ * Run with: bun test/limits.ts
  */
 import { mkdtempSync } from "node:fs";
 import { tmpdir } from "node:os";
 import { join } from "node:path";
 
-import { Type } from "typebox";
 import { Value } from "typebox/value";
 
 import { TowerBoard } from "../board.ts";
 import {
   MAX_BLOCKER_CHARS,
-  MAX_CHANGED_FILES,
   MAX_IDENTITY_CHARS,
   MAX_MESSAGE_SUBJECT_CHARS,
-  MAX_PATH_ENTRY_CHARS,
-  MAX_SCOPE_GLOBS,
   MAX_TASK_BLOCKERS,
   MAX_TASK_DEPENDENCIES,
   MAX_TASK_DESCRIPTION_CHARS,
@@ -496,7 +492,8 @@ async function main(): Promise<void> {
   // -------------------------------------------------------------------------
   check(
     "subject: emptiness is the fold's rule (no schema minLength to pre-empt it)",
-    item.properties.subject.minLength === undefined,
+    (item.properties.subject as { minLength?: unknown }).minLength ===
+      undefined,
   );
   const current = await fold();
   await expectThrows(

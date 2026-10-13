@@ -1,21 +1,17 @@
 /**
- * tower-do presence + message-retention regression — locks the interaction
+ * tower-do message + activity-annotation regression — locks the interaction
  * layer added on top of the board:
  *
  *  1. read/ack: messages carry `readBy`; inbox reads append an ack (LWW by
- *     message id), broadcast senders are excluded from "who must read", so
- *     broadcasts can retire.
- *  2. retention / exit: fully-read history beyond the budget is retired from
- *     every view, while unread / partially-read traffic always survives.
- *  3. presence: who-is-around is DERIVED from the activity log (zero writes —
- *     a pure read must never mark the reader as active), and idle owners are
- *     flagged.
- *  4. activity rendering: raw JSON event lines fold into compact human lines.
- *  5. backward compatibility: pre-readBy persisted messages stay valid.
- *  6. session checkpoints: restore takes the latest valid compact snapshot
- *     (getBranch is oldest-first), never an earlier cancelled board.
+ *     message id); broadcast senders are excluded from "who must read", so a
+ *     broadcast retires once its audience has read it.
+ *  2. retention / exit: the budget retires ACKED history only; unread traffic
+ *     survives it and leaves the default view through the age valve alone.
+ *  3. activity rendering: raw JSON event lines fold into compact human lines,
+ *     with session-break separators and the latest-write summary.
+ *  4. backward compatibility: pre-readBy persisted messages stay valid.
  *
- * Run: bun test/presence-retention.ts
+ * Run: bun test/message-retention.ts
  */
 import { mkdtempSync } from "node:fs";
 import { tmpdir } from "node:os";
@@ -31,6 +27,7 @@ import {
   isMessageFullyRead,
   knownIdentities,
   latestActivity,
+  MESSAGE_PENDING_RETIRE_MS,
   parseActivityLine,
   relativeTime,
   retainMessages,
@@ -231,7 +228,7 @@ async function layer1(): Promise<void> {
   );
 }
 
-// --- layer 2: activity + presence derivation ---------------------------------
+// --- layer 2: activity + latest-write derivation -----------------------------
 
 function layer2(): void {
   const now = Date.now();
@@ -287,7 +284,7 @@ function layer2(): void {
   );
   check("activity empty line skipped", parseActivityLine("  ") === undefined);
   // A task line the fold would reject (op is neither upsert nor remove) must
-  // not count as ownership activity: presence and the fold read one clock.
+  // not count as ownership activity: the parser and the fold read one clock.
   check(
     "activity rejects a task line with an invalid op (fold/reachability agree)",
     parseActivityLine(
@@ -324,25 +321,6 @@ function layer2(): void {
     relativeTime(now, now - 60_000) === "1m ago",
     relativeTime(now, now - 60_000),
   );
-
-  // Presence is derived from events only (a status read must not self-mark).
-  // Three distinct owners: alice (active just now), carol (worked 12m ago —
-  // past the 10m idle threshold → genuinely idle), dave (owns a task but has
-  // NEVER acted → unstarted, NOT idle).
-  const idleEvent = JSON.stringify({
-    kind: "task",
-    op: "upsert",
-    key: "stale",
-    task: {
-      key: "stale",
-      subject: "stale owned task",
-      status: "in_progress",
-      owner: "carol",
-      updatedAt: now - 720_000,
-    },
-    by: "carol",
-    at: now - 720_000,
-  });
 
   // --- feed rendering: session-break separators + latest-write summary ---
   // All times are newest-first (the status tool reverses the raw tail). A
@@ -467,14 +445,15 @@ async function layer3(): Promise<void> {
   );
 
   // Re-emit the same id with readBy (an ack) → LWW replaces, not duplicates.
-  const acked = { ...legacy, readBy: ["bob"] };
+  const acked: TowerDoMessage = { ...legacyRaw, readBy: ["bob"] };
   await board.append([
     { kind: "message", message: acked, by: "bob", at: Date.now() },
   ]);
   view = await board.fold();
   check(
     "ack re-emit LWW-replaces by id (no duplicate rows)",
-    view.messages.length === 1 && view.messages[0]?.readBy?.includes("bob"),
+    view.messages.length === 1 &&
+      (view.messages[0]?.readBy?.includes("bob") ?? false),
   );
   check(
     "ack turns a message fully read",
@@ -490,8 +469,6 @@ async function layer3(): Promise<void> {
 function layer5(): void {
   const header = "TowerDo shared board — identity alice, revision 4";
   const headerOther = "TowerDo shared board — identity alice-2, revision 4";
-  const ownPresence = "- alice (me) — last seen 5m ago";
-  const otherPresence = "- alice-2 — last seen 5m ago";
   const ownTask = "- ◐ key: subject @alice (me)";
   const otherTask = "- ◐ key: subject @alice-2 (me)";
   const msgs = "## Messages for alice (1; 0 unread)";
@@ -505,11 +482,6 @@ function layer5(): void {
   check(
     "suffix caller matches its own full identity",
     isCallerLine(headerOther, "alice-2"),
-  );
-  check("caller presence line matches", isCallerLine(ownPresence, "alice"));
-  check(
-    "caller presence does not match @owner suffix collision",
-    !isCallerLine(otherPresence, "alice"),
   );
   check("caller task owner matches", isCallerLine(ownTask, "alice"));
   check(
@@ -600,14 +572,15 @@ function layer5(): void {
   );
 }
 
-// --- layer 4: orphan / audience retirement semantics -------------------------
-// Two ways a message can become unreadable forever; both must retire instead
-// of pinning the retention budget:
-//  P1: a broadcast whose audience (owners at send time) has all left the
-//      board — fold back-fills the audience snapshot for pre-audience logs so
-//      a LATER-joining owner cannot keep it alive.
-//  P2: an addressed message whose recipient left the board — nobody can ever
-//      read it, so it counts as fully read.
+// --- layer 4: audience snapshot + unread retention semantics ----------------
+// Two audience facts must hold without ever retiring unread mail early:
+//  P1: a broadcast's audience is the owners at SEND time — fold back-fills the
+//      snapshot for pre-audience logs, so a LATER-joining owner cannot keep an
+//      old broadcast alive.
+//  P2: a message is fully read only when its addressee ACKS it. An unread
+//      message whose recipient is unreachable leaves the default view through
+//      the age valve alone, never through the retention budget — the budget
+//      may retire only acked history.
 
 async function layer4(): Promise<void> {
   const dir = mkdtempSync(join(tmpdir(), "tower-retire-"));
@@ -656,14 +629,13 @@ async function layer4(): Promise<void> {
   await board.append(details.taskEvents);
   view = await board.fold();
   const orphan = view.messages.find((m) => m.id === "m-to-bob");
+  // Nobody acked it, so it is NOT fully read — whatever became of the
+  // recipient. This is what keeps "unread mail never exits on the budget"
+  // literally true (CONTRACTS.md "message retention").
   check(
-    "orphan addressed message (recipient gone) counts as fully read",
-    orphan !== undefined && isMessageFullyRead(orphan, view),
+    "orphan addressed message (recipient gone) stays unread",
+    orphan !== undefined && !isMessageFullyRead(orphan, view),
   );
-  // Retention budget 1 with a live unread message competing for the slot:
-  // only the orphan is fully-read, so the budget must retire the orphan and
-  // keep the unread one. budget 0 is legacy keep-everything and would make
-  // this trivially pass — the survivor check is what catches a regression.
   const liveUnread = msg({
     id: "m-live-keep",
     to: "dave",
@@ -671,18 +643,64 @@ async function layer4(): Promise<void> {
     subject: "still waiting",
     at: now + 1,
   });
-  const budgeted = retainMessages([orphan!, liveUnread], view, 1);
+  const ackedHistory = msg({
+    id: "m-acked",
+    to: "dave",
+    from: "eve",
+    subject: "done",
+    at: now + 2,
+    readBy: ["dave"],
+  });
+  // Budget 1 with two UNREAD messages (one orphan) competing with one acked
+  // message: only the acked history is retirable, so it is what the budget
+  // drops and both unread messages survive. budget 0 is legacy
+  // keep-everything and would make this trivially pass — the survivor check is
+  // what catches a regression.
+  const budgeted = retainMessages(
+    [orphan!, liveUnread, ackedHistory],
+    view,
+    1,
+  );
   check(
-    "orphan retires under a selective budget, unread survives",
-    budgeted.length === 1 && budgeted[0]?.id === "m-live-keep",
+    "budget retires acked history only; unread (incl. orphan) survives",
+    budgeted.length === 2 &&
+      !budgeted.some((m) => m.id === "m-acked") &&
+      budgeted.some((m) => m.id === "m-to-bob") &&
+      budgeted.some((m) => m.id === "m-live-keep"),
     `kept ${budgeted.map((m) => m.id).join(",")}`,
   );
-  // `tower` is the reserved orchestrator identity and owns no task by design, so
-  // a reachability proxy based purely on TASK OWNERSHIP classified every
-  // message addressed to it as "nobody can ever read this" — while its own
-  // inbox still reported it unread. Under a retention budget the unread
-  // message was then retired before genuinely-read ones, which is exactly the
-  // "unread traffic survives" guarantee the budget exists to keep.
+  // ...and an unacked message nobody will ever read still leaves the default
+  // view once it is past the age valve.
+  check(
+    "an unread orphan leaves the default view through the age valve",
+    retainMessages(
+      [orphan!],
+      view,
+      1,
+      now + MESSAGE_PENDING_RETIRE_MS + 1,
+    ).length === 0,
+  );
+  // The case a TASK-OWNERSHIP reachability proxy got wrong: a recipient that
+  // owns no row but is legitimately reachable (recent board activity, which
+  // `ensureKnown` accepts) must still not lose unread mail to the budget.
+  const activityOnly = msg({
+    id: "m-activity-only",
+    to: "frank",
+    from: "eve",
+    subject: "handoff",
+    at: now + 4,
+  });
+  check(
+    "unread mail to an activity-only recipient is not retired by the budget",
+    retainMessages([activityOnly, ackedHistory], view, 1).some(
+      (m) => m.id === "m-activity-only",
+    ),
+  );
+  // `tower` is the reserved orchestrator identity and owns no task by design.
+  // A reachability proxy based on TASK OWNERSHIP used to classify every message
+  // addressed to it as "nobody can ever read this" while its own inbox still
+  // reported it unread — and the budget then retired it before genuinely-read
+  // ones. Read state is now the ack list alone, so no carve-out is needed.
   const towerMsg = msg({
     id: "m-tower-unread",
     to: "tower",
@@ -886,9 +904,11 @@ async function layer4(): Promise<void> {
   await board4.append(d4b.taskEvents);
   view4 = await board4.fold();
   const orphanBc = view4.messages.find((m) => m.id === "m-obs");
+  // bob never acked and has left: still UNREAD (never acked), so the budget
+  // cannot retire it — it leaves the default view through the age valve.
   check(
-    "orphaned broadcast (audience members all gone) counts as fully read",
-    orphanBc !== undefined && isMessageFullyRead(orphanBc, view4),
+    "orphaned broadcast (audience all gone) stays unread",
+    orphanBc !== undefined && !isMessageFullyRead(orphanBc, view4),
   );
   // Live audience member still pins the broadcast until they read
   const dir5 = mkdtempSync(join(tmpdir(), "tower-lbc-"));

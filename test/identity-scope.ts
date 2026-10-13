@@ -7,17 +7,16 @@
  * `towerDoExtension(pi)` call in the process overwrote. A child session's
  * restore() therefore re-labelled the parent:
  *   - the parent's board reminder announced the child's identity
- *     ("TowerDo shared board — you are session-<child>"),
- *   - the parent's liveness heartbeat wrote the child's identity, so the
- *     parent's own tasks lost their liveness protection (a live owner reads as
- *     idle and becomes displaceable after the takeover window),
- *   - presence / `live N` merged the two.
+ *     ("TowerDo shared board — you are <child>"),
+ *   - the parent's own tasks lost their stale-claim protection (the takeover
+ *     clock keyed on the child's identity, so a live owner read as idle and
+ *     became displaceable after the takeover window).
  * The TOOL path masked it (prepare() assigned the global to its own ctx right
  * before resolving the caller), which is why writes were still attributed
  * correctly — so this gate drives the REMINDER path, where the wrong identity
  * actually surfaced.
  *
- * Run with: bun run test/identity-scope.ts
+ * Run with: bun test/identity-scope.ts
  */
 import { mkdtempSync } from "node:fs";
 
@@ -143,12 +142,9 @@ async function main(): Promise<void> {
   };
 
   const parentReminder = await reminderOf(parent);
-  check(
-    "bucket siblings in one process get different identities",
-    parentIdentity !== childIdentity &&
-      parentIdentity.slice(0, 8) === childIdentity.slice(0, 8),
-    `${parentIdentity} vs ${childIdentity}`,
-  );
+  // The two ids differ by construction (identity IS the raw session id), so
+  // what needs locking is that the CODE keeps them apart: the parent's own
+  // reminder must announce the parent, never the nested session.
   check(
     "parent reminder still announces the PARENT identity after a nested session started",
     parentReminder.includes(`you are ${parentIdentity}`),
@@ -206,9 +202,9 @@ async function main(): Promise<void> {
   );
   await named.fire("session_shutdown").catch(() => {});
 
-  // Both instances are real extension sessions: they hold live heartbeat
-  // timers and fs watchers, so the test must shut them down (and exit) rather
-  // than wait for an event loop that will never drain.
+  // Both instances are real extension sessions; shut them down before exiting
+  // so session-scoped state (widget, current view) is cleared rather than left
+  // hanging on the mock's event loop.
   await parent.fire("session_shutdown").catch(() => {});
   await child.fire("session_shutdown").catch(() => {});
 

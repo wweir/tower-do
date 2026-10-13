@@ -50,7 +50,15 @@
   chars. `to` must be `all`, `tower`, a current task owner, or an identity with
   recent board activity. Self-send is rejected.
 - A broadcast (`to: "all"`) records the audience snapshot (the board's owners at
-  send time, minus the sender), so an owner who joins later does not pin it.
+  send time, minus the sender) and persists it **even when empty**, so an owner
+  who joins later is neither counted as addressed nor able to pin it.
+- **Retention.** The default view (widget / reminder / `tower_do_status` /
+  `inbox`) keeps at most an internal budget of **fully read** messages, where
+  fully read means every addressee has acked (a broadcast: its whole audience).
+  Unread traffic therefore never exits on the budget; mail nobody acks —
+  including mail whose recipient is unreachable — leaves the default view only
+  through the age valve (14 days). The disk and `inbox all: true` always keep
+  it.
 - `inbox` returns messages addressed to the caller (or `all`), newest first, and
   marks the ones it shows as read (`readBy`). `all: true` includes
   view-retired messages; the disk never deletes them.
@@ -65,6 +73,13 @@
 - `baseRevision`, when passed, must equal the current revision or the write is
   rejected with a "stale tower-do revision" error naming the remedy (re-read
   via `tower_do_status`, merge, retry).
+- A write reports the revision a **fresh fold observes after its append**, never
+  the prediction `read revision + appended events`: that is the value a caller
+  passes back as its next `baseRevision`, so it must be one the file really
+  holds. The fold→append window itself is last-writer-wins — `baseRevision` is
+  conflict awareness against a revision a caller OBSERVED, not a lock, so two
+  writers that folded the same revision can both be accepted (and can both pass
+  a capacity or ownership check).
 - Message traffic never advances the revision.
 
 ## arg schema vs the fold — who enforces what
@@ -85,7 +100,10 @@ Length is measured in Unicode **code points** (`textLength`), not UTF-16 units.
 
 ## Test gate (what must stay green)
 
-`bunx tsc --noEmit -p tsconfig.json` plus, run with `bun <file>`:
+`bunx tsc --noEmit -p tsconfig.json` (src) and `bunx tsc --noEmit -p
+ tsconfig.test.json` (`test/`; it is deliberately outside the main `include`,
+ so a dangling import in a suite is invisible to the first program), plus, run
+ with `bun <file>`:
 
 | Suite | Proves |
 | --- | --- |

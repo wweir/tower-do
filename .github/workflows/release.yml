@@ -40,6 +40,13 @@ jobs:
       - name: Compile check
         run: bunx tsc --noEmit -p tsconfig.json
 
+      # `test/` is deliberately outside the main `include`, so this second
+      # program is the only thing that type-checks it. Three test imports of
+      # symbols deleted in v0.8.0 stayed green for a whole release without it
+      # (bun tolerates a missing named export; tsc does not).
+      - name: Compile check (tests)
+        run: bunx tsc --noEmit -p tsconfig.test.json
+
       - name: Test gate
         run: |
           bun test/smoke.ts

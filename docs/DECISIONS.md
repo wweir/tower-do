@@ -42,6 +42,32 @@ Legacy compatibility: an existing `board.jsonl` still folds. A pre-compaction
 `{kind:"compact"}` header is read, and a legacy `finding` line is ignored
 rather than counted as unfoldable.
 
+## 2026-10 — a write reports the revision a fold observes, not a prediction
+
+`writeBoardSnapshot` returns `fold revision + appended events`, which equals the
+file's revision only if no other process appended in the same window. There is
+deliberately no cross-process lease, so two writers that folded the same
+revision can both pass a capacity or ownership check: `baseRevision` is
+conflict awareness against a revision a caller OBSERVED, not a lock. `tower_do`
+therefore re-folds after a non-empty append and reports THAT revision, so the
+value a caller passes back as `baseRevision` is one the file really holds. The
+decision window itself stays last-writer-wins (CONTRACTS.md "revision gate").
+
+`test/` also moved under the compile gate (`tsconfig.test.json`): it sits
+outside the main `include` on purpose, which is how three imports of symbols
+deleted in v0.8.0 stayed green through a release — bun tolerates a missing named
+export, so only `tsc` can see the difference.
+
+## 2026-10 — unread mail retires by age, never by the budget
+
+"Fully read" is a pure ack test. It used to proxy reachability through task
+ownership ("the recipient owns no row, so nobody can ever read it"), which
+contradicted the documented guarantee that unread traffic survives the
+retention budget, misclassified mail to any recipient admitted only by recent
+board activity, and needed a `tower` carve-out because the orchestrator owns no
+task. An unacked message now leaves the default view only through the age
+valve, which bounds it without guessing.
+
 ## 2026-10 — task writes are upserts, deletion is explicit
 
 A full-replacement write (the caller had to enumerate every key it wanted to

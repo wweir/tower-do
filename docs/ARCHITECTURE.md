@@ -42,10 +42,14 @@ Two event kinds are appended (one JSON line each):
   deletion. A write that changes nothing appends nothing and does not bump the
   revision.
 - `append` is one `open(O_APPEND)` + single `write(2)` call per batch, so
-  concurrent processes cannot interleave inside a batch. **There is no
-  cross-process lease and no log compaction**: the log grows only by the events
-  actually written, and folding a few hundred kilobytes is cheap. A future `gc`
-  is an optimisation, never a correctness requirement.
+  concurrent processes cannot interleave inside a batch. The batch is atomic;
+  the DECISION that produced it is not — a writer folds, decides and appends
+  without holding anything a peer respects, so it must report the revision a
+  fresh fold observes after its append (never a prediction) and `baseRevision`
+  is conflict awareness, not a lock. **There is no cross-process lease and no
+  log compaction**: the log grows only by the events actually written, and
+  folding a few hundred kilobytes is cheap. A future `gc` is an optimisation,
+  never a correctness requirement.
 - `fold()` treats a missing file as an empty board; any other read error throws
   (an unreadable file must not look like a cleared board).
 - **Legacy tolerance.** A pre-compaction `{kind:"compact"}` header from an older
@@ -67,7 +71,9 @@ Two event kinds are appended (one JSON line each):
    `tower`, except a stale non-completed claim.
 4. Compute the capacity, dependency-consistency and cycle checks over the
    **produced board** (existing rows − removals + upserts), not the input list.
-5. Return the produced view, a change summary, and the events to append.
+5. Return the produced view, a change summary, and the events to append
+   (`index.ts` re-folds after a NON-EMPTY append and reports that observed
+   revision, because the produced view's own revision is only a prediction).
 
 ## Identity & takeover
 
@@ -86,9 +92,10 @@ Two event kinds are appended (one JSON line each):
   persisted `blockedBy` field, or unresolved `dependsOn`. A completed task is
   never blocked.
 - **View layers** — removed (the dashboard renders open tasks plainly).
-- **Message retirement** (`retainMessages`): fully-read history past the
-  internal retention budget leaves the default view; unread mail never exits on
-  the budget, though unread mail nobody acks retires after the age valve.
+- **Message retirement** (`retainMessages`): fully read = every addressee has
+  acked (a broadcast: its whole audience). Acked history past the internal
+  retention budget leaves the default view; unread mail never exits on the
+  budget and retires only through the age valve.
 
 ## Widget & reminder
 

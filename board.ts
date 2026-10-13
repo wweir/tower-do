@@ -15,6 +15,15 @@
  * cheap. A future `gc` can be added with its own concurrency proof, but it is
  * an optimisation, never a correctness requirement.
  *
+ * The batch append is atomic; the DECISION that produced it is not. A writer
+ * folds, decides and appends without holding anything a peer respects, so two
+ * writers that folded the same revision can both pass a capacity or ownership
+ * check — `baseRevision` is conflict awareness against a revision a writer
+ * OBSERVED, not a lock. A caller must therefore read back the revision the
+ * file reports after appending rather than predict it: index.ts re-folds after
+ * a write that appended something, and CONTRACTS.md "revision gate" states
+ * the bound.
+ *
  * Readers never lock and never mutate. `fold()` treats a missing file as an
  * empty board; any other read error throws (an unreadable file must not look
  * like a cleared board).
@@ -56,12 +65,23 @@ function errorCode(error: unknown): string | undefined {
 }
 
 /** One O_APPEND write per batch: the kernel appends the whole buffer before
- *  any other O_APPEND writer can, so a peer never sees half a batch. */
+ *  any other O_APPEND writer can, so a peer never sees half a batch.
+ *
+ *  A short write is fatal, not silent: the batch did not land as one line per
+ *  event, and the missing trailing newline makes the NEXT append concatenate
+ *  onto this batch's last line — two events unparseable forever (fold
+ *  `skipped`) while the write reported success. Fail loud instead. */
 async function appendBatch(file: string, text: string): Promise<void> {
   await mkdir(dirname(file), { recursive: true });
   const handle = await open(file, "a");
   try {
-    await handle.write(text, null, "utf8");
+    const expected = Buffer.byteLength(text, "utf8");
+    const { bytesWritten } = await handle.write(text, null, "utf8");
+    if (bytesWritten !== expected) {
+      throw new Error(
+        `tower-do board append was short: wrote ${String(bytesWritten)} of ${String(expected)} bytes to ${file} — the log may hold a torn line`,
+      );
+    }
   } finally {
     await handle.close();
   }
@@ -93,12 +113,13 @@ function readEvent(candidate: unknown): ReadEventResult {
   }
   if (candidate.kind === "message" && isRecord(candidate.message)) {
     const message = readPersistedMessage(candidate.message);
-    const by =
-      typeof candidate.by === "string" ? candidate.by : (message?.from ?? "?");
-    const at = isEpochMs(candidate.at)
-      ? candidate.at
-      : (message?.at ?? Date.now());
+    // A message that does not validate is not an event at all, so its `at` and
+    // sender are read from the payload only AFTER the shape check — never
+    // back-filled with `Date.now()`, which would make an unreadable line look
+    // permanently fresh (the same reason the task branch has no fallback).
     if (!message) return undefined;
+    const by = typeof candidate.by === "string" ? candidate.by : message.from;
+    const at = isEpochMs(candidate.at) ? candidate.at : message.at;
     return { kind: "message", message, by, at };
   }
   // Findings are retired from the product: legacy lines are valid history, not
@@ -138,7 +159,6 @@ export class TowerBoard {
     const messages = new Map<string, TowerDoMessage>();
     let revision = 0;
     let skipped = 0;
-    let index = 0;
     // A legacy compact header may open the file (written by a version that had
     // compaction). It carries the logical `revision` and the number of
     // following last-wins snapshot lines; those lines rebuild the maps WITHOUT
@@ -226,7 +246,7 @@ export class TowerBoard {
           skipped += 1;
           continue;
         }
-        const plain = readPersistedTask(candidate.task, index);
+        const plain = readPersistedTask(candidate.task);
         if (plain === undefined) {
           // A payload that no longer validates under the CURRENT limits (a
           // retuned cap, a schema change, a torn append) must not vanish
@@ -240,7 +260,6 @@ export class TowerBoard {
             ? candidate.task.updatedAt
             : event.at;
         tasks.set(event.key, { ...plain, updatedAt });
-        index += 1;
         continue;
       }
       if (event.kind === "message" && event.message !== undefined) {
@@ -285,13 +304,18 @@ export class TowerBoard {
     };
   }
 
+  /** Append events as ONE batch. NOT serialized: the caller already holds the
+   *  write chain (`withWrite`) or IS the chain (`append`). */
+  private async appendBatchNow(events: readonly BoardEvent[]): Promise<void> {
+    if (events.length === 0) return;
+    const lines = events.map((event) => `${JSON.stringify(event)}\n`);
+    await appendBatch(this.file, lines.join(""));
+  }
+
   /** Append board events (one JSON line each), serialized per process. */
   async append(events: readonly BoardEvent[]): Promise<void> {
     if (events.length === 0) return;
-    return this.serialize(async () => {
-      const lines = events.map((event) => `${JSON.stringify(event)}\n`);
-      await appendBatch(this.file, lines.join(""));
-    });
+    return this.serialize(() => this.appendBatchNow(events));
   }
 
   /** Run `fn` while holding the in-process write chain, handing it an append
@@ -305,13 +329,8 @@ export class TowerBoard {
     fn: (append: (events: readonly BoardEvent[]) => Promise<void>) => Promise<T>,
   ): Promise<T> {
     return this.serialize(async () => {
-      const append = async (
-        events: readonly BoardEvent[],
-      ): Promise<void> => {
-        if (events.length === 0) return;
-        const lines = events.map((event) => `${JSON.stringify(event)}\n`);
-        await appendBatch(this.file, lines.join(""));
-      };
+      const append = (events: readonly BoardEvent[]): Promise<void> =>
+        this.appendBatchNow(events);
       return fn(append);
     });
   }
@@ -324,16 +343,6 @@ export class TowerBoard {
       .split("\n")
       .map((line) => line.trim())
       .filter((line) => line.length > 0);
-  }
-
-  /** Raw tail of the event log (newest lines last). */
-  async rawTail(lines: number = 50): Promise<string[]> {
-    // slice(-0) is slice(0) — the whole log — so a non-positive request must be
-    // an empty tail, not a full read that looks bounded. `!Number.isFinite`
-    // also catches NaN, for which `NaN <= 0` is false and `slice(-NaN)`
-    // silently becomes `slice(0)`.
-    if (!Number.isFinite(lines) || lines <= 0) return [];
-    return (await this.rawLines()).slice(-lines);
   }
 }
 

@@ -1,21 +1,18 @@
 /**
  * tower-do smoke test — two layers:
- *  1. pure state + board layer (multi-agent semantics incl. the changedFiles
- *     delivery-receipt disk round-trip via append/fold across instances)
+ *  1. pure state + board layer (multi-agent semantics incl. the append/fold
+ *     disk round-trip across instances)
  *  2. the real extension via a mock ExtensionAPI (tools execute end-to-end)
- * Run with: bun run test/smoke.ts
+ * Run with: bun test/smoke.ts
  */
 import {
-  existsSync,
   mkdirSync,
   mkdtempSync,
   readFileSync,
-  statSync,
-  unlinkSync,
   writeFileSync,
 } from "node:fs";
 import { tmpdir } from "node:os";
-import { dirname, join } from "node:path";
+import { join } from "node:path";
 
 import { TowerBoard } from "../board.ts";
 import {
@@ -24,7 +21,6 @@ import {
   formatBoardReminder,
   MAX_MESSAGE_BYTES,
   taskIsBlocked,
-  TOWER_DO_REMINDER_TYPE,
   writeBoardSnapshot,
 } from "../state.ts";
 
@@ -54,12 +50,12 @@ async function layer1(): Promise<void> {
     missingFold.revision === 0 && missingFold.tasks.length === 0,
   );
   try {
-    await board.rawTail();
-    check("rawTail on missing file throws", false, "expected throw");
+    await board.rawLines();
+    check("rawLines on missing file throws", false, "expected throw");
   } catch (error) {
     const code =
       error instanceof Error && "code" in error ? error.code : undefined;
-    check("rawTail on missing file throws", code === "ENOENT");
+    check("rawLines on missing file throws", code === "ENOENT");
   }
   const notAFile = join(dir, "not-a-file");
   mkdirSync(notAFile);
@@ -74,8 +70,7 @@ async function layer1(): Promise<void> {
 
   // Fold discloses lines it cannot turn into events (a corrupt line, a foreign
   // shape, or a payload that no longer validates): the board still holds them
-  // and no participant may lose sight of that silently. rawTail(0) must be an
-  // empty tail, because slice(-0) is slice(0) — the whole log.
+  // and no participant may lose sight of that silently.
   const logFile = join(dir, "logs", "board.jsonl");
   const logWriter = new TowerBoard(logFile);
   await logWriter.append([
@@ -103,10 +98,6 @@ async function layer1(): Promise<void> {
     "fold counts a line it cannot fold instead of dropping it silently",
     corruptView.skipped === 1 && corruptView.tasks.length === 1,
     `skipped=${String(corruptView.skipped)} tasks=${String(corruptView.tasks.length)}`,
-  );
-  check(
-    "rawTail(0) is an empty tail, not the whole log",
-    (await new TowerBoard(logFile).rawTail(0)).length === 0,
   );
 
   // Planning: two missions + a dependent one (3 upsert events → revision 3).
@@ -503,17 +494,16 @@ async function layer2(): Promise<void> {
     name: string;
     execute: (
       id: string,
-      params: never,
+      params: unknown,
       signal: AbortSignal | undefined,
       onUpdate: unknown,
-      ctx: never,
+      ctx: unknown,
     ) => Promise<{
       content: Array<{ type: "text"; text: string }>;
       details?: unknown;
     }>;
   };
   const tools = new Map<string, ToolDef>();
-  let lastAppend: { customType: string; data: unknown } | undefined;
 
   const pi = {
     on: (event: string, handler: Handler): void => {
@@ -522,9 +512,7 @@ async function layer2(): Promise<void> {
     registerTool: (def: ToolDef): void => {
       tools.set(def.name, def);
     },
-    appendEntry: (customType: string, data: unknown): void => {
-      lastAppend = { customType, data };
-    },
+    appendEntry: (_customType: string, _data: unknown): void => {},
     sendMessage: (): void => {},
     sendUserMessage: (): void => {},
     getSessionName: () => "smoke-session",
@@ -538,11 +526,8 @@ async function layer2(): Promise<void> {
     events: { on: () => {}, emit: (): void => {} },
   } as never;
 
-  const {
-    default: towerDoExtension,
-    boardFileFor,
-    stateDirFor,
-  } = await import("../index.ts");
+  const { default: towerDoExtension, boardFileFor } =
+    await import("../index.ts");
   towerDoExtension(pi as never);
 
   for (const name of ["tower_do", "tower_do_talk", "tower_do_status"]) {
@@ -567,7 +552,7 @@ async function layer2(): Promise<void> {
 
   const run = async (
     name: string,
-    params: never,
+    params: unknown,
     cwd?: string,
   ): Promise<{ text: string; details?: unknown }> => {
     const def = tools.get(name)!;
@@ -675,10 +660,9 @@ async function layer2(): Promise<void> {
     "pending filter empty",
   );
 
-  // The default folds unrelated unfinished work into a compact ledger instead
-  // of dropping it (every key a full-replacement write must name stays
-  // readable), `view=mine` narrows further, and `view=all` expands. The ledger
-  // prints the STORED status —
+  // The default folds unrelated unfinished work into a compact key ledger
+  // instead of dropping it (an upsert leaves an unlisted key untouched, and the
+  // ledger keeps every key readable). It prints the STORED status —
   // `billing` is stored `pending` and only derived-blocked — because that is
   // the value a replay writes back.
   // bob (as subagent id) tries to complete alice's task → ownership error.
@@ -1187,7 +1171,7 @@ async function layer2(): Promise<void> {
     body: "hello",
     as: "alice",
   } as never);
-  const staleRow = await run("tower_do_status", { view: "all" } as never);
+  const staleRow = await run("tower_do_status", {} as never);
   const statusLines = staleRow.text.split("\n");
   // Completed rows render as a key ledger now: pin that section, not a
   // glyph+subject line (the subject still appears in the activity feed).
@@ -1334,40 +1318,6 @@ async function layer2(): Promise<void> {
     `rev=${homeBoard.revision} file=${boardFileFor(homeProject)}`,
   );
 
-  // A caller-centred view is only testable with a caller-coupled peer row:
-  // with no mine/needs rows, `view=mine`, `view=needs` and the default
-  // `layers` render the same output, so a regression that wired the wrong
-  // layer into the window would pass. Build a board where the caller's own
-  // work waits on a peer's task and one unrelated row exists, then pin each
-  // view's contract.
-  const layersViewDir = mkdtempSync(join(tmpdir(), "tower-do-view-layers-"));
-  await run(
-    "tower_do",
-    {
-      tasks: [
-        {
-          key: "peer-blocker",
-          subject: "peer gate",
-          status: "pending",
-          owner: "peer-owner",
-        },
-        {
-          key: "mine-waits",
-          subject: "my turn after the gate",
-          status: "pending",
-          owner: "smoke-session",
-          dependsOn: ["peer-blocker"],
-        },
-        {
-          key: "unrelated",
-          subject: "nobody business",
-          status: "pending",
-          owner: "someone-else",
-        },
-      ],
-    } as never,
-    layersViewDir,
-  );
   // A message old enough to leave the default view (unread, past the age
   // valve) is still readable via inbox all, but the default inbox hides it.
   const retiredAt = Date.now() - 30 * 24 * 60 * 60_000;

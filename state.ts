@@ -9,16 +9,16 @@
  * self-reported one).
  *
  * Tower concepts fused in:
- *  - ownership: a task may have an `owner`; status changes require the owner
- *    or the reserved orchestrator identity "tower" (workers only touch their
- *    own missions).
- *  - scope: optional file-glob list describing what paths the task may touch
- *    (mission scope; visible to everyone; only owner/tower may change it).
+ *  - ownership: a task may have an `owner`; changing or removing an owned row
+ *    requires the owner or the reserved orchestrator identity "tower" (workers
+ *    only touch their own missions).
+ *  - upsert writes: a listed key is created or patched, an unlisted key is left
+ *    alone, and deletion is the explicit `remove` list.
  *  - blocked: a task can be parked with a `blockedBy` note instead of being
  *    silently stuck (Tower's blocker/mission semantics).
- *  - deps: dependsOn must name a task in the SAME batch — tower_do is a full
- *    replacement, so an omitted dependency is being deleted, not merely absent
- *    from this call (Tower's "deps must reference known missions").
+ *  - deps: dependsOn must name a task on the PRODUCED board (a target may be an
+ *    untouched row outside this call), and in_progress/completed require every
+ *    dependency to be completed.
  */
 
 export const TOWER_DO_SCHEMA_VERSION = 1 as const;
@@ -39,8 +39,9 @@ export const MAX_MESSAGE_BYTES = 32 * 1024;
 export const MAX_MESSAGE_SUBJECT_CHARS = 200;
 /** Age after which an unread message leaves the default view even though nobody
  * acked it. The message stays on disk and is readable via `inbox all` — a view
- * retirement, never a delete. */
-const MESSAGE_PENDING_RETIRE_MS = 14 * 24 * 60 * 60_000;
+ * retirement, never a delete. Exported because it is the bound CONTRACTS.md
+ * names for unread mail the retention budget may not touch. */
+export const MESSAGE_PENDING_RETIRE_MS = 14 * 24 * 60 * 60_000;
 /** Ownership-takeover window for non-completed tasks: ownership dies on the
  * task-relevant activity clock, not on unrelated board chatter (see
  * staleTaskClaims). */
@@ -98,9 +99,9 @@ export function textLength(value: string): number {
  * Wherever the schema declares an element-level bound, it is this guard, and
  * the extension owns the error, because only it can name the task key, the
  * measured length and the remedy (CONTRACTS.md "arg schema vs the fold").
- * Limits the schema does not declare at all (per-entry size of
- * `scope`/`changedFiles`, the key format inside `dependsOn`) are enforced by
- * the extension alone and need no guard — nothing can pre-empt them.
+ * A limit the schema does not declare at all (the key format inside
+ * `dependsOn`) is enforced by the extension alone and needs no guard — nothing
+ * can pre-empt it.
  *
  * The guard is a payload bound, not a second rule: the host's length check
  * never counts more than the fold's code points (plain BMP text: exactly equal;
@@ -227,7 +228,6 @@ export function createEmptyBoard(): TowerBoardView {
 function cloneTask(task: TowerDoTask): TowerDoTask {
   return {
     ...task,
-    ...(task.owner === undefined ? {} : { owner: task.owner }),
     dependsOn: [...task.dependsOn],
     blockedBy: [...task.blockedBy],
   };
@@ -287,7 +287,8 @@ function assertSingleLine(value: string, location: string): string {
 /**
  * Normalize one list-valued task field: trim, drop blanks, dedupe — while
  * keeping each surviving entry's ORIGINAL payload index. A length error must
- * name the caller's position (`scope[2]`), not the deduped one (`scope[1]`),
+ * name the caller's position (`dependsOn[2]`), not the deduped one
+ * (`dependsOn[1]`),
  * or the documented remedy ("shorten the named entry") points at the wrong
  * item and the retry fails identically.
  */
@@ -402,13 +403,9 @@ export function writeBoardSnapshot(
         `tasks[${index}].status is required for new task ${key}`,
       );
     }
+    // A blank owner means "no owner" (normalizeTask drops it); a real one is
+    // validated there too, naming the task key in the error.
     const owner = patch.owner ?? existing?.owner;
-    if (owner !== undefined && owner.trim() !== "") {
-      // Validate here too (fail fast before the merge), but with the key: an
-      // element-level rejection must be attributable to a task. A blank owner
-      // is skipped because the layers below treat "" as "no owner".
-      normalizeIdentity(owner, `tasks[${index}].owner (${key})`);
-    }
     resolved.push(
       normalizeTask(
         {
@@ -680,8 +677,8 @@ function normalizeTask(
 
   // Lists: normalize (trim, drop blanks, dedupe) FIRST, then validate entries,
   // then apply the cap. Counting the raw input would reject a batch whose
-  // stored value is legal: 101 changedFiles entries with one duplicate is 100
-  // paths, and 21 dependsOn entries with a duplicate is one dependency.
+  // stored value is legal: 21 dependsOn entries with a duplicate is 20
+  // dependencies.
   const dependsOnEntries = normalizeListEntries(
     input.dependsOn,
     (entryIndex) => `tasks[${index}].dependsOn[${entryIndex}] (${key})`,
@@ -833,8 +830,9 @@ export function findAllUnresolvedDeps(
 
 
 // ---------------------------------------------------------------------------
-// Persisted-state reading (board file entries) + session checkpoint replay.
-// The disk board is authoritative; the session checkpoint is a fallback.
+// Persisted-state reading (board file entries).
+// The disk board is authoritative: a persisted row the fold cannot validate is
+// skipped and disclosed, never salvaged from anywhere else.
 // ---------------------------------------------------------------------------
 
 export function isRecord(value: unknown): value is Record<string, unknown> {
@@ -851,7 +849,6 @@ export function isEpochMs(value: unknown): value is number {
 
 export function readPersistedTask(
   candidate: unknown,
-  index: number,
 ): ResolvedTowerDoTaskInput | undefined {
   if (!isRecord(candidate)) return undefined;
   if (
@@ -888,7 +885,9 @@ export function readPersistedTask(
         dependsOn,
         blockedBy,
       },
-      index,
+      // The index only ever reached a thrown message that this caller
+      // discards, so it is not a parameter: a rejected row is `undefined`.
+      0,
     );
   } catch {
     return undefined;
@@ -1014,64 +1013,44 @@ export function unreadMessagesToMe(
   );
 }
 
-/** True when every addressee of the message has read it (all → every owner). */
+/**
+ * True when every addressee of the message has ACKED it: a message nobody read
+ * is never "fully read", whatever became of its recipients.
+ *
+ * Deliberately a pure ack test with no reachability proxy. "The recipient owns
+ * no row, so nobody can ever read this" cannot be told apart from a peer that
+ * is legitimately reachable — the send path admits a recipient with recent
+ * board activity and no task at all — and the proxy had already needed a
+ * `tower` carve-out so that mail to the orchestrator (which owns no task by
+ * design) was not classified as unreadable. An unacked message therefore
+ * leaves the default view only through the age valve, which bounds it without
+ * guessing (CONTRACTS.md "message retention").
+ *
+ * A broadcast is read once its whole AUDIENCE has acked: the send-time
+ * snapshot when present, else the current owners, minus the sender — the
+ * sender already knows what it wrote and can never ack its own broadcast, so
+ * counting it as a pending reader would pin the broadcast forever. An empty
+ * audience (`to: "all"` addressed nobody) is vacuously read.
+ */
 export function isMessageFullyRead(
   message: TowerDoMessage,
   view: TowerBoardView,
 ): boolean {
   const readBy = message.readBy ?? [];
-  if (message.to === "all") {
-    // The sender already knows what they wrote (self-sends never reach their
-    // own inbox), so they cannot ack their own broadcast and must not count
-    // as a pending reader — otherwise broadcasts would never retire. The
-    // audience (send-time snapshot, else current owners) is exactly who the
-    // broadcast addressed and who `messagesToMe` surfaces it to.
-    const owners = broadcastAudience(message, view);
-    if (owners.size === 0) return true; // nobody left to read it
-    // Orphaned broadcast: every audience member who has not yet read has
-    // since LEFT the board (the board was cleared / rebuilt under new
-    // owners). Nobody can ever read it now — treat as fully read so a
-    // finished broadcast round cannot pin the retention budget forever.
-    const pendingReaders = [...owners].filter(
-      (owner) => !readBy.includes(owner),
-    );
-    if (pendingReaders.length === 0) return true;
-    const pendingStillHere = pendingReaders.some((owner) =>
-      view.tasks.some(
-        (task) => task.owner !== undefined && task.owner === owner,
-      ),
-    );
-    if (!pendingStillHere) return true;
-    return false;
-  }
-  // Addressed message: fully read once the recipient acks. `tower` is the
-  // reserved orchestrator identity and owns no task by design, so the
-  // ownership proxy below would classify every message to it as undeliverable
-  // and let the retention budget drop one that is still unread. Its read state
-  // is the ack list alone.
-  if (message.to === TOWER_IDENTITY) return readBy.includes(message.to);
-  // Anyone else: if the recipient is no longer an owner on the board (they
-  // left / the board was rebuilt), nobody can ever read it — treat it as fully
-  // read so orphan messages do not accumulate in the folded view forever.
-  // Reachability is proxied by TASK OWNERSHIP (CONTRACTS.md
-  // "undeliverable/orphaned messages auto-retire"); a recipient admitted only
-  // for recent board activity may therefore retire earlier than the age valve,
-  // which stays the bound.
-  const recipientStillHere = view.tasks.some(
-    (task) => task.owner !== undefined && task.owner === message.to,
-  );
-  if (!recipientStillHere) return true;
-  return readBy.includes(message.to);
+  if (message.to !== "all") return readBy.includes(message.to);
+  const audience = broadcastAudience(message, view);
+  if (audience.size === 0) return true; // addressed nobody
+  return [...audience].every((owner) => readBy.includes(owner));
 }
 
 /**
- * Retire fully-read history: keep at most `retention` fully-read messages
- * (oldest first) once the folded set exceeds the budget. Unread and
- * partially-read messages always survive the budget — retiring them would
- * silently swallow traffic a peer has not seen — but an unread message nobody
- * acks still leaves the DEFAULT view after `MESSAGE_PENDING_RETIRE_MS` (the
- * age valve; disk and `inbox all` keep it). retention 0 = keep everything
- * (legacy). Returns a NEW messages array; the input view is not mutated.
+ * Retire ACKED history: keep at most `retention` fully-read messages (oldest
+ * first) once the folded set exceeds the budget. Unread messages always
+ * survive the budget — retiring them would silently swallow traffic a peer has
+ * not seen — and leave the DEFAULT view only through the age valve
+ * (`MESSAGE_PENDING_RETIRE_MS`; disk and `inbox all` keep them). retention 0 =
+ * keep everything (legacy). Returns a NEW messages array; the input view is
+ * not mutated.
  */
 export function retainMessages(
   messages: readonly TowerDoMessage[],
@@ -1113,7 +1092,8 @@ export interface ActivityEntry {
   taskKey?: string;
 }
 
-const ACTIVITY_GLYPHS: Record<TowerDoStatus, string> = {
+/** Status glyph shared by every renderer (activity feed, dashboard, widget). */
+export const TASK_STATUS_GLYPHS: Record<TowerDoStatus, string> = {
   completed: "✓",
   in_progress: "◐",
   pending: "○",
@@ -1165,13 +1145,13 @@ export function parseActivityLine(line: string): ActivityEntry | undefined {
     // no longer refresh an owner's takeover clock (ARCHITECTURE.md "one clock,
     // not two").
     if (key !== undefined && task !== undefined) {
-      const plain = readPersistedTask(task, 0);
+      const plain = readPersistedTask(task);
       if (plain !== undefined) {
         return {
           kind: "task",
           by,
           at,
-          glyph: ACTIVITY_GLYPHS[plain.status],
+          glyph: TASK_STATUS_GLYPHS[plain.status],
           detail: `${key}: ${plain.subject}`, // could be added or updated
           taskKey: key,
         };
@@ -1234,7 +1214,7 @@ export function formatActivityEntry(entry: ActivityEntry, now: number): string {
  * one sitting" from "several sittings" without timestamps on every row.
  * Pure read derivation; no schema, no writes.
  */
-export const SESSION_BREAK_GAP_MS = 30 * 60_000;
+const SESSION_BREAK_GAP_MS = 30 * 60_000;
 
 /**
  * Latest-write summary of an activity feed: the identity and time of the
@@ -1297,10 +1277,8 @@ export function knownIdentities(
 
 /** Human form of the takeover window, derived from the constant so the
  * user-facing hint can never drift from the permission it describes. */
-export function formatTakeoverWindow(
-  idleMs: number = TASK_CLAIM_STALE_MS,
-): string {
-  const minutes = Math.round(idleMs / 60_000);
+export function formatTakeoverWindow(): string {
+  const minutes = Math.round(TASK_CLAIM_STALE_MS / 60_000);
   if (minutes < 60) return `${String(minutes)} min`;
   const hours = minutes / 60;
   return Number.isInteger(hours)
@@ -1336,7 +1314,6 @@ export function staleTaskClaims(
   entries: readonly ActivityEntry[],
   tasks: readonly TowerDoTask[],
   now: number,
-  idleMs: number = TASK_CLAIM_STALE_MS,
 ): Set<string> {
   const stale = new Set<string>();
   // No activity data at all (unreadable / garbage log) must disable the
@@ -1354,14 +1331,15 @@ export function staleTaskClaims(
       taskActivity.set(key, entry.at);
   }
   for (const task of tasks) {
-    // Exact label again: a bucket sibling's activity or heartbeat must not
-    // decide whether THIS owner is stale. A legacy row therefore goes stale by
+    // Exact identity again: another session's activity (on another task) must
+    // not decide whether THIS owner is stale. A legacy row therefore goes stale by
     // its own label's silence and becomes adoptable through the normal window —
     // that is the documented remedy, predictable rather than guessed.
     if (task.owner === undefined || task.status === "completed") continue;
     const quietSince =
       taskActivity.get(claimKey(task.owner, task.key)) ?? task.updatedAt;
-    if (now - quietSince > idleMs) stale.add(claimKey(task.owner, task.key));
+    if (now - quietSince > TASK_CLAIM_STALE_MS)
+      stale.add(claimKey(task.owner, task.key));
   }
   return stale;
 }
@@ -1474,7 +1452,6 @@ export function isCallerLine(line: string, caller: string): boolean {
   return new RegExp(
     [
       `^TowerDo shared board — identity ${id}, revision`,
-      `^- ${id} \\(me\\) —`,
       `^- ${id} · `,
       `^- [◐✓○✗] .* @${id} \\(me\\)(?= ←| \\[| —|$)`,
       `^## Messages for ${id} \\(`,
@@ -1482,10 +1459,9 @@ export function isCallerLine(line: string, caller: string): boolean {
   ).test(line);
 }
 
-/** Compact status-line rendering of the whole board for reminders. Rows are
- *  layered (mine → needs) and recency-first, so the cap shows the work the
- *  caller is in and the peer work it is coupled to; the unrelated layer folds
- *  to one key line. Counts stay board-wide. */
+/** Compact status-line rendering of the whole board for reminders. Open rows
+ *  render recency-first (newest activity first) up to REMINDER_TASK_LINE_CAP,
+ *  the rest fold into one key-only overflow line; counts stay board-wide. */
 export function formatBoardReminder(
   view: TowerBoardView,
   identity: string,
