@@ -82,7 +82,7 @@ Pi 启动时自动发现该扩展；已有 session 用 `/reload` 生效。
 | [docs/DECISIONS.md](docs/DECISIONS.md) | 为什么：file-as-state、upsert 写入、owner 守卫、单时钟接管 |
 | [docs/OPERATIONS.md](docs/OPERATIONS.md) | 安装、配置、发布流程（tag → CI → npm）、排障 |
 
-质量门禁：`bunx tsc --noEmit` 加上 [docs/CONTRACTS.md](docs/CONTRACTS.md) 里列出的测试套件，在每次 release tag 上由 CI 强制执行。
+质量门禁：`bun run check`（`typecheck` + `lint` + `test`），定义在 `package.json` 里一处；测试套件清单见 [docs/CONTRACTS.md](docs/CONTRACTS.md)。CI 在每次 push 到 `main`、每个 pull request，以及 release tag 发布前跑同一个脚本。
 
 ## License
 

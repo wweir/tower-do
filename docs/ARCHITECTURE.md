@@ -111,9 +111,31 @@ Two event kinds are appended (one JSON line each):
 ## Layout
 
 ```
-index.ts     # extension entry: 3 tools + widget + reminder + lifecycle
+index.ts     # extension assembly: 3 tools + widget + reminder + lifecycle
 state.ts     # pure schema / validation / fold semantics / read derivations (no I/O)
-board.ts     # disk layer (append-only JSONL) + config normalization
+render.ts    # tool arg schemas + shared formatters (no I/O)
+board.ts     # disk layer: append-only JSONL log + config normalization
+paths.ts     # project anchoring, config path, per-project board cache
 test/        # test suites (see CONTRACTS.md test gate)
 docs/        # this documentation set
 ```
+
+## Layering
+
+The dependency direction is one-way and enforced (not merely documented):
+
+```
+state.ts   ← render.ts
+state.ts   ← board.ts ← paths.ts
+all four   ← index.ts
+```
+
+- `state.ts` and `render.ts` import **no runtime builtin** — the fold,
+  validation and formatting logic is testable without a filesystem.
+- `board.ts` owns the log; `paths.ts` owns project anchoring and the board
+  cache. Neither may reach up into presentation or the extension.
+- `index.ts` is the only assembly point and may import all of them.
+
+`test/layering.ts` asserts this on the source text (a forbidden import
+ type-checks fine, so `tsc` cannot catch it), and requires every top-level
+ module to be covered by a rule so a new file cannot bypass the boundary.

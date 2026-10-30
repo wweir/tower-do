@@ -5,6 +5,35 @@
 > [ARCHITECTURE.md](./ARCHITECTURE.md). Only decisions that still bind the
 > two-feature product are kept here.
 
+## 2026-10 — the gate is enforced, not documented
+
+Four constraints existed as prose only. Each now has a machine check, because a
+rule that only a careful reader enforces is not a rule:
+
+- **`tsc` runs at the merge point.** The release workflow was the only place the
+  compiler and suites ran, and it triggers on a version tag — a type error or a
+  failing suite could sit on `main` until the one moment it is expensive to fix.
+  `.github/workflows/ci.yml` runs the same script on push-to-main and on pull
+  requests. Both workflows call `bun run check` (`typecheck` + `lint` + `test`),
+  defined once in `package.json`, so the command list cannot drift.
+- **Warnings fail.** `biome lint --error-on-warnings` is the lint gate. Plain
+  `biome lint` exits 0 on warnings, which would have made the script decorative.
+  The formatter stays **off**: a tree-wide reformat is a separate mechanical
+  change and must not hide inside a feature diff.
+- **The compiler is set to `strict` plus the flags that matter here:**
+  `exactOptionalPropertyTypes` (a task write is an upsert PATCH, so `undefined`
+  and "absent" must not collapse), `noUncheckedIndexedAccess` (every fold/Math
+  index access is now bounds-proven), `noImplicitOverride`,
+  `noFallthroughCasesInSwitch`. `noPropertyAccessFromIndexSignature` was tried
+  and rejected: 91 hits, almost all in `unknown` narrowing where it adds noise
+  rather than safety.
+- **Layering is asserted on source text.** `test/layering.ts` fails when
+  `state.ts`/`render.ts` import a runtime builtin, when a lower layer imports
+  `index.ts`, when a relative import does not resolve, or when a top-level
+  module exists with no declared rule (the module set is enumerated from disk,
+  not written down). `tsc` cannot see any of this: a forbidden import
+  type-checks fine.
+
 ## 2026-10 — the two-feature reduction (what was removed and why)
 
 The product was reduced to its two core features — a shared project todo board

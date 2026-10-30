@@ -36,6 +36,22 @@ invalid `identity` fails loudly at session start — it is never silently
 defaulted, because a silently-reset identity would corrupt owner matching and
 message addressing in multi-agent sessions.
 
+## Local gate
+
+Run `bun run check` before committing (= `typecheck` + `lint` + `test`, defined
+once in `package.json`). CI runs the same script on every push to `main`, on
+every pull request (`.github/workflows/ci.yml`), and before a tag publishes. The
+suite list and the reason both tsconfig programs exist are in
+[CONTRACTS.md](./CONTRACTS.md) "Test gate".
+
+- `bun run lint` is `biome lint --error-on-warnings .` — a warning fails the
+  gate (plain `biome lint` exits 0 on warnings, which would make the script
+  decorative). The biome formatter is **off on purpose**: a tree-wide reformat
+  is its own mechanical commit, never part of a feature diff.
+- `bun run test` runs each suite as `bun test/<file>.ts` — not `bun run <file>`
+  (since bun 1.4.0 that prints help, runs nothing and exits 0) and not `bun
+  test` (these are standalone programs, not a `bun:test` harness).
+
 ## Release (npm publish on tag)
 
 Tagging `vX.Y.Z` on `main` triggers `.github/workflows/release.yml`, which runs
@@ -71,12 +87,8 @@ only while npm has no such version** (`curl -s -o /dev/null -w '%{http_code}'
 https://registry.npmjs.org/tower-do/X.Y.Z` → `404`). A tag whose release
 succeeded must never be force-moved: cut the next version instead.
 
-- The repo ships TypeScript sources directly (`main: ./index.ts`, no build
-  step), so the "compile" gate is `bunx tsc --noEmit -p tsconfig.json` plus
-  `bunx tsc --noEmit -p tsconfig.test.json` (`test/` is outside the main
-  `include` on purpose, so only the second program type-checks it), and the
-  test gate runs each suite as `bun test/<file>.ts` (**not** `bun run <file>`,
-  which since bun 1.4.0 prints help and exits 0 without running anything).
+- The gate is `bun run check` (see "Local gate" above); this workflow calls it
+  rather than inlining the commands, so it cannot drift from `ci.yml`.
 - The tag must equal the `package.json` version (`v` stripped), or the job
   fails before publish.
 - Publish uses **npm trusted publishing (OIDC)** — no repository secret. The

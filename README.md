@@ -105,8 +105,10 @@ event semantics, and read derivations:
 | [docs/OPERATIONS.md](docs/OPERATIONS.md) | Install, config, release flow (tag → CI → npm), troubleshooting |
 | [README.zh-CN.md](./README.zh-CN.md) | 中文版说明 |
 
-Quality gate: `bunx tsc --noEmit` plus the suites listed in
-[docs/CONTRACTS.md](docs/CONTRACTS.md), enforced in CI on every release tag.
+Quality gate: `bun run check` (`typecheck` + `lint` + `test`), defined once in
+`package.json`; the suites are listed in
+[docs/CONTRACTS.md](docs/CONTRACTS.md). CI runs the same script on every push to
+`main`, on every pull request, and before a release tag publishes.
 
 ## License
 

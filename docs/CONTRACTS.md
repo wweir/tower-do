@@ -101,10 +101,12 @@ Length is measured in Unicode **code points** (`textLength`), not UTF-16 units.
 
 ## Test gate (what must stay green)
 
-`bunx tsc --noEmit -p tsconfig.json` (src) and `bunx tsc --noEmit -p
- tsconfig.test.json` (`test/`; it is deliberately outside the main `include`,
- so a dangling import in a suite is invisible to the first program), plus, run
- with `bun <file>`:
+One command runs everything: `bun run check` = `typecheck` + `lint` + `test`,
+each defined once in `package.json`. The two compile programs are
+`tsc --noEmit -p tsconfig.json` (src) and `tsc --noEmit -p tsconfig.test.json`
+(`test/`; it is deliberately outside the main `include`, so a dangling import in
+a suite is invisible to the first program). Suites run as `bun <file>` (never
+`bun run <file>` — see OPERATIONS.md):
 
 | Suite | Proves |
 | --- | --- |
@@ -117,6 +119,13 @@ Length is measured in Unicode **code points** (`textLength`), not UTF-16 units.
 | `test/task-cap.ts` | open-task budget, dependency gating across the budget |
 | `test/limits.ts` | arg-schema vs fold ownership, per-element limits |
 | `test/identity-scope.ts` | per-instance session identity (no module-global leak) |
+| `test/layering.ts` | the module dependency direction (ARCHITECTURE.md "Layering") |
 
-CI runs this list on every release tag (`.github/workflows/release.yml`); the
-workflow is the authoritative copy of the list.
+`bun run check` runs in `.github/workflows/ci.yml` on every push to `main` and
+every pull request, and again in `release.yml` before a tag publishes. Both
+workflows call the same package.json scripts, so the table above cannot drift
+from what CI actually runs — but a suite added to `test/` must still be added to
+the `test` script in `package.json`, or nobody runs it.
+
+The lint step, and why the formatter is off, are described in
+[OPERATIONS.md](./OPERATIONS.md) "Local gate".
