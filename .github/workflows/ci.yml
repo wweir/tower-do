@@ -1,0 +1,46 @@
+name: ci
+
+# The release workflow's gate ran only on a version tag, so a type error or a
+# failing suite could live on main until the one moment it is expensive to fix.
+# This workflow runs the SAME gate (`bun run check`) at the merge point: the
+# commands live in package.json, so the two workflows cannot drift apart.
+#
+# `on.push.branches` is main only: a feature branch is covered by its
+# pull_request run, and the point of the push trigger is to catch a direct
+# commit to main.
+on:
+  push:
+    branches: [main]
+  pull_request:
+
+permissions:
+  contents: read
+
+concurrency:
+  group: ci-${{ github.ref }}
+  cancel-in-progress: true
+
+jobs:
+  check:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+
+      # No dependency cache: bun install is fast on this repo, and a cache is a
+      # poisoning surface this workflow does not need.
+      - uses: oven-sh/setup-bun@0c5077e51419868618aeaa5fe8019c62421857d6 # v2.2.0 # zizmor: ignore[cache-poisoning] (no cache configured)
+        with:
+          bun-version: latest
+
+      - name: Install dependencies
+        run: bun install --frozen-lockfile
+
+      # typecheck (both tsconfig programs) + biome lint (warnings fail) + every
+      # test suite. One command, defined once in package.json.
+      #
+      # The suites are individual `bun <file>` runs, NOT `bun test`: each file
+      # is its own program that calls process.exit(1) on failure. `bun run
+      # <path>` would print the CLI help and exit 0 (a silent always-green
+      # gate) — see the note in package.json's test script.
+      - name: Check
+        run: bun run check

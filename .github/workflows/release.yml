@@ -30,34 +30,11 @@ jobs:
       - name: Install dependencies
         run: bun install --frozen-lockfile
 
-      # The repo publishes TypeScript sources directly (main: ./index.ts, no
-      # build step) — tsc is the compile gate and the rest is the test gate.
-      #
-      # `bun <file>`, NOT `bun run <file>`: since bun 1.4.0 a `bun run <path>`
-      # with no matching package.json script prints the CLI help, runs NOTHING,
-      # and exits 0 — a silent always-green gate. `bun <file>` executes the file
-      # and each suite calls process.exit(1) on failure.
-      - name: Compile check
-        run: bunx tsc --noEmit -p tsconfig.json
-
-      # `test/` is deliberately outside the main `include`, so this second
-      # program is the only thing that type-checks it. Three test imports of
-      # symbols deleted in v0.8.0 stayed green for a whole release without it
-      # (bun tolerates a missing named export; tsc does not).
-      - name: Compile check (tests)
-        run: bunx tsc --noEmit -p tsconfig.test.json
-
-      - name: Test gate
-        run: |
-          bun test/smoke.ts
-          bun test/config.ts
-          bun test/owner-guard.ts
-          bun test/message-retention.ts
-          bun test/home-isolation.ts
-          bun test/board-progress.ts
-          bun test/task-cap.ts
-          bun test/limits.ts
-          bun test/identity-scope.ts
+      # `bun run check` = typecheck + lint + every suite, defined once in
+      # package.json so this workflow and ci.yml cannot drift apart. Why the
+      # gate needs both tsconfig programs: CONTRACTS.md "Test gate".
+      - name: Check
+        run: bun run check
 
       - name: Verify tag matches package version
         run: |

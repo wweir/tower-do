@@ -10,8 +10,17 @@
     "allowImportingTsExtensions": true,
     "noUnusedLocals": true,
     "noUnusedParameters": true,
+    // A task write is an upsert PATCH, so `undefined` and "field absent" are
+    // different things; exactOptionalPropertyTypes is what keeps the two from
+    // collapsing into one another at the type level.
+    "exactOptionalPropertyTypes": true,
+    // Fold paths index arrays/Maps that are bounds-proven elsewhere; the flag
+    // makes each of those proofs explicit instead of assumed.
+    "noUncheckedIndexedAccess": true,
+    "noImplicitOverride": true,
+    "noFallthroughCasesInSwitch": true,
     "skipLibCheck": true,
     "forceConsistentCasingInFileNames": true
   },
-  "include": ["state.ts", "board.ts", "index.ts"]
+  "include": ["state.ts", "board.ts", "paths.ts", "render.ts", "index.ts"]
 }

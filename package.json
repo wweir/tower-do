@@ -6,6 +6,12 @@
   "author": "温习江湖 <wweir@foxmail.com>",
   "type": "module",
   "main": "./index.ts",
+  "scripts": {
+    "typecheck": "tsc --noEmit -p tsconfig.json && tsc --noEmit -p tsconfig.test.json",
+    "lint": "biome lint --error-on-warnings .",
+    "test": "bun test/smoke.ts && bun test/config.ts && bun test/owner-guard.ts && bun test/message-retention.ts && bun test/home-isolation.ts && bun test/board-progress.ts && bun test/task-cap.ts && bun test/limits.ts && bun test/identity-scope.ts && bun test/layering.ts",
+    "check": "bun run typecheck && bun run lint && bun run test"
+  },
   "keywords": [
     "pi-package",
     "pi-extension",
@@ -20,6 +26,8 @@
     "index.ts",
     "state.ts",
     "board.ts",
+    "paths.ts",
+    "render.ts",
     "test/",
     "docs/",
     "tsconfig.json",
@@ -34,6 +42,7 @@
     ]
   },
   "devDependencies": {
+    "@biomejs/biome": "^2.6.4",
     "@earendil-works/pi-coding-agent": "^1.2.0",
     "bun-types": "^1.4.2",
     "typescript": "^5.9.3"
