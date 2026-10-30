@@ -34,6 +34,15 @@ rule that only a careful reader enforces is not a rule:
   not written down). `tsc` cannot see any of this: a forbidden import
   type-checks fine.
 
+What the flags exposed was **assumptions, not misbehaviour**, and the two are
+not interchangeable: the fold branches on `event.key === undefined` and the
+revision gate on `input.baseRevision !== undefined`, so `{key: undefined}` and
+`{}` were already the same thing at runtime. Those edits are type-level — do not
+cite them as data-integrity fixes. The one real publication hazard in the same
+batch was self-inflicted: splitting the modules meant `index.ts` imports files
+that `package.json` `files` had to start shipping, or the tarball would be
+missing part of the extension.
+
 ## 2026-10 — the two-feature reduction (what was removed and why)
 
 The product was reduced to its two core features — a shared project todo board
