@@ -23,6 +23,7 @@ import {
   staleTaskClaims,
   writeBoardSnapshot,
   type ActivityEntry,
+  type TowerBoardView,
   type TowerDoStatus,
   type TowerDoTask,
 } from "../state.ts";
@@ -36,7 +37,7 @@ function check(label: string, ok: boolean, extra = ""): void {
     console.log(`PASS  ${label}`);
   } else {
     failures += 1;
-    console.log(`FAIL  ${label} ${extra ? "— " + extra : ""}`);
+    console.log(`FAIL  ${label} ${extra ? `— ${extra}` : ""}`);
   }
 }
 
@@ -48,6 +49,14 @@ function expectThrows(label: string, fn: () => unknown, match: RegExp): void {
     const message = error instanceof Error ? error.message : String(error);
     check(label, match.test(message), message.slice(0, 140));
   }
+}
+
+/** The single row a one-task fixture produced; a missing row is a broken
+ *  fixture, not a condition to skip. */
+function onlyTask(view: TowerBoardView): TowerDoTask {
+  const [task] = view.tasks;
+  if (task === undefined) throw new Error("expected a task on the board");
+  return task;
 }
 
 function snapshotOf(view: ReturnType<typeof createEmptyBoard>): Array<{
@@ -383,7 +392,7 @@ async function main(): Promise<void> {
   );
   check(
     "unowned task content may be edited by anyone",
-    wUnowned2.view.tasks[0].subject === "rewritten by bob",
+    onlyTask(wUnowned2.view).subject === "rewritten by bob",
   );
 
   // --- stale-owner takeover: an idle owner's unfinished work is adoptable ---

@@ -90,9 +90,31 @@ type SchemaNode = {
   pattern?: string;
 };
 
+/** A named property of a schema node. A missing one is a broken fixture, not a
+ *  case to skip. */
+function property(node: SchemaNode, name: string): SchemaNode {
+  const found = node.properties[name];
+  if (found === undefined) {
+    throw new Error(`schema node has no property "${name}"`);
+  }
+  return found;
+}
+
+/** The registered `parameters` schema of one tool by name. */
+function registeredSchema(
+  tools: ReadonlyMap<string, { parameters: unknown }>,
+  name: string,
+): SchemaNode {
+  const tool = tools.get(name);
+  if (tool === undefined) throw new Error(`tool ${name} is not registered`);
+  return tool.parameters as SchemaNode;
+}
+
 /** The task-item schema of a registered tool's parameters (an array element). */
 function taskItemSchema(parameters: unknown): SchemaNode {
-  return (parameters as SchemaNode).properties.tasks.items as SchemaNode;
+  const tasks = property(parameters as SchemaNode, "tasks");
+  if (tasks.items === undefined) throw new Error("tasks is not an array schema");
+  return tasks.items;
 }
 
 /** Element-level text limits, and the limit the extension enforces for each. */
@@ -159,8 +181,10 @@ async function main(): Promise<void> {
     events: { on: () => {}, emit: (): void => {} },
   } as never;
 
-  const { default: towerDoExtension, boardFileFor } =
-    await import("../index.ts");
+  const { default: towerDoExtension } = await import("../index.ts");
+  // boardFileFor lives in the path layer now; importing it from index.ts would
+  // re-export the extension's internals just for a test.
+  const { boardFileFor } = await import("../paths.ts");
   towerDoExtension(pi as never);
 
   const ctx = {
@@ -174,7 +198,8 @@ async function main(): Promise<void> {
   } as never;
   const board = new TowerBoard(boardFileFor(dir));
   const write = async (params: unknown): Promise<string> => {
-    const def = tools.get("tower_do")!;
+    const def = tools.get("tower_do");
+    if (def === undefined) throw new Error("tower_do is not registered");
     const result = await def.execute(
       "call-1",
       params,
@@ -205,7 +230,7 @@ async function main(): Promise<void> {
   //    are strictly looser than the limit the extension enforces.
   // -------------------------------------------------------------------------
   for (const [field, limit] of ELEMENT_TEXT) {
-    const declared = item.properties[field].maxLength;
+    const declared = property(item, field).maxLength;
     check(
       `${field}: element text bound is the derived transport guard (looser than the enforced limit)`,
       declared === transportLimit(limit) && declared > limit,
@@ -213,7 +238,7 @@ async function main(): Promise<void> {
     );
   }
   for (const [field, limit] of ELEMENT_COUNT) {
-    const declared = item.properties[field].maxItems;
+    const declared = property(item, field).maxItems;
     check(
       `${field}: element count bound is the derived transport guard (looser than the enforced limit)`,
       declared === transportLimit(limit) && declared > limit,
@@ -221,24 +246,22 @@ async function main(): Promise<void> {
     );
   }
   for (const [name, field, limit] of TOP_LEVEL) {
-    const declared = (tools.get(name)!.parameters as SchemaNode).properties[
-      field
-    ]?.maxLength;
+    const declared = registeredSchema(tools, name).properties[field]?.maxLength;
     check(
       `${name}.${field}: named field keeps the business limit (its error path names the field)`,
       declared === limit,
       `schema=${String(declared)} limit=${limit}`,
     );
   }
+  const keyNode = property(item, "key");
   check(
     "key: schema length and pattern derive from MAX_TASK_KEY_CHARS",
-    item.properties.key.maxLength === MAX_TASK_KEY_CHARS &&
-      item.properties.key.pattern === TASK_KEY_PATTERN.source,
-    `maxLength=${String(item.properties.key.maxLength)} pattern=${String(item.properties.key.pattern)}`,
+    keyNode.maxLength === MAX_TASK_KEY_CHARS &&
+      keyNode.pattern === TASK_KEY_PATTERN.source,
+    `maxLength=${String(keyNode.maxLength)} pattern=${String(keyNode.pattern)}`,
   );
   for (const name of ["tower_do_talk", "tower_do_status"]) {
-    const taskKey = (tools.get(name)!.parameters as SchemaNode).properties
-      .taskKey;
+    const taskKey = property(registeredSchema(tools, name), "taskKey");
     check(
       `${name}.taskKey: schema derives the key rule`,
       taskKey.maxLength === MAX_TASK_KEY_CHARS &&
@@ -492,7 +515,7 @@ async function main(): Promise<void> {
   // -------------------------------------------------------------------------
   check(
     "subject: emptiness is the fold's rule (no schema minLength to pre-empt it)",
-    (item.properties.subject as { minLength?: unknown }).minLength ===
+    (property(item, "subject") as { minLength?: unknown }).minLength ===
       undefined,
   );
   const current = await fold();

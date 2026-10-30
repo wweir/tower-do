@@ -109,7 +109,16 @@ function readEvent(candidate: unknown): ReadEventResult {
     // it would make the fold non-deterministic between reads and report a
     // corrupt line as permanently fresh.
     if (!isEpochMs(candidate.at)) return undefined;
-    return { kind: "task", op: candidate.op, key, by, at: candidate.at };
+    // `key` stays absent rather than `undefined`: the fold treats a missing key
+    // as an unfoldable row (it increments `skipped`) instead of silently
+    // dropping the event, so the distinction has to survive the type.
+    return {
+      kind: "task",
+      op: candidate.op,
+      ...(key === undefined ? {} : { key }),
+      by,
+      at: candidate.at,
+    };
   }
   if (candidate.kind === "message" && isRecord(candidate.message)) {
     const message = readPersistedMessage(candidate.message);
@@ -167,9 +176,10 @@ export class TowerBoard {
     const firstIndex = lines.findIndex((line) => line.trim().length > 0);
     let start = 0;
     let snapshotLines = 0;
-    if (firstIndex >= 0) {
+    const headerLine = firstIndex >= 0 ? lines[firstIndex] : undefined;
+    if (headerLine !== undefined) {
       try {
-        const header: unknown = JSON.parse(lines[firstIndex].trim());
+        const header: unknown = JSON.parse(headerLine.trim());
         if (
           isRecord(header) &&
           header.kind === "compact" &&
@@ -193,8 +203,7 @@ export class TowerBoard {
     // block must not let the trailing snapshot events fall outside it and bump
     // the revision the block is not allowed to bump.
     let snapshotConsumed = 0;
-    for (let li = 0; li < lines.length; li += 1) {
-      const line = lines[li];
+    for (const [li, line] of lines.entries()) {
       const trimmed = line.trim();
       if (!trimmed) continue;
       if (li === firstIndex && start !== 0) continue; // the compact header itself
@@ -288,7 +297,6 @@ export class TowerBoard {
         } else {
           messages.set(message.id, message);
         }
-        continue;
       }
     }
     const orderedTasks = [...tasks.values()];
@@ -349,8 +357,9 @@ export class TowerBoard {
 export interface TowerDoConfig {
   /**
    * Optional fixed identity; otherwise resolved from the session. The ONLY
-   * user-configurable key — every other tuning constant lives in index.ts
-   * (internal, never user-facing).
+   * user-configurable key — every other tuning constant is internal (state.ts
+   * for the contract-level defaults, index.ts for extension tuning), never
+   * user-facing.
    */
   identity?: string;
 }

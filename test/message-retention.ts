@@ -47,7 +47,7 @@ function check(label: string, ok: boolean, extra = ""): void {
     console.log(`PASS  ${label}`);
   } else {
     failures += 1;
-    console.log(`FAIL  ${label}${extra ? " — " + extra : ""}`);
+    console.log(`FAIL  ${label}${extra ? ` — ${extra}` : ""}`);
   }
 }
 
@@ -636,6 +636,9 @@ async function layer4(): Promise<void> {
     "orphan addressed message (recipient gone) stays unread",
     orphan !== undefined && !isMessageFullyRead(orphan, view),
   );
+  if (orphan === undefined) {
+    throw new Error("expected the orphan message on the board");
+  }
   const liveUnread = msg({
     id: "m-live-keep",
     to: "dave",
@@ -657,7 +660,7 @@ async function layer4(): Promise<void> {
   // keep-everything and would make this trivially pass — the survivor check is
   // what catches a regression.
   const budgeted = retainMessages(
-    [orphan!, liveUnread, ackedHistory],
+    [orphan, liveUnread, ackedHistory],
     view,
     1,
   );
@@ -674,7 +677,7 @@ async function layer4(): Promise<void> {
   check(
     "an unread orphan leaves the default view through the age valve",
     retainMessages(
-      [orphan!],
+      [orphan],
       view,
       1,
       now + MESSAGE_PENDING_RETIRE_MS + 1,

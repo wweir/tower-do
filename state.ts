@@ -47,11 +47,18 @@ export const MESSAGE_PENDING_RETIRE_MS = 14 * 24 * 60 * 60_000;
  * task-relevant activity clock, not on unrelated board chatter (see
  * staleTaskClaims). */
 const TASK_CLAIM_STALE_MS = 6 * 60 * 60_000;
+/** Default task-page size of `tower_do_status`. Lives here (not in the tool
+ * module) because the arg schema's description and the handler must state the
+ * same number, and the schema is built from these constants. */
+export const DASHBOARD_ROW_BUDGET = 200;
+/** Default `tower_do_talk inbox` page size — same reason as
+ * DASHBOARD_ROW_BUDGET. */
+export const DEFAULT_INBOX_LIMIT = 20;
 
 // ---------------------------------------------------------------------------
 // Content limits — defined exactly once, here.
 //
-// The tool-arg schema is built from these constants (index.ts) instead of
+// The tool-arg schema is built from these constants (render.ts) instead of
 // restating them, and each limit has exactly one enforcing layer: an
 // element-level limit (`tasks[i].*`) is enforced by the extension so its error
 // can name the task, a named top-level field by the schema. Nothing else may
@@ -439,6 +446,9 @@ export function writeBoardSnapshot(
   // Explicit removals. A key that is not on the board, or that also appears in
   // `tasks`, is a caller bug — fail loud rather than pick a winner.
   const removeKeys = new Set<string>();
+  // Rows are collected here, where their existence is already proven, so the
+  // guard loop below needs no second lookup (and no non-null assertion).
+  const removals: TowerDoTask[] = [];
   for (const [index, rawKey] of (input.remove ?? []).entries()) {
     const key = normalizeTaskKey(rawKey, `remove[${index}]`);
     if (removeKeys.has(key))
@@ -449,11 +459,13 @@ export function writeBoardSnapshot(
       throw new TowerDoValidationError(
         `task ${key} appears in both tasks and remove — one write cannot upsert and delete it`,
       );
-    if (!existingByKey.has(key))
+    const existing = existingByKey.get(key);
+    if (existing === undefined)
       throw new TowerDoValidationError(
         `cannot remove task ${key}: no such task on the board`,
       );
     removeKeys.add(key);
+    removals.push(existing);
   }
 
   const now = Date.now();
@@ -526,8 +538,8 @@ export function writeBoardSnapshot(
     resultByKey.set(task.key, candidate);
   }
 
-  for (const key of removeKeys) {
-    const target = existingByKey.get(key)!;
+  for (const target of removals) {
+    const key = target.key;
     // Workers may remove only their own (or unowned) tasks; the orchestrator
     // may remove any. Stale-claim exception: a row whose own claim is idle past
     // the takeover window may be removed by anyone. Completed receipts stay
@@ -1245,12 +1257,16 @@ export function formatActivityFeed(
   now: number,
 ): string[] {
   const lines: string[] = [];
-  for (let i = 0; i < entries.length; i += 1) {
-    const entry = entries[i];
-    if (i > 0 && entries[i - 1].at - entry.at > SESSION_BREAK_GAP_MS) {
+  let previous: ActivityEntry | undefined;
+  for (const entry of entries) {
+    if (
+      previous !== undefined &&
+      previous.at - entry.at > SESSION_BREAK_GAP_MS
+    ) {
       lines.push("── session break ──");
     }
     lines.push(`- ${formatActivityEntry(entry, now)}`);
+    previous = entry;
   }
   return lines;
 }
@@ -1446,7 +1462,7 @@ function escapeRegExp(s: string): string {
  * not a tighter regex.
  *
  * Keep in sync with the renderers in index.ts (status sections, owner `(me)`
- * suffix, activity feed format).
+ * suffix, activity feed format) and the tool-arg schemas in render.ts.
  */
 export function isCallerLine(line: string, caller: string): boolean {
   if (caller === "") return false;

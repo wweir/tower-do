@@ -22,6 +22,8 @@ import {
   MAX_MESSAGE_BYTES,
   taskIsBlocked,
   writeBoardSnapshot,
+  type TowerBoardView,
+  type TowerDoTask,
 } from "../state.ts";
 
 let failures = 0;
@@ -37,6 +39,22 @@ function expectThrows(label: string, fn: () => unknown, match: RegExp): void {
     const message = error instanceof Error ? error.message : String(error);
     check(label, match.test(message), message.slice(0, 120));
   }
+}
+
+/** The single row a one-task fixture produced; a missing row is a broken
+ *  fixture, not a condition to skip. */
+function onlyTask(view: TowerBoardView): TowerDoTask {
+  const [task] = view.tasks;
+  if (task === undefined) throw new Error("expected a task on the board");
+  return task;
+}
+
+/** The row for `key`; a missing row is a broken fixture, not a condition to
+ *  skip. */
+function findTask(view: TowerBoardView, key: string): TowerDoTask {
+  const task = view.tasks.find((candidate) => candidate.key === key);
+  if (task === undefined) throw new Error(`expected task "${key}" on the board`);
+  return task;
 }
 
 async function layer1(): Promise<void> {
@@ -143,7 +161,7 @@ async function layer1(): Promise<void> {
   );
 
   // Blocked semantics BEFORE the dependency completes.
-  const carolUnfilled = view.tasks.find((t) => t.key === "test")!;
+  const carolUnfilled = findTask(view, "test");
   check(
     "dependent task reports blocked while dep incomplete",
     taskIsBlocked(carolUnfilled, view),
@@ -211,7 +229,7 @@ async function layer1(): Promise<void> {
   );
   check(
     "dependent unblocked after dep done",
-    !taskIsBlocked(view.tasks.find((t) => t.key === "test")!, view),
+    !taskIsBlocked(findTask(view, "test"), view),
   );
 
   // Completed tasks ignore stale blockedBy (widget/reminder counts and
@@ -233,7 +251,7 @@ async function layer1(): Promise<void> {
   );
   check(
     "completed task ignores stale blockedBy",
-    !taskIsBlocked(staleDone.view.tasks[0], staleDone.view),
+    !taskIsBlocked(onlyTask(staleDone.view), staleDone.view),
   );
   const stillWaiting = writeBoardSnapshot(
     createEmptyBoard(),
@@ -252,7 +270,7 @@ async function layer1(): Promise<void> {
   );
   check(
     "non-completed task with blockedBy still blocked",
-    taskIsBlocked(stillWaiting.view.tasks[0], stillWaiting.view),
+    taskIsBlocked(onlyTask(stillWaiting.view), stillWaiting.view),
   );
 
   // Reminder rows must agree with the header's derived blocked count: a
@@ -415,7 +433,7 @@ async function layer1(): Promise<void> {
     const newTask = { ...keptTask, key: "new", subject: "new task" };
     writeFileSync(
       legacyCompactFile,
-      [
+      `${[
         JSON.stringify({
           kind: "compact",
           revision: 5,
@@ -470,7 +488,7 @@ async function layer1(): Promise<void> {
           by: "alice",
           at,
         }),
-      ].join("\n") + "\n",
+      ].join("\n")}\n`,
     );
     const folded = await new TowerBoard(legacyCompactFile).fold();
     check(
@@ -526,8 +544,10 @@ async function layer2(): Promise<void> {
     events: { on: () => {}, emit: (): void => {} },
   } as never;
 
-  const { default: towerDoExtension, boardFileFor } =
-    await import("../index.ts");
+  const { default: towerDoExtension } = await import("../index.ts");
+  // boardFileFor lives in the path layer now; importing it from index.ts would
+  // re-export the extension's internals just for a test.
+  const { boardFileFor } = await import("../paths.ts");
   towerDoExtension(pi as never);
 
   for (const name of ["tower_do", "tower_do_talk", "tower_do_status"]) {
@@ -555,7 +575,8 @@ async function layer2(): Promise<void> {
     params: unknown,
     cwd?: string,
   ): Promise<{ text: string; details?: unknown }> => {
-    const def = tools.get(name)!;
+    const def = tools.get(name);
+    if (def === undefined) throw new Error(`tool ${name} is not registered`);
     const callCtx =
       cwd === undefined ? ctxBase : { ...(ctxBase as object), cwd };
     const result = await def.execute(
@@ -1229,9 +1250,9 @@ async function layer2(): Promise<void> {
   aborted.abort();
   let abortMsg = "NO ERROR";
   try {
-    await tools
-      .get("tower_do")!
-      .execute(
+    const abortTool = tools.get("tower_do");
+    if (abortTool === undefined) throw new Error("tower_do is not registered");
+    await abortTool.execute(
         "call-abort",
         { tasks: [{ key: "nope", subject: "x", status: "pending" }] } as never,
         aborted.signal,
@@ -1297,7 +1318,10 @@ async function layer2(): Promise<void> {
     reservedMsg.slice(0, 80),
   );
 
-  const homeProject = process.env.HOME!;
+  const homeProject = process.env.HOME;
+  if (homeProject === undefined) {
+    throw new Error("HOME must be set inside withHome");
+  }
 
   // Beyond the guard not firing: a real write must land in the global
   // records home. Fold the resolved path back and assert the round-trip.

@@ -23,7 +23,7 @@ function check(label: string, ok: boolean, extra = ""): void {
     console.log(`PASS  ${label}`);
   } else {
     failures += 1;
-    console.log(`FAIL  ${label} ${extra ? "— " + extra : ""}`);
+    console.log(`FAIL  ${label} ${extra ? `— ${extra}` : ""}`);
   }
 }
 

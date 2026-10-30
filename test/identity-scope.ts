@@ -93,6 +93,17 @@ function makeInstance(dir: string, sessionId: string, sessionName?: string) {
   return { pi, ctx, tools, sent, fire };
 }
 
+/** A registered tool on one session instance; a missing tool is a broken
+ *  fixture, not a condition to skip. */
+function toolOf(
+  instance: { tools: Map<string, ToolDef> },
+  name: string,
+): ToolDef {
+  const tool = instance.tools.get(name);
+  if (tool === undefined) throw new Error(`tool ${name} is not registered`);
+  return tool;
+}
+
 async function main(): Promise<void> {
   process.env.HOME = mkdtempSync(join(tmpdir(), "tower-do-scope-home-"));
   const dir = mkdtempSync(join(tmpdir(), "tower-do-scope-"));
@@ -111,7 +122,7 @@ async function main(): Promise<void> {
   towerDoExtension(parent.pi as never);
   await parent.fire("session_start");
 
-  const plan = await parent.tools.get("tower_do")!.execute(
+  const plan = await toolOf(parent, "tower_do").execute(
     "call-1",
     { tasks: [{ key: "work", subject: "unfinished work", status: "pending" }] },
     undefined,
@@ -163,7 +174,7 @@ async function main(): Promise<void> {
     childReminder.split("\n")[0]?.slice(0, 120),
   );
 
-  const status = await parent.tools.get("tower_do_status")!.execute(
+  const status = await toolOf(parent, "tower_do_status").execute(
     "call-2",
     {},
     undefined,
@@ -186,7 +197,7 @@ async function main(): Promise<void> {
   const named = makeInstance(dir, badNameId, badName);
   towerDoExtension(named.pi as never);
   await named.fire("session_start");
-  const namedStatus = await named.tools.get("tower_do_status")!.execute(
+  const namedStatus = await toolOf(named, "tower_do_status").execute(
     "call-3",
     {},
     undefined,
